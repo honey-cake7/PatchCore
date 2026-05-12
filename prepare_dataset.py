@@ -3,8 +3,8 @@ import shutil
 import random
 from pathlib import Path
 
-KVASIR_V2_DIR = Path("../dataset/kvasir-dataset-v2/kvasir-dataset-v2") 
-KVASIR_SEG_DIR = Path("../dataset/kvasir-seg/Kvasir-SEG")       
+KVASIR_V2_DIR = Path("../dataset/kvasir-dataset-v2") 
+KVASIR_SEG_DIR = Path("../dataset/Kvasir-SEG")       
 
 OUTPUT_DIR = Path("../dataset/kvasir_patchcore")        
 
