@@ -3,22 +3,12 @@ import shutil
 import random
 from pathlib import Path
 
-# ==========================================
-# 1. SET YOUR PATHS HERE
-# ==========================================
-# Path to the unzipped Kvasir-v2 dataset folder
-KVASIR_V2_DIR = Path("dataset/kvasir-dataset-v2/kvasir-dataset-v2") 
+KVASIR_V2_DIR = Path("../dataset/kvasir-dataset-v2/kvasir-dataset-v2") 
+KVASIR_SEG_DIR = Path("../dataset/kvasir-seg/Kvasir-SEG")       
 
-# Path to the unzipped Kvasir-SEG dataset folder
-KVASIR_SEG_DIR = Path("dataset/kvasir-seg/Kvasir-SEG")       
+OUTPUT_DIR = Path("../dataset/kvasir_patchcore")        
 
-# Where you want the new, MVTec-formatted dataset to be saved
-OUTPUT_DIR = Path("dataset/custom_kvasir")        
 
-# ==========================================
-# 2. CONFIGURATION
-# ==========================================
-# We ONLY want completely healthy tissue for PatchCore's memory bank
 HEALTHY_CLASSES = ["normal-cecum", "normal-pylorus", "normal-z-line"]
 TRAIN_SPLIT = 0.80 # 80% of healthy images for training, 20% for testing
 
@@ -50,11 +40,10 @@ def process_healthy_data(kvasir_v2_path, out_paths):
         else:
             print(f"Warning: Could not find folder {class_dir}")
 
-    # Shuffle to ensure a random distribution of different healthy tissues
-    random.seed(42) # Fixed seed for reproducibility
+   
+    random.seed(42) 
     random.shuffle(all_healthy_images)
     
-    # Calculate split index
     split_idx = int(len(all_healthy_images) * TRAIN_SPLIT)
     train_images = all_healthy_images[:split_idx]
     test_images = all_healthy_images[split_idx:]
