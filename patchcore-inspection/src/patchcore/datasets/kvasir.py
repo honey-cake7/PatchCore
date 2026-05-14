@@ -6,21 +6,7 @@ import torch
 from torchvision import transforms
 
 _CLASSNAMES = [
-    "bottle",
-    "cable",
-    "capsule",
-    "carpet",
-    "grid",
-    "hazelnut",
-    "leather",
-    "metal_nut",
-    "pill",
-    "screw",
-    "tile",
-    "toothbrush",
-    "transistor",
-    "wood",
-    "zipper",
+    "kvasir_patchcore",
 ]
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
@@ -50,8 +36,8 @@ class KvasirDataset(torch.utils.data.Dataset):
     ):
         """
         Args:
-            source: [str]. Path to the MVTec data folder.
-            classname: [str or None]. Name of MVTec class that should be
+            source: [str]. Path to the Kvasir folder.
+            classname: [str or None]. Name of Kvasir class that should be
                        provided in this dataset. If None, the datasets
                        iterates over all available images.
             resize: [int]. (Square) Size the loaded image initially gets
@@ -60,14 +46,15 @@ class KvasirDataset(torch.utils.data.Dataset):
                        (center-)cropped to.
             split: [enum-option]. Indicates if training or test split of the
                    data should be used. Has to be an option taken from
-                   DatasetSplit, e.g. mvtec.DatasetSplit.TRAIN. Note that
-                   mvtec.DatasetSplit.TEST will also load mask data.
+                   DatasetSplit, e.g. kvasir.DatasetSplit.TRAIN. Note that
+                   kvasir.DatasetSplit.TEST will also load mask data.
         """
         super().__init__()
         self.source = source
         self.split = split
         self.classnames_to_use = [classname] if classname is not None else _CLASSNAMES
         self.train_val_split = train_val_split
+        # added it as attributes to avoid circular imports when computing metrics
         self.transform_mean = IMAGENET_MEAN
         self.transform_std = IMAGENET_STD
 

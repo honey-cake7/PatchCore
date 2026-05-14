@@ -68,6 +68,7 @@ class MVTecDataset(torch.utils.data.Dataset):
         self.split = split
         self.classnames_to_use = [classname] if classname is not None else _CLASSNAMES
         self.train_val_split = train_val_split
+        # add
         self.transform_mean = IMAGENET_MEAN
         self.transform_std = IMAGENET_STD
 
