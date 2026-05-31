@@ -15,16 +15,12 @@ def compute_imagewise_retrieval_metrics(
     return {"auroc": auroc, "fpr": fpr, "tpr": tpr, "threshold": thresholds}
 
 
-def compute_pixelwise_retrieval_metrics(anomaly_segmentations, ground_truth_masks):
-    if isinstance(anomaly_segmentations, list):
-        anomaly_segmentations = np.stack(anomaly_segmentations)
-
+def _prepare_masks(ground_truth_masks, target_shape):
     if isinstance(ground_truth_masks, list):
-        target_shape = anomaly_segmentations.shape[1:]  # (H, W)
         resized_masks = []
         for mask in ground_truth_masks:
             mask = np.array(mask)
-            mask = np.squeeze(mask)  
+            mask = np.squeeze(mask)
 
             # If still not 2D, take first channel
             if mask.ndim == 3:
@@ -40,7 +36,42 @@ def compute_pixelwise_retrieval_metrics(anomaly_segmentations, ground_truth_mask
                 mask = np.array(pil_mask)
 
             resized_masks.append(mask)
-        ground_truth_masks = np.stack(resized_masks)
+        return np.stack(resized_masks)
+    return np.squeeze(np.array(ground_truth_masks))
+
+
+def compute_binary_segmentation_metrics(binary_maps, ground_truth_masks):
+    """Pixel-level Precision/Recall/F1 for binary anomaly segmentation maps.
+
+    Intended to be called on anomalous samples only (the paper's protocol).
+
+    Args:
+        binary_maps: list or array of [H, W] maps with values in {0, 1}.
+        ground_truth_masks: matching ground-truth masks (any resolution).
+    """
+    if isinstance(binary_maps, list):
+        binary_maps = np.stack(binary_maps)
+    binary_maps = (binary_maps > 0).astype(int)
+
+    ground_truth_masks = _prepare_masks(ground_truth_masks, binary_maps.shape[1:])
+
+    preds = binary_maps.ravel()
+    gts = (ground_truth_masks.ravel() > 0).astype(int)
+
+    precision = metrics.precision_score(gts, preds, zero_division=0)
+    recall = metrics.recall_score(gts, preds, zero_division=0)
+    f1 = metrics.f1_score(gts, preds, zero_division=0)
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def compute_pixelwise_retrieval_metrics(anomaly_segmentations, ground_truth_masks):
+    if isinstance(anomaly_segmentations, list):
+        anomaly_segmentations = np.stack(anomaly_segmentations)
+
+    if isinstance(ground_truth_masks, list):
+        ground_truth_masks = _prepare_masks(
+            ground_truth_masks, anomaly_segmentations.shape[1:]
+        )
     else:
         ground_truth_masks = np.squeeze(np.array(ground_truth_masks))
 

@@ -120,7 +120,14 @@ class MVTecDataset(torch.utils.data.Dataset):
         maskpaths_per_class = {}
 
         for classname in self.classnames_to_use:
-            classpath = os.path.join(self.source, classname, self.split.value)
+            # MVTec has no dedicated "val" folder: so making a validation set is carved out
+            # of the (nominal-only) train folder
+            split_folder = (
+                DatasetSplit.TRAIN.value
+                if self.split == DatasetSplit.VAL
+                else self.split.value
+            )
+            classpath = os.path.join(self.source, classname, split_folder)
             maskpath = os.path.join(self.source, classname, "ground_truth")
             anomaly_types = os.listdir(classpath)
 

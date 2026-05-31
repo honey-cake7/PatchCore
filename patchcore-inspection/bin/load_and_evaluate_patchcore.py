@@ -12,6 +12,7 @@ import patchcore.common
 import patchcore.metrics
 import patchcore.patchcore
 import patchcore.sampler
+import patchcore.ttt4as
 import patchcore.utils
 
 LOGGER = logging.getLogger(__name__)
@@ -27,12 +28,44 @@ _DATASETS = {
 @click.option("--gpu", type=int, default=[0], multiple=True, show_default=True)
 @click.option("--seed", type=int, default=0, show_default=True)
 @click.option("--save_segmentation_images", is_flag=True)
+@click.option("--ttt4as", is_flag=True, help="Enable TTT4AS binary segmentation.")
+@click.option(
+    "--ttt4as_features",
+    type=click.Choice(["wrn50", "dinov2"]),
+    default="wrn50",
+    show_default=True,
+    help="Feature extractor used to train the test-time SVM.",
+)
+@click.option(
+    "--percentile",
+    type=float,
+    default=99.0,
+    show_default=True,
+    help="Percentile for TTT4AS peak suppression / THR fallback.",
+)
+@click.option(
+    "--thr_sigma",
+    type=float,
+    default=3.0,
+    show_default=True,
+    help="c in the mu + c*sigma threshold baseline.",
+)
 def main(**kwargs):
     pass
 
 
 @main.result_callback()
-def run(methods, results_path, gpu, seed, save_segmentation_images):
+def run(
+    methods,
+    results_path,
+    gpu,
+    seed,
+    save_segmentation_images,
+    ttt4as,
+    ttt4as_features,
+    percentile,
+    thr_sigma,
+):
     methods = {key: item for (key, item) in methods}
 
     os.makedirs(results_path, exist_ok=True)
@@ -169,14 +202,74 @@ def run(methods, results_path, gpu, seed, save_segmentation_images):
             )
             anomaly_pixel_auroc = pixel_scores["auroc"]
 
-            result_collect.append(
-                {
-                    "dataset_name": dataset_name,
-                    "instance_auroc": auroc,
-                    "full_pixel_auroc": full_pixel_auroc,
-                    "anomaly_pixel_auroc": anomaly_pixel_auroc,
-                }
-            )
+            result_dict = {
+                "dataset_name": dataset_name,
+                "instance_auroc": auroc,
+                "full_pixel_auroc": full_pixel_auroc,
+                "anomaly_pixel_auroc": anomaly_pixel_auroc,
+            }
+
+            # TTT4AS: binary segmentation via per-image test-time SVM, compared
+            # against the mu + c*sigma threshold baseline, on anomalous samples.
+            if ttt4as and sel_idxs:
+                if len(PatchCore_list) > 1:
+                    LOGGER.warning(
+                        "TTT4AS uses only the first PatchCore of the ensemble."
+                    )
+                ad_model = PatchCore_list[0]
+                # Raw (un-normalized) score maps from the AD&S model.
+                raw_test_segs = aggregator["segmentations"][0]
+                gt_anom = [masks_gt[i] for i in sel_idxs]
+
+                LOGGER.info("Fitting THR baseline from validation scores...")
+                _, val_segs, _, _ = ad_model.predict(dataloaders["validation"])
+                val_segs = np.stack(val_segs)
+                thr_map = val_segs.mean(axis=0) + thr_sigma * val_segs.std(axis=0)
+                thr_bin = [
+                    (np.asarray(raw_test_segs[i]) > thr_map).astype(np.uint8)
+                    for i in sel_idxs
+                ]
+                thr_metrics = patchcore.metrics.compute_binary_segmentation_metrics(
+                    thr_bin, gt_anom
+                )
+
+                LOGGER.info(
+                    "Running TTT4AS ({} features) on {} anomalous samples...".format(
+                        ttt4as_features, len(sel_idxs)
+                    )
+                )
+                ttt = patchcore.ttt4as.TTT4AS(
+                    ad_model,
+                    feature_extractor=ttt4as_features,
+                    device=device,
+                    percentile=percentile,
+                    seed=seed,
+                )
+                ttt_bin = []
+                for idx in sel_idxs:
+                    image = dataloaders["testing"].dataset[idx]["image"]
+                    feature_map = ttt.extract_feature_map(image)
+                    ttt_bin.append(
+                        ttt.predict_binary_map(
+                            raw_test_segs[idx], feature_map, image_index=idx
+                        )
+                    )
+                ttt_metrics = patchcore.metrics.compute_binary_segmentation_metrics(
+                    ttt_bin, gt_anom
+                )
+
+                result_dict.update(
+                    {
+                        "thr_precision": thr_metrics["precision"],
+                        "thr_recall": thr_metrics["recall"],
+                        "thr_f1": thr_metrics["f1"],
+                        "ttt4as_precision": ttt_metrics["precision"],
+                        "ttt4as_recall": ttt_metrics["recall"],
+                        "ttt4as_f1": ttt_metrics["f1"],
+                    }
+                )
+
+            result_collect.append(result_dict)
 
             for key, item in result_collect[-1].items():
                 if key != "dataset_name":
@@ -246,9 +339,25 @@ def patch_core_loader(patch_core_paths, faiss_on_gpu, faiss_num_workers):
 @click.option("--num_workers", default=8, type=int, show_default=True)
 @click.option("--resize", default=256, type=int, show_default=True)
 @click.option("--imagesize", default=224, type=int, show_default=True)
+@click.option(
+    "--train_val_split",
+    default=0.8,
+    type=float,
+    show_default=True,
+    help="Fraction of train kept as train; the rest forms the nominal val set "
+    "used by the TTT4AS THR baseline.",
+)
 @click.option("--augment", is_flag=True)
 def dataset(
-    name, data_path, subdatasets, batch_size, resize, imagesize, num_workers, augment
+    name,
+    data_path,
+    subdatasets,
+    batch_size,
+    resize,
+    imagesize,
+    num_workers,
+    train_val_split,
+    augment,
 ):
     dataset_info = _DATASETS[name]
     dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
@@ -276,7 +385,29 @@ def dataset(
             if subdataset is not None:
                 test_dataloader.name += "_" + subdataset
 
-            dataloader_dict = {"testing": test_dataloader}
+            # Nominal-only validation split carved out of the train folder,
+            # used to fit the mu + c*sigma threshold baseline for TTT4AS.
+            val_dataset = dataset_library.__dict__[dataset_info[1]](
+                data_path,
+                classname=subdataset,
+                resize=resize,
+                imagesize=imagesize,
+                split=dataset_library.DatasetSplit.VAL,
+                train_val_split=train_val_split,
+                seed=seed,
+            )
+            val_dataloader = torch.utils.data.DataLoader(
+                val_dataset,
+                batch_size=batch_size,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=True,
+            )
+
+            dataloader_dict = {
+                "testing": test_dataloader,
+                "validation": val_dataloader,
+            }
 
             yield dataloader_dict
 
