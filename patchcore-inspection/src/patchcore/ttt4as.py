@@ -4,6 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from scipy import ndimage
+from sklearn.preprocessing import normalize
 from sklearn.svm import LinearSVC
 
 LOGGER = logging.getLogger(__name__)
@@ -203,9 +204,25 @@ class TTT4AS:
             threshold = np.percentile(score_map, self.percentile)
             return (score_map >= threshold).astype(np.uint8)
 
-        train_feats = feature_map[coords[:, 0], coords[:, 1]]  # [N, D]
-        clf = LinearSVC(C=self.svm_C, dual="auto")
+        # L2-normalize features so the SVM margin is independent of the
+        # backbone's feature scale; without this, small feature norms combined
+        # with the tiny C make the SVM collapse onto the majority class.
+        flat_feats = normalize(feature_map.reshape(h * w, -1))
+        flat_coords = coords[:, 0] * w + coords[:, 1]
+        train_feats = flat_feats[flat_coords]  # [N, D]
+
+        # class_weight="balanced" counters the heavy pseudo-label imbalance
+        # (tens of anomalous points vs hundreds of nominal ones).
+        clf = LinearSVC(C=self.svm_C, dual="auto", class_weight="balanced")
         clf.fit(train_feats, labels)
 
-        dense = clf.predict(feature_map.reshape(h * w, -1))
+        dense = clf.predict(flat_feats)
+        if dense.max() == dense.min():
+            LOGGER.warning(
+                "TTT4AS SVM predicted a single class for image %d "
+                "(%d anomalous / %d nominal pseudo-labels).",
+                image_index,
+                int(labels.sum()),
+                int((labels == 0).sum()),
+            )
         return dense.reshape(h, w).astype(np.uint8)
