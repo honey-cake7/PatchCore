@@ -12,6 +12,7 @@ import patchcore.common
 import patchcore.metrics
 import patchcore.patchcore
 import patchcore.sampler
+import patchcore.ttt4as
 import patchcore.utils
 
 LOGGER = logging.getLogger(__name__)
@@ -30,6 +31,28 @@ _DATASETS = {
 @click.option("--log_project", type=str, default="project")
 @click.option("--save_segmentation_images", is_flag=True)
 @click.option("--save_patchcore_model", is_flag=True)
+@click.option("--ttt4as", is_flag=True, help="Enable TTT4AS binary segmentation.")
+@click.option(
+    "--ttt4as_features",
+    type=click.Choice(["wrn50", "dinov2"]),
+    default="wrn50",
+    show_default=True,
+    help="Feature extractor used to train the test-time SVM.",
+)
+@click.option(
+    "--percentile",
+    type=float,
+    default=99.0,
+    show_default=True,
+    help="Percentile for TTT4AS peak suppression / THR fallback.",
+)
+@click.option(
+    "--thr_sigma",
+    type=float,
+    default=3.0,
+    show_default=True,
+    help="c in the mu + c*sigma threshold baseline.",
+)
 def main(**kwargs):
     pass
 
@@ -44,6 +67,10 @@ def run(
     log_project,
     save_segmentation_images,
     save_patchcore_model,
+    ttt4as,
+    ttt4as_features,
+    percentile,
+    thr_sigma,
 ):
     methods = {key: item for (key, item) in methods}
 
@@ -198,14 +225,87 @@ def run(
             )
             anomaly_pixel_auroc = pixel_scores["auroc"]
 
-            result_collect.append(
-                {
-                    "dataset_name": dataset_name,
-                    "instance_auroc": auroc,
-                    "full_pixel_auroc": full_pixel_auroc,
-                    "anomaly_pixel_auroc": anomaly_pixel_auroc,
-                }
-            )
+            result_dict = {
+                "dataset_name": dataset_name,
+                "instance_auroc": auroc,
+                "full_pixel_auroc": full_pixel_auroc,
+                "anomaly_pixel_auroc": anomaly_pixel_auroc,
+            }
+
+            # TTT4AS: binary segmentation via per-image test-time SVM, compared
+            # against the mu + c*sigma threshold baseline, on anomalous samples.
+            if ttt4as and sel_idxs:
+                if len(PatchCore_list) > 1:
+                    LOGGER.warning(
+                        "TTT4AS uses only the first PatchCore of the ensemble."
+                    )
+                ad_model = PatchCore_list[0]
+                # Raw (un-normalized) score maps from the AD&S model.
+                raw_test_segs = aggregator["segmentations"][0]
+                gt_anom = [masks_gt[i] for i in sel_idxs]
+
+                # THR baseline needs a nominal validation split (train_val_split < 1).
+                val_loader = dataloaders.get("validation")
+                if val_loader is not None:
+                    LOGGER.info("Fitting THR baseline from validation scores...")
+                    _, val_segs, _, _ = ad_model.predict(val_loader)
+                    val_segs = np.stack(val_segs)
+                    thr_map = val_segs.mean(axis=0) + thr_sigma * val_segs.std(axis=0)
+                    thr_bin = [
+                        (np.asarray(raw_test_segs[i]) > thr_map).astype(np.uint8)
+                        for i in sel_idxs
+                    ]
+                    thr_metrics = (
+                        patchcore.metrics.compute_binary_segmentation_metrics(
+                            thr_bin, gt_anom
+                        )
+                    )
+                    result_dict.update(
+                        {
+                            "thr_precision": thr_metrics["precision"],
+                            "thr_recall": thr_metrics["recall"],
+                            "thr_f1": thr_metrics["f1"],
+                        }
+                    )
+                else:
+                    LOGGER.warning(
+                        "TTT4AS THR baseline skipped: no validation split "
+                        "(pass --train_val_split < 1)."
+                    )
+
+                LOGGER.info(
+                    "Running TTT4AS ({} features) on {} anomalous samples...".format(
+                        ttt4as_features, len(sel_idxs)
+                    )
+                )
+                ttt = patchcore.ttt4as.TTT4AS(
+                    ad_model,
+                    feature_extractor=ttt4as_features,
+                    device=device,
+                    percentile=percentile,
+                    seed=seed,
+                )
+                ttt_bin = []
+                for idx in sel_idxs:
+                    image = dataloaders["testing"].dataset[idx]["image"]
+                    feature_map = ttt.extract_feature_map(image)
+                    ttt_bin.append(
+                        ttt.predict_binary_map(
+                            raw_test_segs[idx], feature_map, image_index=idx
+                        )
+                    )
+                ttt_metrics = patchcore.metrics.compute_binary_segmentation_metrics(
+                    ttt_bin, gt_anom
+                )
+                result_dict.update(
+                    {
+                        "ttt4as_precision": ttt_metrics["precision"],
+                        "ttt4as_recall": ttt_metrics["recall"],
+                        "ttt4as_f1": ttt_metrics["f1"],
+                    }
+                )
+
+            result_collect.append(result_dict)
 
             for key, item in result_collect[-1].items():
                 if key != "dataset_name":

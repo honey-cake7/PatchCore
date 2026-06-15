@@ -31,6 +31,10 @@ python bin/run_patchcore.py \
     --seed 0 \
     --save_patchcore_model \
     --save_segmentation_images \
+    --ttt4as \
+    --ttt4as_features wrn50 \
+    --percentile 99.0 \
+    --thr_sigma 3.0 \
     --log_group KvasirCapsule_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0 \
     --log_project KvasirCapsule_Results \
     results \
@@ -47,6 +51,7 @@ python bin/run_patchcore.py \
     dataset \
         --resize 256 \
         --imagesize 224 \
+        --train_val_split 0.8 \
         "${dataset_flags[@]}" \
         mvtec $datapath
 
