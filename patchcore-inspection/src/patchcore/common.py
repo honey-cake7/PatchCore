@@ -283,6 +283,20 @@ class ForwardHook:
         )
 
     def __call__(self, module, input, output):
+        # Handle ViT sequence output: [B, N, C] -> [B, C, H, W]
+        if isinstance(output, torch.Tensor) and output.dim() == 3:
+            import math
+            B, N, C = output.shape
+            if N == 197:
+                hw = 14
+                output = output[:, 1:, :].transpose(1, 2).reshape(B, C, hw, hw)
+            elif math.isqrt(N) ** 2 == N:
+                hw = math.isqrt(N)
+                output = output.transpose(1, 2).reshape(B, C, hw, hw)
+            elif math.isqrt(N - 1) ** 2 == N - 1:
+                hw = math.isqrt(N - 1)
+                output = output[:, 1:, :].transpose(1, 2).reshape(B, C, hw, hw)
+            
         self.hook_dict[self.layer_name] = output
         if self.raise_exception_to_break:
             raise LastLayerToExtractReachedException()
