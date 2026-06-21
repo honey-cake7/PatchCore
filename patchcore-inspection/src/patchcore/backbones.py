@@ -73,3 +73,6 @@ _BACKBONES = {
     "efficientnet_b3a": 'timm.create_model("efficientnet_b3a", pretrained=True)',
 }
 
+def load(name):
+    return eval(_BACKBONES[name])
+
