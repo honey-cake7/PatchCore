@@ -43,6 +43,7 @@ env PYTHONPATH=src python bin/run_patchcore.py \
   results \
   patch_core \
   -b gastronet \
+  -le blocks.9 \
   -le blocks.11 \
   --faiss_on_gpu \
   --pretrain_embed_dimension 768 \
