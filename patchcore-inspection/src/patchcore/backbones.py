@@ -28,7 +28,7 @@ def load_gastronet():
     model.eval()          # important — disables dropout/batchnorm training behavior
     return model
 _BACKBONES = {
-    "gastronet": "patchcore.backbones.load_gastronet()", 
+    "gastronet": "load_gastronet()",
     "alexnet": "models.alexnet(pretrained=True)",
     "bninception": 'pretrainedmodels.__dict__["bninception"]'
     '(pretrained="imagenet", num_classes=1000)',
@@ -73,6 +73,3 @@ _BACKBONES = {
     "efficientnet_b3a": 'timm.create_model("efficientnet_b3a", pretrained=True)',
 }
 
-
-def load(name):
-    return eval(_BACKBONES[name])
