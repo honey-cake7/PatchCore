@@ -50,7 +50,7 @@ env PYTHONPATH=src python bin/run_patchcore.py \
   --target_embed_dimension 768 \
   --anomaly_scorer_num_nn 1 \
   --patchsize 3 \
-  sampler -p 0.1 approx_greedy_coreset \
+  sampler -p 0.2 approx_greedy_coreset \
   dataset \
   --resize 256 \
   --imagesize 224 \
