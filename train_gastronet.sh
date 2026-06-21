@@ -49,7 +49,7 @@ env PYTHONPATH=src python bin/run_patchcore.py \
   --faiss_on_gpu \
   --pretrain_embed_dimension 1024 \
   --target_embed_dimension 1024 \
-  --anomaly_scorer_num_nn 1 \
+  --anomaly_scorer_num_nn 5 \
   --patchsize 6 \
   sampler -p 0.2 approx_greedy_coreset \
   dataset \
