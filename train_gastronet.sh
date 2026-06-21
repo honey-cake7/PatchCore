@@ -43,14 +43,14 @@ env PYTHONPATH=src python bin/run_patchcore.py \
   results \
   patch_core \
   -b gastronet \
-  -le blocks.4 \
+  -le blocks.5 \
   -le blocks.8 \
-  -le norm \
+  -le blocks.11 \
   --faiss_on_gpu \
-  --pretrain_embed_dimension 1536 \
-  --target_embed_dimension 1536 \
+  --pretrain_embed_dimension 1024 \
+  --target_embed_dimension 1024 \
   --anomaly_scorer_num_nn 1 \
-  --patchsize 3 \
+  --patchsize 6 \
   sampler -p 0.2 approx_greedy_coreset \
   dataset \
   --resize 256 \
