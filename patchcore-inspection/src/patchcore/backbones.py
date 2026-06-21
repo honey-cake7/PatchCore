@@ -1,7 +1,34 @@
 import timm  # noqa
 import torchvision.models as models  # noqa
+import torch
 
+
+def load_gastronet():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    model = timm.create_model("vit_base_patch16_224", pretrained=False, num_classes=0)
+    
+    weights_path = "/home/user1/aniket/Patchcore/PatchCore/models/gastronet.pth"
+    state_dict = torch.load(weights_path, map_location=device)  # load directly to target device
+    
+    if "model" in state_dict:
+        state_dict = state_dict["model"]
+    elif "state_dict" in state_dict:
+        state_dict = state_dict["state_dict"]
+    elif "teacher" in state_dict:
+        state_dict = state_dict["teacher"]
+    
+    state_dict = {
+        k.replace("backbone.", "").replace("module.", ""): v
+        for k, v in state_dict.items()
+    }
+    
+    model.load_state_dict(state_dict, strict=False)
+    model = model.to(device)
+    model.eval()          # important — disables dropout/batchnorm training behavior
+    return model
 _BACKBONES = {
+    "gastronet": "patchcore.backbones.load_gastronet()", 
     "alexnet": "models.alexnet(pretrained=True)",
     "bninception": 'pretrainedmodels.__dict__["bninception"]'
     '(pretrained="imagenet", num_classes=1000)',
