@@ -15,14 +15,18 @@ module load libs/cuda-12.8
 source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
 conda activate patchcore
 
-pip3  install mamba-ssm causal-conv1d einops
+# Ignore ~/.local site-packages (a transformers 4.57 there shadows the conda env and, with
+# torch 2.0.1, silently disables the PyTorch backend). Pin a torch-2.0-compatible transformers.
+export PYTHONNOUSERSITE=1
+pip install 'transformers==4.46.3'
+pip install mamba-ssm causal-conv1d einops
 
 # Sanity checks
 nvidia-smi
 which python
 python --version
 python -c "import torch; print('torch OK | CUDA:', torch.cuda.is_available())"
-python -c "import transformers; print('transformers OK', transformers.__version__)"
+python -c "import transformers, torch; print('transformers', transformers.__version__, '| torch backend OK:', transformers.is_torch_available())"
 python -c "import faiss; res = faiss.StandardGpuResources(); print('faiss-gpu OK:', faiss.__version__)"
 
 # MambaVision needs CUDA-built selective-scan kernels + einops. Fail early with a hint if missing.
