@@ -1,6 +1,10 @@
+import os
+
 import timm  # noqa
 import torchvision.models as models  # noqa
 import torch
+
+from patchcore.networks.pvtv2 import pvt_v2_b2
 
 
 def load_gastronet():
@@ -27,8 +31,63 @@ def load_gastronet():
     model = model.to(device)
     model.eval()          # important — disables dropout/batchnorm training behavior
     return model
+
+
+
+
+def _load_pvtv2_b2(weights_path):
+    """Load a PVTv2-B2 backbone, auto-detecting the checkpoint's key prefix.
+
+    Handles plain ImageNet weights (no prefix), Polyp-PVT weights ("backbone." prefix),
+    and DataParallel weights ("module." prefix). Fails loudly if the checkpoint doesn't
+    match the architecture, so we never silently load the wrong weights.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = pvt_v2_b2()
+
+    save_model = torch.load(weights_path, map_location=device)
+    for key in ("model", "state_dict"):  # unwrap common checkpoint containers
+        if isinstance(save_model, dict) and key in save_model:
+            save_model = save_model[key]
+            break
+
+    model_dict = model.state_dict()
+    # Pick the prefix-stripping that matches the most target keys.
+    candidates = {
+        "": save_model,
+        "backbone.": {
+            k[len("backbone."):]: v for k, v in save_model.items() if k.startswith("backbone.")
+        },
+        "module.": {
+            k[len("module."):]: v for k, v in save_model.items() if k.startswith("module.")
+        },
+    }
+    best = max(candidates.values(), key=lambda sd: sum(k in model_dict for k in sd))
+    state_dict = {k: v for k, v in best.items() if k in model_dict}
+
+    n_matched, n_total = len(state_dict), len(model_dict)
+    print(f"[pvtv2] {weights_path}: matched {n_matched}/{n_total} backbone keys")
+    assert n_matched > n_total * 0.8, (
+        f"only {n_matched}/{n_total} keys matched — wrong checkpoint for pvt_v2_b2?"
+    )
+
+    model_dict.update(state_dict)
+    model.load_state_dict(model_dict)
+    return model.to(device).eval()
+
+
+def load_polyp_pvt():
+    return _load_pvtv2_b2(os.environ.get("POLYP_PVT_WEIGHTS", "models/PolypPVT.pth"))
+
+
+def load_pvtv2_b2():
+    return _load_pvtv2_b2(os.environ.get("PVTV2_B2_WEIGHTS", "models/pvt_v2_b2.pth"))
+
+
 _BACKBONES = {
     "gastronet": "load_gastronet()",
+    "polyp-pvt": "load_polyp_pvt()",
+    "pvtv2_b2": "load_pvtv2_b2()",
     "alexnet": "models.alexnet(pretrained=True)",
     "bninception": 'pretrainedmodels.__dict__["bninception"]'
     '(pretrained="imagenet", num_classes=1000)',
