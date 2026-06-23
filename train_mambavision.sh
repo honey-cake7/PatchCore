@@ -15,6 +15,8 @@ module load libs/cuda-12.8
 source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
 conda activate patchcore
 
+pip3  install mamba-ssm causal-conv1d einops
+
 # Sanity checks
 nvidia-smi
 which python
