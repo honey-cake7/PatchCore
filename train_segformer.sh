@@ -18,6 +18,12 @@ conda activate patchcore
 # Ignore ~/.local site-packages (a transformers 4.57 there shadows the conda env and, with
 # torch 2.0.1, silently disables the PyTorch backend). Install a torch-2.0-compatible pin.
 export PYTHONNOUSERSITE=1
+
+# Compute nodes are offline — load the SegFormer weights from the HF cache. Run
+# download_hf_backbones.sh on the login node first to populate it.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
 pip install 'transformers==4.46.3'
 
 # Sanity checks
