@@ -19,7 +19,15 @@ conda activate patchcore
 # torch 2.0.1, silently disables the PyTorch backend). Pin a torch-2.0-compatible transformers.
 export PYTHONNOUSERSITE=1
 pip install 'transformers==4.46.3'
-pip install mamba-ssm causal-conv1d einops
+
+# MambaVision needs the CUDA selective-scan kernels. Install PREBUILT wheels matching this
+# env (cu118 / torch2.0 / cp39) instead of compiling from source — source builds need nvcc and
+# would mismatch the loaded cuda-12.8 module against torch's CUDA 11.8. ABI is auto-selected
+# from torch. NOTE: cp39 is hardcoded for Python 3.9 — bump if the env's Python changes.
+pip install einops
+ABI=$(python -c "import torch; print('TRUE' if torch._C._GLIBCXX_USE_CXX11_ABI else 'FALSE')")
+pip install --no-deps "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.2.0.post2/causal_conv1d-1.2.0.post2+cu118torch2.0cxx11abi${ABI}-cp39-cp39-linux_x86_64.whl"
+pip install --no-deps "https://github.com/state-spaces/mamba/releases/download/v1.2.0.post1/mamba_ssm-1.2.0.post1+cu118torch2.0cxx11abi${ABI}-cp39-cp39-linux_x86_64.whl"
 
 # Sanity checks
 nvidia-smi
