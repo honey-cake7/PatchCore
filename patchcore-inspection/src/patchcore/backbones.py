@@ -116,7 +116,9 @@ def load_mambavision_t():
     model = AutoModel.from_pretrained("nvidia/MambaVision-T-1K", trust_remote_code=True)
 
     def extract(m, x):
-        return list(m.forward_features(x)[1])  # forward_features -> (pooled, [4 maps])
+        # The HF wrapper's forward returns (out_avg_pool, features) where features is the
+        # list of 4 stage maps [B,C,H,W]; it has no `forward_features` method.
+        return list(m(x)[1])
 
     return MultiScaleWrapper(model, extract).to(device).eval()
 
