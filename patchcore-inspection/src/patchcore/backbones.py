@@ -84,10 +84,51 @@ def load_pvtv2_b2():
     return _load_pvtv2_b2(os.environ.get("PVTV2_B2_WEIGHTS", "models/pvt_v2_b2.pth"))
 
 
+def load_segformer_mit_b3():
+    """SegFormer MiT-b3 (ImageNet) encoder, wrapped to expose its 4 pyramid maps.
+
+    Channels [64, 128, 320, 512] at strides /4, /8, /16, /32 -> hook stages.1 / stages.2.
+    """
+    from transformers import SegformerModel  # lazy: optional dependency
+
+    from patchcore.networks.feature_wrapper import MultiScaleWrapper
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = SegformerModel.from_pretrained("nvidia/mit-b3")
+
+    def extract(m, x):
+        return list(m(x, output_hidden_states=True).hidden_states)  # 4 x [B, C, H, W]
+
+    return MultiScaleWrapper(model, extract).to(device).eval()
+
+
+def load_mambavision_t():
+    """NVIDIA MambaVision-T (ImageNet), wrapped to expose its 4 pyramid maps.
+
+    Channels [80, 160, 320, 640] at strides /4, /8, /16, /32 -> hook stages.1 / stages.2.
+    Requires CUDA (mamba_ssm / causal_conv1d) + einops; cannot run CPU-only.
+    """
+    from transformers import AutoModel  # lazy: optional dependency
+
+    from patchcore.networks.feature_wrapper import MultiScaleWrapper
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = AutoModel.from_pretrained("nvidia/MambaVision-T-1K", trust_remote_code=True)
+
+    def extract(m, x):
+        # The HF wrapper's forward returns (out_avg_pool, features) where features is the
+        # list of 4 stage maps [B,C,H,W]; it has no `forward_features` method.
+        return list(m(x)[1])
+
+    return MultiScaleWrapper(model, extract).to(device).eval()
+
+
 _BACKBONES = {
     "gastronet": "load_gastronet()",
     "polyp-pvt": "load_polyp_pvt()",
     "pvtv2_b2": "load_pvtv2_b2()",
+    "segformer_mit_b3": "load_segformer_mit_b3()",
+    "mambavision_t": "load_mambavision_t()",
     "alexnet": "models.alexnet(pretrained=True)",
     "bninception": 'pretrainedmodels.__dict__["bninception"]'
     '(pretrained="imagenet", num_classes=1000)',

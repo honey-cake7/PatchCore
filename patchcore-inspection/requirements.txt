@@ -11,3 +11,9 @@ scikit-learn>= 1.0.1
 scipy>= 1.7.1
 torchvision>= 0.11.1
 tqdm>= 4.62.3
+# transformers >= 4.52 requires torch >= 2.1; the cluster has torch 2.0.1+cu118, so pin to a
+# torch-2.0-compatible release. Bump this only if/when torch is upgraded to >= 2.1.
+transformers>=4.40,<=4.46.3
+einops>= 0.6.0
+# MambaVision (mambavision_t backbone) also needs CUDA-built kernels — install on the GPU
+# cluster only, not on macOS/CPU:  pip install mamba-ssm causal-conv1d
