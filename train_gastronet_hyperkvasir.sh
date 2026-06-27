@@ -9,7 +9,7 @@
 #SBATCH --error=/home/user1/aniket/Patchcore/logs/hyperkvasir_gastro_%j.err
 #SBATCH --cpus-per-task=32
 
-cd /home/user1/aniket/Patchcore/patchcore-inspection
+cd /home/user1/aniket/Patchcore/PatchCore/patchcore-inspection
 module load compilers/anaconda3-2024.06
 module load libs/cuda-12.8
 source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
