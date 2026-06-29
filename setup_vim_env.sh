@@ -46,7 +46,9 @@ else
   # --no-build-isolation: both setup.py files `import torch` at build time, which pip's
   # default isolated PEP-517 build env lacks. Build against the env's torch + ninja instead.
   # (Requires nvcc on PATH from the cuda-11.8 module to compile the CUDA kernels.)
-  pip install ninja
+  # setuptools<70: torch 2.1.1's cpp_extension does `from pkg_resources import packaging`,
+  # removed in setuptools >=70 (conda create ships 82) — pin an older one for the build.
+  pip install ninja "setuptools<70" wheel
   VIM_DIR="${VIM_DIR:-$HOME/Vim}"
   [ -d "$VIM_DIR" ] || git clone https://github.com/hustvl/Vim.git "$VIM_DIR"
   pip install --no-build-isolation -e "$VIM_DIR/causal-conv1d"
