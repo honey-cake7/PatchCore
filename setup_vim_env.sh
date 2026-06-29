@@ -39,13 +39,20 @@ else
   pip uninstall -y faiss-cpu
   conda install -y -c pytorch -c nvidia faiss-gpu=1.9.0
 
+  # The node's default nvcc is CUDA 13.0, but torch is cu118 — torch's cpp_extension aborts the
+  # kernel build on that mismatch. Install a matching CUDA 11.8 toolkit into the env and point
+  # the build at it via CUDA_HOME; robust even when `module load libs/cuda-11.8` is a no-op in
+  # this non-interactive shell. $CONDA_PREFIX/bin/nvcc then shadows the system CUDA 13.0.
+  conda install -y -c "nvidia/label/cuda-11.8.0" cuda-toolkit
+  export CUDA_HOME="$CONDA_PREFIX"
+
   # Vim's vendored CUDA kernels + forked mamba_ssm. Build against CUDA 11.8 (loaded above).
   # Install causal-conv1d FIRST, installing mamba-1p1p1 can otherwise pull a newer
   # causal_conv1d (1.2.x) and break Vim. NOTE: the dirs are hyphenated (causal-conv1d),
   # even though the import name is causal_conv1d.
   # --no-build-isolation: both setup.py files `import torch` at build time, which pip's
-  # default isolated PEP-517 build env lacks. Build against the env's torch + ninja instead.
-  # (Requires nvcc on PATH from the cuda-11.8 module to compile the CUDA kernels.)
+  # default isolated PEP-517 build env lacks. Build against the env's torch + ninja instead,
+  # using the env's CUDA 11.8 nvcc (CUDA_HOME set above) to compile the kernels.
   # setuptools<70: torch 2.1.1's cpp_extension does `from pkg_resources import packaging`,
   # removed in setuptools >=70 (conda create ships 82) — pin an older one for the build.
   pip install ninja "setuptools<70" wheel
