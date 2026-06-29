@@ -15,10 +15,8 @@ module load compilers/anaconda3-2024.06 2>/dev/null || true
 module load libs/cuda-11.8 2>/dev/null || true   # Vim built against CUDA 11.8 (torch cu118)
 source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
 
-# Build the dedicated Vim env once (forked mamba_ssm + CUDA kernels); reused on later runs.
-if ! conda env list | grep -qE '^vim[[:space:]]'; then
-  ( cd /home/user1/aniket/Patchcore/PatchCore/ && ./setup_vim_env.sh )
-fi
+# Build the dedicated Vim env (forked mamba_ssm + CUDA kernels).
+( cd /home/user1/aniket/Patchcore/PatchCore/ && ./setup_vim_env.sh )
 
 cd /home/user1/aniket/Patchcore/PatchCore/patchcore-inspection
 conda activate vim || {        # dedicated env, see setup_vim_env.sh
