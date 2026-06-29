@@ -43,10 +43,14 @@ else
   # Install causal-conv1d FIRST, installing mamba-1p1p1 can otherwise pull a newer
   # causal_conv1d (1.2.x) and break Vim. NOTE: the dirs are hyphenated (causal-conv1d),
   # even though the import name is causal_conv1d.
+  # --no-build-isolation: both setup.py files `import torch` at build time, which pip's
+  # default isolated PEP-517 build env lacks. Build against the env's torch + ninja instead.
+  # (Requires nvcc on PATH from the cuda-11.8 module to compile the CUDA kernels.)
+  pip install ninja
   VIM_DIR="${VIM_DIR:-$HOME/Vim}"
   [ -d "$VIM_DIR" ] || git clone https://github.com/hustvl/Vim.git "$VIM_DIR"
-  pip install -e "$VIM_DIR/causal-conv1d"
-  pip install --no-deps -e "$VIM_DIR/mamba-1p1p1"
+  pip install --no-build-isolation -e "$VIM_DIR/causal-conv1d"
+  pip install --no-build-isolation --no-deps -e "$VIM_DIR/mamba-1p1p1"
 
   # Pre-download Vim weights into the HF cache (compute nodes load weights offline at train
   # time). Cache warm-up only — must not abort an otherwise-successful build.
