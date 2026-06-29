@@ -9,6 +9,9 @@
 #SBATCH --error=/home/user1/aniket/Patchcore/logs/patchcore_vim%j.err
 #SBATCH --cpus-per-task=32
 
+cd /home/user1/aniket/Patchcore/PatchCore/
+./setup_vim_env.sh
+
 cd /home/user1/aniket/Patchcore/PatchCore/patchcore-inspection
 module load compilers/anaconda3-2024.06
 module load libs/cuda-11.8        # Vim built against CUDA 11.8 (torch cu118)
