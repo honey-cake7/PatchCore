@@ -9,14 +9,22 @@
 #SBATCH --error=/home/user1/aniket/Patchcore/logs/patchcore_vim%j.err
 #SBATCH --cpus-per-task=32
 
-cd /home/user1/aniket/Patchcore/PatchCore/
-./setup_vim_env.sh
+# module loads are non-fatal (the `module` function may be undefined in this
+# non-interactive shell); the direct conda.sh source is the reliable path to `conda`.
+module load compilers/anaconda3-2024.06 2>/dev/null || true
+module load libs/cuda-11.8 2>/dev/null || true   # Vim built against CUDA 11.8 (torch cu118)
+source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
+
+# Build the dedicated Vim env once (forked mamba_ssm + CUDA kernels); reused on later runs.
+if ! conda env list | grep -qE '^vim[[:space:]]'; then
+  ( cd /home/user1/aniket/Patchcore/PatchCore/ && ./setup_vim_env.sh )
+fi
 
 cd /home/user1/aniket/Patchcore/PatchCore/patchcore-inspection
-module load compilers/anaconda3-2024.06
-module load libs/cuda-11.8        # Vim built against CUDA 11.8 (torch cu118)
-source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
-conda activate vim                # dedicated env — see setup_vim_env.sh (run it first)
+conda activate vim || {        # dedicated env, see setup_vim_env.sh
+  echo "ERROR: 'vim' conda env missing, setup_vim_env.sh failed. Check the .out log."
+  exit 1
+}
 export PYTHONNOUSERSITE=1
 
 # Vim weights load from the HF cache (compute nodes are offline; setup_vim_env.sh pre-downloads).
