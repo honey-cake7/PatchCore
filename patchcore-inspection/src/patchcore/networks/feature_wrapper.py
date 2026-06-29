@@ -11,6 +11,9 @@ the resulting `[B, C, H, W]` maps through a top-level `Identity` (`stages.0..N`)
 can then hook them by the single-dot names `stages.0`, `stages.1`, ... and the captured
 tensors are already 4-D, so `ForwardHook` passes them through unchanged.
 """
+import math
+
+import torch
 import torch.nn as nn
 
 
@@ -30,3 +33,45 @@ class MultiScaleWrapper(nn.Module):
     def forward(self, x):
         feats = self._extract_fn(self.model, x)
         return [stage(f) for stage, f in zip(self.stages, feats)]
+
+
+class IsotropicTokenWrapper(nn.Module):
+    """Expose intermediate token outputs of an isotropic (ViT/Vim-style) backbone as spatial maps.
+
+    Hooks model.layers[i] for each i in layer_indices, drops a middle cls token, and reshapes the
+    remaining (perfect-square) patch tokens to [B, C, g, g], routed through stages.* Identities so
+    PatchCore can hook them by single-dot name. Grid size and cls index are derived from the
+    captured sequence length, so it handles different patch counts (stride16 / stride8).
+    """
+
+    def __init__(self, model, layer_indices):
+        super().__init__()
+        self.model = model
+        self.layer_indices = list(layer_indices)
+        self.stages = nn.ModuleList([nn.Identity() for _ in self.layer_indices])
+        self._captured = {}
+        for slot, li in enumerate(self.layer_indices):
+            model.layers[li].register_forward_hook(self._make_hook(slot))
+
+    def _make_hook(self, slot):
+        def hook(module, inp, out):
+            # Vim Block.forward returns (hidden_states, residual); take the hidden states.
+            self._captured[slot] = out[0] if isinstance(out, tuple) else out
+
+        return hook
+
+    def forward(self, x):
+        self._captured.clear()
+        self.model.forward_features(x)  # populates the hooks; its return value (cls token) is unused
+        outs = []
+        for slot in range(len(self.layer_indices)):
+            tok = self._captured[slot]  # [B, N, C], N = num_patches + 1 (cls token in the middle)
+            B, N, C = tok.shape
+            p = N - 1
+            cls_pos = p // 2
+            tok = torch.cat([tok[:, :cls_pos], tok[:, cls_pos + 1:]], dim=1)  # drop middle cls -> [B, p, C]
+            g = int(math.isqrt(p))
+            assert g * g == p, f"non-square token grid: {p} tokens"
+            fmap = tok.transpose(1, 2).reshape(B, C, g, g)
+            outs.append(self.stages[slot](fmap))
+        return outs

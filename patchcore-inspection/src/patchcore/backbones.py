@@ -123,12 +123,42 @@ def load_mambavision_t():
     return MultiScaleWrapper(model, extract).to(device).eval()
 
 
+def load_vim_base():
+    """Vision Mamba (Vim-base, midclstok, stride16) — isotropic bidirectional SSM backbone.
+
+    embed_dim 768, 24 blocks at /16 (196 patches -> 14x14). Two block depths (layers 11 & 17)
+    are exposed as stages.0 / stages.1. Requires the dedicated `vim` conda env (forked mamba_ssm
+    + causal_conv1d, CUDA-only); see setup_vim_env.sh.
+    """
+    from huggingface_hub import hf_hub_download  # lazy: optional dependency
+
+    from patchcore.networks.vim.models_mamba import VisionMamba
+    from patchcore.networks.feature_wrapper import IsotropicTokenWrapper
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = VisionMamba(
+        patch_size=16, embed_dim=768, depth=24, d_state=16, rms_norm=True,
+        residual_in_fp32=True, fused_add_norm=True, final_pool_type="mean",
+        if_abs_pos_embed=True, if_rope=False, if_rope_residual=False,
+        bimamba_type="v2", if_cls_token=True, if_devide_out=True,  # sic: upstream spelling
+        use_middle_cls_token=True,
+    )
+    path = os.environ.get("VIM_WEIGHTS") or hf_hub_download(
+        "hustvl/Vim-base-midclstok", "vim_b_midclstok_81p9acc.pth"
+    )
+    sd = torch.load(path, map_location=device)["model"]
+    missing, unexpected = model.load_state_dict(sd, strict=False)
+    print(f"[vim] loaded vim_b: {len(sd)} keys (missing {len(missing)}, unexpected {len(unexpected)})")
+    return IsotropicTokenWrapper(model, layer_indices=[11, 17]).to(device).eval()
+
+
 _BACKBONES = {
     "gastronet": "load_gastronet()",
     "polyp-pvt": "load_polyp_pvt()",
     "pvtv2_b2": "load_pvtv2_b2()",
     "segformer_mit_b3": "load_segformer_mit_b3()",
     "mambavision_t": "load_mambavision_t()",
+    "vim_base": "load_vim_base()",
     "alexnet": "models.alexnet(pretrained=True)",
     "bninception": 'pretrainedmodels.__dict__["bninception"]'
     '(pretrained="imagenet", num_classes=1000)',
