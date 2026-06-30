@@ -46,6 +46,13 @@ else
   conda install -y -c "nvidia/label/cuda-11.8.0" cuda-toolkit
   export CUDA_HOME="$CONDA_PREFIX"
 
+  # CUDA 11.8 nvcc rejects host gcc >11, but the node ships gcc 15. Install gcc/g++ 11 into
+  # the env and force both nvcc (via -ccbin) and the C++ step (CC/CXX) to use them.
+  conda install -y -c conda-forge gcc_linux-64=11 gxx_linux-64=11
+  export CC="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-gcc"
+  export CXX="$CONDA_PREFIX/bin/x86_64-conda-linux-gnu-g++"
+  export NVCC_PREPEND_FLAGS="-ccbin $CXX"
+
   # Vim's vendored CUDA kernels + forked mamba_ssm. Build against CUDA 11.8 (loaded above).
   # Install causal-conv1d FIRST, installing mamba-1p1p1 can otherwise pull a newer
   # causal_conv1d (1.2.x) and break Vim. NOTE: the dirs are hyphenated (causal-conv1d),
