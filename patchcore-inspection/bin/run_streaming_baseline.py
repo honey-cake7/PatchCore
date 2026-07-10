@@ -1,0 +1,148 @@
+"""Benchmark maintenance policies over a drifting stream (baselines + PPO).
+
+Runs each policy over the cached (or synthetic) stream, freezes the bank at each
+stage boundary, and evaluates per-stage image AUROC / pixel AUROC / PRO plus
+forgetting (stage-0 test after the full stream) and maintenance cost (bank
+mutations). Writes a CSV/JSON summary.
+"""
+import csv
+import json
+import os
+import sys
+
+import click
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+
+from patchcore.streaming import policies as P
+from patchcore.streaming.env import ActionConfig, MemoryMaintenanceEnv
+from patchcore.streaming.evaluate import evaluate_bank_on_stage
+
+
+def _load_readers(cache_dir, synthetic):
+    if synthetic:
+        from patchcore.streaming.synthetic import (
+            SyntheticConfig, make_all_test_stages, make_synthetic_stream,
+        )
+
+        cfg = SyntheticConfig()
+        return make_synthetic_stream(cfg), make_all_test_stages(cfg), None, None
+    from patchcore.streaming.cache import EmbeddingCacheReader
+
+    stream = EmbeddingCacheReader(os.path.join(cache_dir, "stream"))
+    test_dir = os.path.join(cache_dir, "test")
+    stages = sorted(d for d in os.listdir(test_dir) if d.startswith("stage_"))
+    tests = [EmbeddingCacheReader(os.path.join(test_dir, s)) for s in stages]
+    patch_shape = tuple(stream.manifest.get("patch_shape", (0, 0))) or None
+    imagesize = stream.manifest.get("imagesize")
+    return stream, tests, patch_shape, imagesize
+
+
+def _build_policy(name, ppo_path, device):
+    if name == "ppo":
+        import torch
+
+        from patchcore.streaming.policies import PPOPolicy
+        from patchcore.streaming.ppo import ActorCritic
+
+        ac = ActorCritic()
+        ac.load_state_dict(torch.load(ppo_path, map_location=device))
+        return PPOPolicy(ac, device=device)
+    cls = P.BASELINES[name]
+    return cls(k=8) if name in ("fifo", "random") else cls()
+
+
+@click.command()
+@click.option("--cache_dir", default=None)
+@click.option("--synthetic", is_flag=True)
+@click.option("--capacity", type=int, default=2000)
+@click.option("--warmup", type=int, default=100)
+@click.option("--n_nn", type=int, default=1)
+@click.option("--policies", "policy_names", default="static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo")
+@click.option("--ppo_path", default="ppo_policy.pt")
+@click.option("--action_mode", default="continuous6")
+@click.option("--seeds", default="0,1,2")
+@click.option("--out", default="streaming_results")
+def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
+         action_mode, seeds, out):
+    stream, tests, patch_shape, imagesize = _load_readers(cache_dir, synthetic)
+    seeds = [int(s) for s in seeds.split(",")]
+    names = [n for n in policy_names.split(",") if n]
+    os.makedirs(out, exist_ok=True)
+
+    def make_env(seed):
+        return MemoryMaintenanceEnv(
+            stream, capacity=capacity, warmup_images=warmup, seed=seed,
+            action_cfg=ActionConfig(mode=action_mode), n_nearest_neighbours=n_nn,
+        )
+
+    def eval_fn(env, stage):
+        return evaluate_bank_on_stage(
+            env.bank, tests[stage], n_nn, patch_shape, imagesize, "cpu"
+        )
+
+    rows = []
+    for name in names:
+        if name == "ppo" and not os.path.exists(ppo_path):
+            print(f"[skip] ppo policy not found at {ppo_path}")
+            continue
+        for seed in seeds:
+            env = make_env(seed)
+            policy = _build_policy(name, ppo_path, "cpu")
+            summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
+            # forgetting: re-evaluate stage-0 test with the final bank
+            forget = evaluate_bank_on_stage(
+                env.bank, tests[0], n_nn, patch_shape, imagesize, "cpu"
+            )["image_auroc"]
+            for ev in summ["evals"]:
+                rows.append({
+                    "policy": name, "seed": seed, "stage": ev["stage"],
+                    "image_auroc": ev.get("image_auroc", float("nan")),
+                    "pixel_auroc": ev.get("pixel_auroc", float("nan")),
+                    "pro": ev.get("pro", float("nan")),
+                })
+            rows.append({
+                "policy": name, "seed": seed, "stage": "final_forgetting",
+                "image_auroc": forget, "pixel_auroc": float("nan"),
+                "pro": float("nan"),
+            })
+            print(f"{name:26s} seed={seed} mean_reward={summ['mean_reward']:.4f} "
+                  f"admit={summ['total_admit']} evict={summ['total_evict']} "
+                  f"stage0_forget={forget:.4f}")
+
+    csv_path = os.path.join(out, "results.csv")
+    with open(csv_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=["policy", "seed", "stage", "image_auroc",
+                                          "pixel_auroc", "pro"])
+        w.writeheader()
+        w.writerows(rows)
+    with open(os.path.join(out, "results.json"), "w") as f:
+        json.dump(rows, f, indent=2, default=str)
+
+    _print_summary(rows, names)
+    print(f"\nwrote {csv_path}")
+
+
+def _print_summary(rows, names):
+    print("\n=== mean image AUROC per policy per stage (over seeds) ===")
+    stages = sorted({r["stage"] for r in rows if r["stage"] != "final_forgetting"},
+                    key=lambda x: int(x))
+    header = "policy".ljust(26) + "".join(f"stage{ s}".rjust(10) for s in stages) + "forget".rjust(10)
+    print(header)
+    for name in names:
+        cells = []
+        for s in stages:
+            vals = [r["image_auroc"] for r in rows
+                    if r["policy"] == name and r["stage"] == s
+                    and np.isfinite(r["image_auroc"])]
+            cells.append(f"{np.mean(vals):.3f}".rjust(10) if vals else "n/a".rjust(10))
+        fvals = [r["image_auroc"] for r in rows
+                 if r["policy"] == name and r["stage"] == "final_forgetting"
+                 and np.isfinite(r["image_auroc"])]
+        forget = f"{np.mean(fvals):.3f}".rjust(10) if fvals else "n/a".rjust(10)
+        print(name.ljust(26) + "".join(cells) + forget)
+
+
+if __name__ == "__main__":
+    main()
