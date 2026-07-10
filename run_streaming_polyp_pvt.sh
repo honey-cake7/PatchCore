@@ -27,16 +27,24 @@
 # ──────────────────────────────────────────────────────────────────────
 set -uo pipefail
 
-# ─── environment (cluster; comment out locally) ───────────────────────
-if command -v module &>/dev/null; then
-  cd /home/user1/aniket/Patchcore/PatchCore/patchcore-inspection
+# ─── environment ──────────────────────────────────────────────────────
+# Defaults to the cluster setup (this script is meant for `sbatch`). Under
+# SLURM `module` is a shell function that is NOT auto-defined, so we must load
+# it exactly like train_polyp_pvt.sh rather than probing with `command -v`.
+# For a laptop/CPU run pass LOCAL=1 (uses python3 and the repo-relative path).
+LOCAL=${LOCAL:-0}
+PY=${PY:-python}
+REPO_DIR=${REPO_DIR:-/home/user1/aniket/Patchcore/PatchCore/patchcore-inspection}
+
+if [ "${LOCAL}" = "1" ]; then
+  cd "$(cd "$(dirname "$0")" && pwd)/patchcore-inspection" || { echo "cannot cd to package dir"; exit 1; }
+  PY=${PY:-python3}
+else
+  cd "${REPO_DIR}" || { echo "cannot cd to ${REPO_DIR} (set REPO_DIR)"; exit 1; }
   module load compilers/anaconda3-2024.06
   module load libs/cuda-12.8
   source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
   conda activate patchcore
-else
-  # interactive / local: run from the repo's package dir
-  cd "$(dirname "$0")/patchcore-inspection"
 fi
 
 # ─── CONFIG (edit these) ──────────────────────────────────────────────
@@ -90,7 +98,7 @@ echo "=================================================================="
 
 # ─── STEP 1: cache embeddings (GPU) ───────────────────────────────────
 echo -e "\n[1/5] Caching embeddings (frozen ${BACKBONE}) ..."
-python bin/cache_embeddings.py \
+$PY bin/cache_embeddings.py \
   --backbone_name "${BACKBONE}" \
   "${LAYERS[@]}" \
   --data_path "${DATA_PATH}" \
@@ -108,7 +116,7 @@ python bin/cache_embeddings.py \
 
 # ─── STEP 2: Gate 1 — headroom ────────────────────────────────────────
 echo -e "\n[2/5] Gate 1 (headroom) ..."
-python bin/run_gate1.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
+$PY bin/run_gate1.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
   --n_nn "${N_NN}" --out "${RESULT_DIR}/gate1.json"
 GATE1=$?
 if [ "${GATE1}" -ne 0 ] && [ "${FORCE}" != "1" ]; then
@@ -119,7 +127,7 @@ fi
 
 # ─── STEP 3: Gate 2 — proxy validation ────────────────────────────────
 echo -e "\n[3/5] Gate 2 (proxy validation) ..."
-python bin/run_gate2.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
+$PY bin/run_gate2.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
   --n_nn "${N_NN}" --out "${RESULT_DIR}/gate2.json"
 GATE2=$?
 if [ "${GATE2}" -ne 0 ] && [ "${FORCE}" != "1" ]; then
@@ -130,7 +138,7 @@ fi
 
 # ─── STEP 4: train PPO ────────────────────────────────────────────────
 echo -e "\n[4/5] Training PPO maintenance policy ..."
-python bin/train_ppo.py \
+$PY bin/train_ppo.py \
   --cache_dir "${CACHE_DIR}" \
   --capacity "${CAPACITY}" \
   --warmup "${WARMUP}" \
@@ -141,7 +149,7 @@ python bin/train_ppo.py \
 
 # ─── STEP 5: benchmark all policies ───────────────────────────────────
 echo -e "\n[5/5] Benchmarking policies ..."
-python bin/run_streaming_baseline.py \
+$PY bin/run_streaming_baseline.py \
   --cache_dir "${CACHE_DIR}" \
   --capacity "${CAPACITY}" \
   --warmup "${WARMUP}" \
