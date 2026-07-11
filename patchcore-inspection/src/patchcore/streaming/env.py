@@ -95,6 +95,10 @@ class MemoryMaintenanceEnv:
 
         self.bank: Optional[DynamicMemoryBank] = None
         self._proxy: Optional[ProxyReward] = None
+        # The warmup coreset is expensive; compute it once and restore a snapshot
+        # on every subsequent reset instead of re-subsampling each episode.
+        self._init_snapshot = None
+        self._probe: Optional[np.ndarray] = None
         self._window: Deque[np.ndarray] = deque(maxlen=self.obs_cfg.window_images)
         self._novelty_hist: Deque[float] = deque(maxlen=self.obs_cfg.slope_horizon)
         self._ewma = 0.0
@@ -124,15 +128,26 @@ class MemoryMaintenanceEnv:
         return DynamicMemoryBank(self.capacity, self.dim)
 
     def reset(self, episode_slice: Optional[slice] = None) -> np.ndarray:
-        self.bank = self._init_bank()
-        # probe set + reward scales from the warmup features
-        warm = self._warmup_features()
-        probe = warm[self.rng.choice(len(warm), size=min(256, len(warm)), replace=False)]
-        cov_scale, delta = estimate_scales(self.bank, probe)
-        self.reward_cfg.coverage_scale = cov_scale
-        if self.reward_cfg.redundancy_delta is None:
-            self.reward_cfg.redundancy_delta = delta
-        self._proxy = ProxyReward(self.reward_cfg, probe)
+        if self._init_snapshot is None:
+            # First episode: pay the coreset cost once, then cache the result.
+            self.bank = self._init_bank()
+            self._init_snapshot = self.bank.snapshot()
+            warm = self._warmup_features()
+            self._probe = warm[
+                self.rng.choice(len(warm), size=min(256, len(warm)), replace=False)
+            ]
+            cov_scale, delta = estimate_scales(self.bank, self._probe)
+            self.reward_cfg.coverage_scale = cov_scale
+            if self.reward_cfg.redundancy_delta is None:
+                self.reward_cfg.redundancy_delta = delta
+        else:
+            # Later episodes: restore the cached warmup bank (cheap memcpy).
+            self.bank = DynamicMemoryBank(
+                self.capacity, self.dim,
+                nn_method=patchcore.common.FaissNN(False, 4),
+            )
+            self.bank.restore(self._init_snapshot)
+        self._proxy = ProxyReward(self.reward_cfg, self._probe)
 
         self._window.clear()
         self._novelty_hist.clear()
