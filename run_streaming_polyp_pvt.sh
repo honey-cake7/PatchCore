@@ -1,13 +1,12 @@
 #!/bin/bash
-#SBATCH --job-name=streaming-polyp-pvt
+#SBATCH --job-name=streaming-polyppvt
 #SBATCH --partition=LocalQ
 #SBATCH --account=default
-#SBATCH --gres=gpu:1
-#SBATCH --gres=shard:32
+#SBATCH --gres=shard:40
 #SBATCH --ntasks=1
-#SBATCH --output=/home/user1/aniket/Patchcore/logs/streaming_polyppvt%j.out
-#SBATCH --error=/home/user1/aniket/Patchcore/logs/streaming_polyppvt%j.err
 #SBATCH --cpus-per-task=32
+#SBATCH --output=../logs/streaming_output_%j.log
+#SBATCH --error=../logs/streaming_error_%j.log
 # ──────────────────────────────────────────────────────────────────────
 # run_streaming_polyp_pvt.sh
 # End-to-end RL memory-bank maintenance pipeline with the Polyp-PVT backbone:
@@ -17,37 +16,90 @@
 #   4. train the self-contained PPO maintenance policy
 #   5. benchmark all policies (baselines + PPO), writing per-stage AUROC/PRO
 #
-# RL is only justified if BOTH gates pass. By default this script STOPS if a gate
-# fails; pass FORCE=1 to run every step regardless.
-#
-# Usage:
-#   sbatch run_streaming_polyp_pvt.sh                 # cluster (SLURM)
-#   bash   run_streaming_polyp_pvt.sh                 # interactive
-#   FORCE=1 DRIFT=staged_gradual_4 bash run_streaming_polyp_pvt.sh
+# RL is only justified if BOTH gates pass. By default this STOPS if a gate fails;
+# pass FORCE=1 to run every step regardless.
+#   sbatch run_streaming_polyp_pvt.sh
+#   FORCE=1 DRIFT=staged_gradual_4 sbatch run_streaming_polyp_pvt.sh
 # ──────────────────────────────────────────────────────────────────────
-set -uo pipefail
 
-# ─── environment ──────────────────────────────────────────────────────
-# Defaults to the cluster setup (this script is meant for `sbatch`). Under
-# SLURM `module` is a shell function that is NOT auto-defined, so we must load
-# it exactly like train_polyp_pvt.sh rather than probing with `command -v`.
-# For a laptop/CPU run pass LOCAL=1 (uses python3 and the repo-relative path).
-LOCAL=${LOCAL:-0}
-PY=${PY:-python}
-REPO_DIR=${REPO_DIR:-/home/user1/aniket/Patchcore/PatchCore/patchcore-inspection}
+# Go to submission directory
+cd $SLURM_SUBMIT_DIR
 
-if [ "${LOCAL}" = "1" ]; then
-  cd "$(cd "$(dirname "$0")" && pwd)/patchcore-inspection" || { echo "cannot cd to package dir"; exit 1; }
-  PY=${PY:-python3}
-else
-  cd "${REPO_DIR}" || { echo "cannot cd to ${REPO_DIR} (set REPO_DIR)"; exit 1; }
-  module load compilers/anaconda3-2024.06
-  module load libs/cuda-12.8
-  source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
-  conda activate patchcore
-fi
+# ------------------------------------------------------------------------------
+# Project Paths
+# ------------------------------------------------------------------------------
+PROJECT_ROOT=${PROJECT_ROOT:-/home/user1/aniket/Patchcore/PatchCore}
+PKG_DIR=${PKG_DIR:-${PROJECT_ROOT}/patchcore-inspection}
+CONDA_ENV=${CONDA_ENV:-patchcore}
 
-# ─── CONFIG (edit these) ──────────────────────────────────────────────
+cd ${PKG_DIR}
+mkdir -p logs
+
+# ------------------------------------------------------------------------------
+# Load Modules
+# ------------------------------------------------------------------------------
+module purge
+module load compilers/anaconda3-2024.06
+module load libs/cuda-12.8
+
+# ------------------------------------------------------------------------------
+# Activate Conda
+# ------------------------------------------------------------------------------
+source /apps/compilers/anaconda3-2024.06/etc/profile.d/conda.sh
+conda activate ${CONDA_ENV}
+
+# IMPORTANT: Put the environment Python first (non-interactive shells otherwise
+# leave the base/system python ahead on PATH -> "python: command not found").
+export PATH=$CONDA_PREFIX/bin:$(echo $PATH | sed "s#$CONDA_PREFIX/bin:##")
+hash -r
+
+# ------------------------------------------------------------------------------
+# CUDA
+# ------------------------------------------------------------------------------
+export CUDA_HOME=/apps/libs/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+TORCH_LIB=$(python -c "import os,torch;print(os.path.join(os.path.dirname(torch.__file__),'lib'))" 2>/dev/null)
+export LD_LIBRARY_PATH=${TORCH_LIB}:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
+
+# ------------------------------------------------------------------------------
+# Python
+# ------------------------------------------------------------------------------
+export PYTHONPATH=${PKG_DIR}/src:${PYTHONPATH}
+
+# ------------------------------------------------------------------------------
+# Environment
+# ------------------------------------------------------------------------------
+export TF_ENABLE_ONEDNN_OPTS=0
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export HF_DATASETS_OFFLINE=1
+
+echo "========================================================="
+echo "Python      : $(which python)"
+echo "Version     : $(python --version)"
+echo "Conda Env   : $CONDA_DEFAULT_ENV"
+echo "CUDA_HOME   : $CUDA_HOME"
+echo "========================================================="
+
+# ------------------------------------------------------------------------------
+# Verify Environment
+# ------------------------------------------------------------------------------
+python - <<'EOF'
+import torch, faiss, timm, patchcore
+print("="*60)
+print("Environment OK")
+print("Torch          :", torch.__version__)
+print("CUDA           :", torch.version.cuda)
+print("CUDA Available :", torch.cuda.is_available())
+print("faiss          :", faiss.__version__)
+print("timm           :", timm.__version__)
+print("patchcore      : OK")
+print("="*60)
+EOF
+
+# ------------------------------------------------------------------------------
+# CONFIG (edit these)
+# ------------------------------------------------------------------------------
 DATA_PATH=${DATA_PATH:-/home/user1/aniket/Patchcore/dataset/kvasir_patchcore}
 CLASSNAME=${CLASSNAME:-kvasir}                 # subfolder under DATA_PATH (mvtec-style)
 BACKBONE=${BACKBONE:-polyp-pvt}                # or pvtv2_b2 (ImageNet) to compare
@@ -81,77 +133,83 @@ PPO_OUT=${PPO_OUT:-${RESULT_DIR}/ppo_${TAG}.pt}
 mkdir -p "${RESULT_DIR}" "$(dirname "${CACHE_DIR}")"
 
 # PVTv2 weights (download with download_and_inspect_pvt_weights.sh)
-export POLYP_PVT_WEIGHTS=${POLYP_PVT_WEIGHTS:-/home/user1/aniket/Patchcore/PatchCore/models/PolypPVT.pth}
-export PVTV2_B2_WEIGHTS=${PVTV2_B2_WEIGHTS:-/home/user1/aniket/Patchcore/PatchCore/models/pvt_v2_b2.pth}
+export POLYP_PVT_WEIGHTS=${POLYP_PVT_WEIGHTS:-${PROJECT_ROOT}/models/PolypPVT.pth}
+export PVTV2_B2_WEIGHTS=${PVTV2_B2_WEIGHTS:-${PROJECT_ROOT}/models/pvt_v2_b2.pth}
 
-# On macOS, faiss-cpu + torch clash on OpenMP; harmless on the GPU cluster.
-export KMP_DUPLICATE_LIB_OK=${KMP_DUPLICATE_LIB_OK:-TRUE}
-
-export PYTHONPATH=src
 FORCE=${FORCE:-0}
 
-echo "=================================================================="
+echo "========================================================="
 echo " Streaming PatchCore | backbone=${BACKBONE} drift=${DRIFT}/${DRIFT_MODE}"
 echo " data=${DATA_PATH}/${CLASSNAME}  M=${CAPACITY}  k=${N_NN}"
 echo " cache=${CACHE_DIR}  results=${RESULT_DIR}"
-echo "=================================================================="
+echo "========================================================="
 
-# ─── STEP 1: cache embeddings (GPU) ───────────────────────────────────
+# ------------------------------------------------------------------------------
+# STEP 1: cache embeddings (GPU)
+# ------------------------------------------------------------------------------
 echo -e "\n[1/5] Caching embeddings (frozen ${BACKBONE}) ..."
-$PY bin/cache_embeddings.py \
-  --backbone_name "${BACKBONE}" \
-  "${LAYERS[@]}" \
-  --data_path "${DATA_PATH}" \
-  --classname "${CLASSNAME}" \
-  --drift "${DRIFT}" \
-  --drift_mode "${DRIFT_MODE}" \
-  --seed "${SEED}" \
-  --resize "${RESIZE}" \
-  --imagesize "${IMAGESIZE}" \
-  --pretrain_embed_dimension "${PRE_DIM}" \
-  --target_embed_dimension "${TGT_DIM}" \
-  --patchsize "${PATCHSIZE}" \
-  --gpu 0 \
-  --out_dir "${CACHE_DIR}" || { echo "caching failed"; exit 1; }
+python -u bin/cache_embeddings.py \
+    --backbone_name             "${BACKBONE}" \
+    "${LAYERS[@]}" \
+    --data_path                 "${DATA_PATH}" \
+    --classname                 "${CLASSNAME}" \
+    --drift                     "${DRIFT}" \
+    --drift_mode                "${DRIFT_MODE}" \
+    --seed                      "${SEED}" \
+    --resize                    "${RESIZE}" \
+    --imagesize                 "${IMAGESIZE}" \
+    --pretrain_embed_dimension  "${PRE_DIM}" \
+    --target_embed_dimension    "${TGT_DIM}" \
+    --patchsize                 "${PATCHSIZE}" \
+    --gpu                       0 \
+    --out_dir                   "${CACHE_DIR}" || { echo "caching failed"; exit 1; }
 
-# ─── STEP 2: Gate 1 — headroom ────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# STEP 2: Gate 1 — headroom
+# ------------------------------------------------------------------------------
 echo -e "\n[2/5] Gate 1 (headroom) ..."
-$PY bin/run_gate1.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
-  --n_nn "${N_NN}" --out "${RESULT_DIR}/gate1.json"
+python -u bin/run_gate1.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
+    --n_nn "${N_NN}" --out "${RESULT_DIR}/gate1.json"
 
 
-# ─── STEP 3: Gate 2 — proxy validation ────────────────────────────────
+# ------------------------------------------------------------------------------
+# STEP 3: Gate 2 — proxy validation
+# ------------------------------------------------------------------------------
 echo -e "\n[3/5] Gate 2 (proxy validation) ..."
-$PY bin/run_gate2.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
-  --n_nn "${N_NN}" --out "${RESULT_DIR}/gate2.json"
+python -u bin/run_gate2.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
+    --n_nn "${N_NN}" --out "${RESULT_DIR}/gate2.json"
 
 
-# ─── STEP 4: train PPO ────────────────────────────────────────────────
+# ------------------------------------------------------------------------------
+# STEP 4: train PPO
+# ------------------------------------------------------------------------------
 echo -e "\n[4/5] Training PPO maintenance policy ..."
-$PY bin/train_ppo.py \
-  --cache_dir "${CACHE_DIR}" \
-  --capacity "${CAPACITY}" \
-  --warmup "${WARMUP}" \
-  --total_env_steps "${PPO_STEPS}" \
-  --seed "${TRAIN_SEEDS}" \
-  --out "${PPO_OUT}" \
-  --eval_baselines || { echo "PPO training failed"; exit 1; }
+python -u bin/train_ppo.py \
+    --cache_dir        "${CACHE_DIR}" \
+    --capacity         "${CAPACITY}" \
+    --warmup           "${WARMUP}" \
+    --total_env_steps  "${PPO_STEPS}" \
+    --seed             "${TRAIN_SEEDS}" \
+    --out              "${PPO_OUT}" \
+    --eval_baselines || { echo "PPO training failed"; exit 1; }
 
-# ─── STEP 5: benchmark all policies ───────────────────────────────────
+# ------------------------------------------------------------------------------
+# STEP 5: benchmark all policies
+# ------------------------------------------------------------------------------
 echo -e "\n[5/5] Benchmarking policies ..."
-$PY bin/run_streaming_baseline.py \
-  --cache_dir "${CACHE_DIR}" \
-  --capacity "${CAPACITY}" \
-  --warmup "${WARMUP}" \
-  --n_nn "${N_NN}" \
-  --policies "${POLICIES}" \
-  --ppo_path "${PPO_OUT}" \
-  --seeds "${EVAL_SEEDS}" \
-  --out "${RESULT_DIR}" || { echo "benchmark failed"; exit 1; }
+python -u bin/run_streaming_baseline.py \
+    --cache_dir  "${CACHE_DIR}" \
+    --capacity   "${CAPACITY}" \
+    --warmup     "${WARMUP}" \
+    --n_nn       "${N_NN}" \
+    --policies   "${POLICIES}" \
+    --ppo_path   "${PPO_OUT}" \
+    --seeds      "${EVAL_SEEDS}" \
+    --out        "${RESULT_DIR}" || { echo "benchmark failed"; exit 1; }
 
-echo -e "\n=================================================================="
+echo "========================================================="
 echo " DONE. Artifacts under ${RESULT_DIR}/"
 echo "   gate1.json / gate2.json   — gate outcomes"
 echo "   ${PPO_OUT}                — trained PPO policy"
 echo "   ${RESULT_DIR}/results.csv — per-stage AUROC/PRO for every policy"
-echo "=================================================================="
+echo "========================================================="
