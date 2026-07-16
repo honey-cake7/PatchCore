@@ -1,18 +1,56 @@
 """Dynamic, budgeted memory bank with add / evict / k-NN under drift.
 
-The bank keeps a pure-numpy array as the source of truth and rebuilds an exact
-``faiss.IndexFlatL2`` after mutations (see the plan's FAISS decision). Rebuild
-from numpy guarantees that evaluation is byte-identical to stock PatchCore: the
-same vectors, installed through :class:`patchcore.common.NearestNeighbourScorer`,
-produce the same k-NN L2 scores.
+The bank keeps a pure-numpy array as the source of truth. k-NN queries run as
+exact brute-force L2 through torch on the fastest available device (CUDA/MPS
+when present, multi-threaded CPU otherwise): at streaming scale (M ~ 2000) one
+distance matrix per query batch is far cheaper than rebuilding a FAISS index
+after every mutation, and it keeps the hot path off the 4-thread FAISS/OpenMP
+pin. Final evaluation still goes through
+:class:`patchcore.common.NearestNeighbourScorer` via :meth:`install_into`, so
+anomaly scores stay byte-identical to stock PatchCore.
+
+Expensive per-step derived quantities (member NN-2 redundancy, eviction
+entry features) are cached per mutation step: the observation, the action
+decoder, and the reward all consume the same bank state within a step, so
+they share one computation instead of re-running the k-NN each time.
 """
-import copy
+import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
+import torch
 
-import patchcore.common
+
+_KNN_CHUNK = 8192  # bound the [n_query, M] distance matrix to ~64MB at M=2000
+
+
+def knn_device() -> torch.device:
+    """Device used for brute-force k-NN (override with STREAMING_KNN_DEVICE).
+
+    Auto-selects CUDA when available, otherwise multi-threaded CPU. MPS is
+    deliberately not auto-selected: its per-call dispatch/sync overhead makes
+    it slower than CPU at this bank size (set STREAMING_KNN_DEVICE=mps to try).
+    """
+    name = os.environ.get("STREAMING_KNN_DEVICE")
+    if name:
+        return torch.device(name)
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def intra_batch_nn2(x: np.ndarray, device: Optional[torch.device] = None) -> np.ndarray:
+    """Distance of each row of ``x`` to its nearest *other* row ([n] float32)."""
+    n = len(x)
+    if n < 2:
+        return np.zeros(n, dtype=np.float32)
+    t = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(
+        device or knn_device()
+    )
+    d = torch.cdist(t, t)
+    d.fill_diagonal_(float("inf"))
+    return d.min(dim=1).values.cpu().numpy().astype(np.float32)
 
 
 # Per-slot metadata columns kept alongside the stored vectors. These feed both
@@ -35,26 +73,25 @@ class DynamicMemoryBank:
     Args:
         capacity: hard budget ``M`` (maximum number of active entries).
         dim: embedding dimension ``D``.
-        nn_method: a :class:`patchcore.common.FaissNN` used for k-NN. A fresh
-            index is (re)built from the active vectors after each mutation
-            (batched by ``rebuild_every``).
-        rebuild_every: rebuild the FAISS index only every N mutations; the index
-            is always rebuilt lazily before a query if stale.
+        nn_method: unused; accepted for backwards compatibility with the old
+            FAISS-backed implementation.
+        rebuild_every: unused; accepted for backwards compatibility.
         seed: RNG seed for redundancy subsampling.
+        device: torch device for k-NN (defaults to :func:`knn_device`).
     """
 
     def __init__(
         self,
         capacity: int,
         dim: int,
-        nn_method: Optional[patchcore.common.FaissNN] = None,
+        nn_method=None,
         rebuild_every: int = 1,
         seed: int = 0,
+        device: Optional[torch.device] = None,
     ) -> None:
         self.capacity = int(capacity)
         self.dim = int(dim)
-        self.nn_method = nn_method or patchcore.common.FaissNN(False, 4)
-        self.rebuild_every = int(rebuild_every)
+        self._device = device or knn_device()
         self._rng = np.random.default_rng(seed)
 
         self._store = np.zeros((self.capacity, self.dim), dtype=np.float32)
@@ -66,11 +103,16 @@ class DynamicMemoryBank:
 
         self._size = 0
         self._step = 0                 # logical mutation clock
-        self._mutations_since_build = 0
-        self._index_dirty = True
+        self._base_dirty = True
+        self._base: Optional[torch.Tensor] = None  # active vectors on device
         # Maps a compact index position (0..size-1, in active-slot order) back to
-        # the underlying slot id; rebuilt with the FAISS index.
+        # the underlying slot id; rebuilt with the device tensor.
         self._index_to_slot = np.empty(0, dtype=np.int64)
+        # Per-mutation-step caches of derived per-member quantities.
+        self._nn2_cache: Optional[np.ndarray] = None
+        self._nn2_step = -1
+        self._ent_cache: Optional[np.ndarray] = None
+        self._ent_step = -1
 
     # ---- basic state -----------------------------------------------------
     def __len__(self) -> int:
@@ -135,27 +177,21 @@ class DynamicMemoryBank:
 
     def _mark_mutated(self) -> None:
         self._step += 1
-        self._mutations_since_build += 1
-        self._index_dirty = True
+        self._base_dirty = True
 
     # ---- indexing / queries ---------------------------------------------
-    def _ensure_index(self, force: bool = False) -> None:
-        if not self._index_dirty:
-            return
-        if (
-            not force
-            and self._mutations_since_build < self.rebuild_every
-            and self.nn_method.search_index is not None
-        ):
+    def _ensure_base(self) -> None:
+        if not self._base_dirty:
             return
         slots = self.active_slots()
         self._index_to_slot = slots
         if len(slots) == 0:
-            self.nn_method.reset_index()
+            self._base = None
         else:
-            self.nn_method.fit(np.ascontiguousarray(self._store[slots]))
-        self._index_dirty = False
-        self._mutations_since_build = 0
+            self._base = torch.from_numpy(
+                np.ascontiguousarray(self._store[slots])
+            ).to(self._device)
+        self._base_dirty = False
 
     def knn(
         self, queries: np.ndarray, k: int = 1, record_hits: bool = False
@@ -171,22 +207,33 @@ class DynamicMemoryBank:
         if queries.ndim == 1:
             queries = queries[None]
         n = len(queries)
+        if n == 0:
+            return (
+                np.zeros((0, k), dtype=np.float32),
+                np.zeros((0, k), dtype=np.int64),
+            )
         if self._size == 0:
             return (
                 np.full((n, k), np.inf, dtype=np.float32),
                 np.full((n, k), -1, dtype=np.int64),
             )
-        self._ensure_index()
+        self._ensure_base()
         kk = min(k, self._size)
-        # FaissNN.run returns (distances, indices) into the compact index order.
-        dists, idxs = self.nn_method.run(kk, queries)
-        dists = np.sqrt(np.clip(dists, 0, None))  # IndexFlatL2 returns squared L2
-        slots = np.where(idxs >= 0, self._index_to_slot[idxs.clip(min=0)], -1)
+        dist_chunks, idx_chunks = [], []
+        for start in range(0, n, _KNN_CHUNK):
+            q = torch.from_numpy(queries[start:start + _KNN_CHUNK]).to(self._device)
+            d = torch.cdist(q, self._base)
+            dd, ii = torch.topk(d, kk, dim=1, largest=False)
+            dist_chunks.append(dd.cpu().numpy())
+            idx_chunks.append(ii.cpu().numpy())
+        dists = np.concatenate(dist_chunks, axis=0)
+        idxs = np.concatenate(idx_chunks, axis=0)
+        slots = self._index_to_slot[idxs]
         if record_hits and kk >= 1:
             nearest = slots[:, 0]
-            valid = nearest >= 0
-            np.add.at(self.hit_count, nearest[valid], 1)
-            self.last_hit_step[nearest[valid]] = self._step
+            np.add.at(self.hit_count, nearest, 1)
+            self.last_hit_step[nearest] = self._step
+            self._ent_step = -1  # hit stats feed entry_features; invalidate
         if kk < k:  # pad to requested width
             pad_d = np.full((n, k - kk), np.inf, dtype=np.float32)
             pad_i = np.full((n, k - kk), -1, dtype=np.int64)
@@ -194,29 +241,43 @@ class DynamicMemoryBank:
             slots = np.concatenate([slots, pad_i], axis=1)
         return dists.astype(np.float32), slots.astype(np.int64)
 
+    def _member_nn2(self) -> np.ndarray:
+        """NN-2 distance of every active member to the rest, in active-slot
+        order; cached per mutation step (observation, eviction features and
+        reward all read it within one step)."""
+        if self._nn2_step == self._step and self._nn2_cache is not None:
+            return self._nn2_cache
+        if self._size < 2:
+            nn2 = np.zeros(0, dtype=np.float32)
+        else:
+            # k=2: the nearest is the member itself (distance 0); take the second.
+            dists, _ = self.knn(self._store[self.active_slots()], k=2)
+            nn2 = dists[:, 1]
+        self._nn2_cache = nn2
+        self._nn2_step = self._step
+        return nn2
+
     def member_redundancy(self, sample: int = 2048) -> np.ndarray:
         """NN-2 distance of (up to ``sample``) active members to the rest.
 
         Small values mean the bank contains near-duplicates — budget wasted on
         redundancy. Returns one distance per sampled member.
         """
-        if self._size < 2:
-            return np.zeros(0, dtype=np.float32)
-        slots = self.active_slots()
-        if len(slots) > sample:
-            slots = self._rng.choice(slots, size=sample, replace=False)
-        queries = self._store[slots]
-        # k=2: the nearest is the member itself (distance 0); take the second.
-        dists, _ = self.knn(queries, k=2)
-        return dists[:, 1]
+        nn2 = self._member_nn2()
+        if len(nn2) > sample:
+            nn2 = self._rng.choice(nn2, size=sample, replace=False)
+        return nn2
 
     def entry_features(self) -> np.ndarray:
         """Per-active-entry features ``[m, 4]`` for the eviction utility.
 
         Columns: normalized age, negative hit rate, negative NN-2 redundancy,
         distance to the recent-insertion centroid. All are computed so that a
-        higher weighted sum means "more worth keeping".
+        higher weighted sum means "more worth keeping". Cached per mutation
+        step.
         """
+        if self._ent_step == self._step and self._ent_cache is not None:
+            return self._ent_cache
         slots = self.active_slots()
         m = len(slots)
         if m == 0:
@@ -226,18 +287,18 @@ class DynamicMemoryBank:
         exposure = np.maximum(self._step - self.insert_step[slots], 1)
         hit_rate = self.hit_count[slots] / exposure
         hit_rate = hit_rate / (hit_rate.max() + 1e-6)
-        red = self.member_redundancy(sample=m) if m >= 2 else np.zeros(m, np.float32)
-        if len(red) != m:  # member_redundancy subsampled; recompute full
-            dists, _ = self.knn(self._store[slots], k=2)
-            red = dists[:, 1]
+        red = self._member_nn2() if m >= 2 else np.zeros(m, np.float32)
         red_n = red / (red.max() + 1e-6)
         centroid = self._store[slots[self.insert_step[slots] >= np.median(
             self.insert_step[slots])]].mean(axis=0, keepdims=True) if m else 0.0
         dist_recent = np.linalg.norm(self._store[slots] - centroid, axis=1)
         dist_recent = dist_recent / (dist_recent.max() + 1e-6)
-        return np.stack([age, -hit_rate, -red_n, dist_recent], axis=1).astype(
+        feats = np.stack([age, -hit_rate, -red_n, dist_recent], axis=1).astype(
             np.float32
         )
+        self._ent_cache = feats
+        self._ent_step = self._step
+        return feats
 
     # ---- persistence -----------------------------------------------------
     def snapshot(self) -> BankSnapshot:
@@ -261,12 +322,11 @@ class DynamicMemoryBank:
         self.last_hit_step = snap.last_hit_step.copy()
         self._size = snap.size
         self._step = snap.step
-        self._index_dirty = True
-        self._mutations_since_build = self.rebuild_every  # force rebuild next query
+        self._base_dirty = True
+        self._nn2_step = -1
+        self._ent_step = -1
 
-    def install_into(
-        self, scorer: patchcore.common.NearestNeighbourScorer
-    ) -> patchcore.common.NearestNeighbourScorer:
+    def install_into(self, scorer):
         """Load the active vectors into a stock NearestNeighbourScorer.
 
         This is the bridge to identical-to-PatchCore evaluation: the scorer's
@@ -282,13 +342,13 @@ class DynamicMemoryBank:
         vectors: np.ndarray,
         capacity: int,
         stage: int = 0,
-        nn_method: Optional[patchcore.common.FaissNN] = None,
+        nn_method=None,
         seed: int = 0,
     ) -> "DynamicMemoryBank":
         """Construct a bank pre-filled with ``vectors`` (e.g. a stage-0 coreset)."""
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)
         capacity = max(capacity, len(vectors))
-        bank = cls(capacity, vectors.shape[1], nn_method=nn_method, seed=seed)
+        bank = cls(capacity, vectors.shape[1], seed=seed)
         bank.add(vectors, stage=stage)
         bank._step = 0  # initial fill is not counted as a mutation step
         bank.insert_step[:] = 0

@@ -63,9 +63,10 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
 @click.option("--total_env_steps", type=int, default=200_000)
 @click.option("--seed", type=int, default=0)
 @click.option("--out", default="ppo_policy.pt")
+@click.option("--device", default="cpu", help="Device for the actor-critic net")
 @click.option("--eval_baselines", is_flag=True, help="Compare learned proxy return vs baselines")
 def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
-         total_env_steps, seed, out, eval_baselines):
+         total_env_steps, seed, out, device, eval_baselines):
     from patchcore.streaming.ppo import PPOConfig, PPOTrainer
 
     if synthetic:
@@ -75,7 +76,7 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
     else:
         raise click.UsageError("pass --cache_dir or --synthetic")
 
-    cfg = PPOConfig(total_env_steps=total_env_steps, device="cpu")
+    cfg = PPOConfig(total_env_steps=total_env_steps, device=device)
     trainer = PPOTrainer(env_fns, cfg)
     history = trainer.train()
     trainer.save(out)

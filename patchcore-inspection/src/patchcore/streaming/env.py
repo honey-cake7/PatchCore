@@ -12,8 +12,7 @@ from typing import Deque, List, Optional, Tuple
 
 import numpy as np
 
-import patchcore.common
-from patchcore.streaming.bank import DynamicMemoryBank
+from patchcore.streaming.bank import DynamicMemoryBank, intra_batch_nn2, knn_device
 from patchcore.streaming.reward import ProxyReward, RewardConfig, estimate_scales
 
 
@@ -119,11 +118,10 @@ class MemoryMaintenanceEnv:
             if len(feats) > self.capacity:
                 pct = self.capacity / len(feats)
                 feats = patchcore.sampler.ApproximateGreedyCoresetSampler(
-                    percentage=pct, device=torch.device("cpu")
+                    percentage=pct, device=knn_device()
                 ).run(np.ascontiguousarray(feats, dtype=np.float32))
             return DynamicMemoryBank.from_vectors(
                 feats[: self.capacity], capacity=self.capacity,
-                nn_method=patchcore.common.FaissNN(False, 4),
             )
         return DynamicMemoryBank(self.capacity, self.dim)
 
@@ -142,10 +140,7 @@ class MemoryMaintenanceEnv:
                 self.reward_cfg.redundancy_delta = delta
         else:
             # Later episodes: restore the cached warmup bank (cheap memcpy).
-            self.bank = DynamicMemoryBank(
-                self.capacity, self.dim,
-                nn_method=patchcore.common.FaissNN(False, 4),
-            )
+            self.bank = DynamicMemoryBank(self.capacity, self.dim)
             self.bank.restore(self._init_snapshot)
         self._proxy = ProxyReward(self.reward_cfg, self._probe)
 
@@ -200,10 +195,7 @@ class MemoryMaintenanceEnv:
 
         # intra-batch density: each admissible patch to nearest other patch
         if len(A) > 1:
-            tmp = DynamicMemoryBank(len(A), self.dim)
-            tmp.add(A)
-            dd, _ = tmp.knn(A, k=2)
-            intra = dd[:, 1]
+            intra = intra_batch_nn2(A)
             intra_log = np.log1p(intra)
             density = [intra_log.mean(), np.median(intra_log), np.percentile(intra_log, 90)]
         else:

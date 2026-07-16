@@ -111,7 +111,10 @@ def estimate_scales(bank, sample_patches: np.ndarray) -> Tuple[float, float]:
     dists, _ = bank.knn(np.ascontiguousarray(sample_patches, dtype=np.float32), k=1)
     d = dists[:, 0]
     d = d[np.isfinite(d)]
-    positive = d[d > 1e-6]
+    # Exact bank members must count as distance 0. Brute-force L2 via matmul
+    # (torch/faiss alike) returns O(1e-3)-scale noise for identical vectors,
+    # so use a threshold relative to the member spacing, not an absolute one.
+    positive = d[d > max(1e-6, 0.05 * delta)]
     if len(positive) >= max(4, int(0.2 * len(d))):
         cov_scale = float(np.median(positive))
     else:

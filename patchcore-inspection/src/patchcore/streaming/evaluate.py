@@ -4,6 +4,7 @@ Scoring goes through the stock :class:`patchcore.common.NearestNeighbourScorer`
 so anomaly scores are identical to what stock PatchCore would produce for the
 same bank vectors — only the memory-bank *contents* differ across policies.
 """
+import os
 from typing import Optional, Tuple
 
 import numpy as np
@@ -12,6 +13,13 @@ import torch
 import patchcore.common
 import patchcore.metrics
 from patchcore.patchcore import PatchMaker
+
+
+def _available_cpus() -> int:
+    try:
+        return len(os.sched_getaffinity(0))  # respects SLURM/cgroup allocation
+    except AttributeError:  # non-Linux
+        return os.cpu_count() or 4
 
 
 def _image_and_pixel_scores(
@@ -25,7 +33,7 @@ def _image_and_pixel_scores(
     """Return (image_scores [N], segmentations [N,H,W] or None)."""
     scorer = patchcore.common.NearestNeighbourScorer(
         n_nearest_neighbours=min(n_nearest_neighbours, max(len(bank), 1)),
-        nn_method=patchcore.common.FaissNN(False, 4),
+        nn_method=patchcore.common.FaissNN(False, _available_cpus()),
     )
     bank.install_into(scorer)
 

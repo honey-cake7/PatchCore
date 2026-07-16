@@ -120,7 +120,11 @@ IMAGESIZE=${IMAGESIZE:-224}
 CAPACITY=${CAPACITY:-2000}                     # memory budget M
 WARMUP=${WARMUP:-100}                          # warmup images for stage-0 bank + reward scales
 N_NN=${N_NN:-5}                                # k for k-NN scoring (matches train_polyp_pvt.sh)
-PPO_STEPS=${PPO_STEPS:-2000000}
+# Episodes are only (stream length - warmup) steps, so 200k total env steps
+# already replays the stream dozens of times per env; the old 2M default was
+# ~10x more compute for a 53-dim-obs MLP policy. Raise via PPO_STEPS=... if
+# the mean_reward curve is still climbing at the end of training.
+PPO_STEPS=${PPO_STEPS:-200000}
 TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
 POLICIES=${POLICIES:-static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo}
