@@ -220,8 +220,9 @@ class MemoryMaintenanceEnv:
             x = np.arange(len(y))
             slope = float(np.polyfit(x, y, 1)[0])
 
-        ent = bank.entry_features()
-        if len(ent):
+        # age stats straight from insert steps (entry_features would drag in
+        # the O(M^2) redundancy column, which only evictions need)
+        if len(bank):
             slots = bank.active_slots()
             age = (bank.step - bank.insert_step[slots]).astype(np.float32)
             age_norm = age / (age.max() + 1e-6)
@@ -231,8 +232,7 @@ class MemoryMaintenanceEnv:
 
         # random-projection distributional summary
         proj_batch = (A @ self._proj).mean(axis=0) if len(A) else np.zeros(cfg.d_proj)
-        bank_vecs = bank.vectors()
-        proj_bank = (bank_vecs @ self._proj).mean(axis=0) if len(bank_vecs) else np.zeros(cfg.d_proj)
+        proj_bank = bank.projected_mean(self._proj)
         proj_diff = np.linalg.norm(proj_batch - proj_bank)
 
         scalar = np.array(

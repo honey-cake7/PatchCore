@@ -22,7 +22,9 @@ import numpy as np
 import torch
 
 
-_KNN_CHUNK = 8192  # bound the [n_query, M] distance matrix to ~64MB at M=2000
+# Bound each [chunk, M] distance matrix to ~64M float32 entries (256MB), so
+# query batches stay memory-safe as the bank capacity M grows.
+_KNN_CHUNK_ENTRIES = 64_000_000
 
 
 def knn_device() -> torch.device:
@@ -219,9 +221,10 @@ class DynamicMemoryBank:
             )
         self._ensure_base()
         kk = min(k, self._size)
+        chunk = max(256, _KNN_CHUNK_ENTRIES // self._size)
         dist_chunks, idx_chunks = [], []
-        for start in range(0, n, _KNN_CHUNK):
-            q = torch.from_numpy(queries[start:start + _KNN_CHUNK]).to(self._device)
+        for start in range(0, n, chunk):
+            q = torch.from_numpy(queries[start:start + chunk]).to(self._device)
             d = torch.cdist(q, self._base)
             dd, ii = torch.topk(d, kk, dim=1, largest=False)
             dist_chunks.append(dd.cpu().numpy())
@@ -240,6 +243,22 @@ class DynamicMemoryBank:
             dists = np.concatenate([dists, pad_d], axis=1)
             slots = np.concatenate([slots, pad_i], axis=1)
         return dists.astype(np.float32), slots.astype(np.int64)
+
+    def projected_mean(self, proj: np.ndarray) -> np.ndarray:
+        """Mean of the active vectors projected through ``proj`` ([D, p] -> [p]).
+
+        Runs on the cached device tensor, so it stays cheap at large M
+        (the numpy equivalent ``vectors() @ proj`` copies and re-projects the
+        whole bank every step).
+        """
+        if self._size == 0:
+            return np.zeros(proj.shape[1], dtype=np.float32)
+        self._ensure_base()
+        p = torch.from_numpy(np.ascontiguousarray(proj, dtype=np.float32)).to(
+            self._device
+        )
+        # mean-then-project == project-then-mean (linearity), but O(D*p) cheaper
+        return (self._base.mean(dim=0) @ p).cpu().numpy().astype(np.float32)
 
     def _member_nn2(self) -> np.ndarray:
         """NN-2 distance of every active member to the rest, in active-slot
@@ -261,12 +280,23 @@ class DynamicMemoryBank:
         """NN-2 distance of (up to ``sample``) active members to the rest.
 
         Small values mean the bank contains near-duplicates — budget wasted on
-        redundancy. Returns one distance per sampled member.
+        redundancy. Returns one distance per sampled member. When a full
+        per-member cache already exists for this step it is subsampled;
+        otherwise only ``sample`` members are queried (O(sample * M) instead of
+        the O(M^2) full computation, which matters for large banks).
         """
-        nn2 = self._member_nn2()
-        if len(nn2) > sample:
-            nn2 = self._rng.choice(nn2, size=sample, replace=False)
-        return nn2
+        if self._size < 2:
+            return np.zeros(0, dtype=np.float32)
+        if self._nn2_step == self._step and self._nn2_cache is not None:
+            nn2 = self._nn2_cache
+            if len(nn2) > sample:
+                nn2 = self._rng.choice(nn2, size=sample, replace=False)
+            return nn2
+        if sample >= self._size:
+            return self._member_nn2()
+        slots = self._rng.choice(self.active_slots(), size=sample, replace=False)
+        dists, _ = self.knn(self._store[slots], k=2)
+        return dists[:, 1]
 
     def entry_features(self) -> np.ndarray:
         """Per-active-entry features ``[m, 4]`` for the eviction utility.

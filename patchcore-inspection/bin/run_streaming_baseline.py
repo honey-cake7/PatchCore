@@ -92,9 +92,10 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
             policy = _build_policy(name, ppo_path, "cpu")
             summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
             # forgetting: re-evaluate stage-0 test with the final bank
-            forget = evaluate_bank_on_stage(
+            forget_m = evaluate_bank_on_stage(
                 env.bank, tests[0], n_nn, patch_shape, imagesize, "cpu"
-            )["image_auroc"]
+            )
+            forget = forget_m["image_auroc"]
             for ev in summ["evals"]:
                 rows.append({
                     "policy": name, "seed": seed, "stage": ev["stage"],
@@ -104,8 +105,9 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                 })
             rows.append({
                 "policy": name, "seed": seed, "stage": "final_forgetting",
-                "image_auroc": forget, "pixel_auroc": float("nan"),
-                "pro": float("nan"),
+                "image_auroc": forget,
+                "pixel_auroc": forget_m.get("pixel_auroc", float("nan")),
+                "pro": forget_m.get("pro", float("nan")),
             })
             print(f"{name:26s} seed={seed} mean_reward={summ['mean_reward']:.4f} "
                   f"admit={summ['total_admit']} evict={summ['total_evict']} "
@@ -125,7 +127,16 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
 
 
 def _print_summary(rows, names):
-    print("\n=== mean image AUROC per policy per stage (over seeds) ===")
+    for key, title in (("image_auroc", "image AUROC"),
+                       ("pixel_auroc", "pixel AUROC"),
+                       ("pro", "PRO")):
+        if not any(np.isfinite(r.get(key, float("nan"))) for r in rows):
+            continue  # metric unavailable (e.g. no masks cached)
+        _print_metric_table(rows, names, key, title)
+
+
+def _print_metric_table(rows, names, key, title):
+    print(f"\n=== mean {title} per policy per stage (over seeds) ===")
     stages = sorted({r["stage"] for r in rows if r["stage"] != "final_forgetting"},
                     key=lambda x: int(x))
     header = "policy".ljust(26) + "".join(f"stage{ s}".rjust(10) for s in stages) + "forget".rjust(10)
@@ -133,13 +144,13 @@ def _print_summary(rows, names):
     for name in names:
         cells = []
         for s in stages:
-            vals = [r["image_auroc"] for r in rows
+            vals = [r[key] for r in rows
                     if r["policy"] == name and r["stage"] == s
-                    and np.isfinite(r["image_auroc"])]
+                    and np.isfinite(r.get(key, float("nan")))]
             cells.append(f"{np.mean(vals):.3f}".rjust(10) if vals else "n/a".rjust(10))
-        fvals = [r["image_auroc"] for r in rows
+        fvals = [r[key] for r in rows
                  if r["policy"] == name and r["stage"] == "final_forgetting"
-                 and np.isfinite(r["image_auroc"])]
+                 and np.isfinite(r.get(key, float("nan")))]
         forget = f"{np.mean(fvals):.3f}".rjust(10) if fvals else "n/a".rjust(10)
         print(name.ljust(26) + "".join(cells) + forget)
 
