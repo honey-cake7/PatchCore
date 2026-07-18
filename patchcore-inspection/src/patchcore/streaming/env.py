@@ -12,7 +12,12 @@ from typing import Deque, List, Optional, Tuple
 
 import numpy as np
 
-from patchcore.streaming.bank import DynamicMemoryBank, intra_batch_nn2, knn_device
+from patchcore.streaming.bank import (
+    DynamicMemoryBank,
+    intra_batch_nn2,
+    knn_device,
+    pinned_global_seed,
+)
 from patchcore.streaming.reward import ProxyReward, RewardConfig, estimate_scales
 
 
@@ -102,6 +107,10 @@ class MemoryMaintenanceEnv:
         self._novelty_hist: Deque[float] = deque(maxlen=self.obs_cfg.slope_horizon)
         self._ewma = 0.0
         self._prev_coverage = 0.0
+        # (added, evicted) from a replace_bank() call, folded into the next
+        # step's churn so wholesale rewrites (periodic-coreset) are metered on
+        # the same footing as admit/evict policies.
+        self._pending_churn = (0, 0)
 
     # ---- initialization --------------------------------------------------
     def _warmup_features(self) -> np.ndarray:
@@ -117,9 +126,11 @@ class MemoryMaintenanceEnv:
 
             if len(feats) > self.capacity:
                 pct = self.capacity / len(feats)
-                feats = patchcore.sampler.ApproximateGreedyCoresetSampler(
+                sampler = patchcore.sampler.ApproximateGreedyCoresetSampler(
                     percentage=pct, device=knn_device()
-                ).run(np.ascontiguousarray(feats, dtype=np.float32))
+                )
+                with pinned_global_seed(int(self.rng.integers(2**31))):
+                    feats = sampler.run(np.ascontiguousarray(feats, dtype=np.float32))
             return DynamicMemoryBank.from_vectors(
                 feats[: self.capacity], capacity=self.capacity,
             )
@@ -148,6 +159,7 @@ class MemoryMaintenanceEnv:
         self._novelty_hist.clear()
         self._ewma = 0.0
         self._prev_coverage = 0.0
+        self._pending_churn = (0, 0)
 
         start = self.warmup_images if episode_slice is None else episode_slice.start
         stop = self.reader.n_images if episode_slice is None else episode_slice.stop
@@ -330,10 +342,16 @@ class MemoryMaintenanceEnv:
         if n_admit:
             self.bank.add(self._admissible[admit_idx], stage=self.stage)
 
+        # fold in any churn from a preceding replace_bank() this step
+        pend_admit, pend_evict = self._pending_churn
+        self._pending_churn = (0, 0)
+        tot_admit = n_admit + pend_admit
+        tot_evict = len(evict_slots) + pend_evict
+
         self._window.append(self._holdout)
         holdout = np.concatenate(list(self._window), axis=0)
         reward, comps = self._proxy.compute(
-            self.bank, holdout, n_admit, len(evict_slots)
+            self.bank, holdout, tot_admit, tot_evict
         )
 
         # drift EWMA over batch novelty mean
@@ -346,7 +364,7 @@ class MemoryMaintenanceEnv:
         done = self._t >= self._stop
         info = {
             "stage": self.stage if not done else self.reader.stage_of(self._t - 1),
-            "n_admit": n_admit, "n_evict": len(evict_slots),
+            "n_admit": tot_admit, "n_evict": tot_evict,
             "occupancy": self.bank.occupancy, **comps,
         }
         if done:
@@ -361,8 +379,19 @@ class MemoryMaintenanceEnv:
         return obs
 
     def replace_bank(self, vectors: np.ndarray) -> None:
-        """Wholesale replace the active bank contents (periodic-coreset baseline)."""
+        """Wholesale replace the active bank contents (periodic-coreset baseline).
+
+        Records the (added, evicted) counts so the next step_with_decision folds
+        them into that step's churn — otherwise a full rewrite would be free in
+        the reward, which unfairly advantages this baseline over admit/evict
+        policies.
+        """
         vectors = np.ascontiguousarray(vectors, dtype=np.float32)[: self.capacity]
+        n_evicted = len(self.bank)
         self.bank.evict(self.bank.active_slots())
+        n_added = 0
         if len(vectors):
             self.bank.add(vectors, stage=self.stage)
+            n_added = len(vectors)
+        prev_add, prev_evict = self._pending_churn
+        self._pending_churn = (prev_add + n_added, prev_evict + n_evicted)

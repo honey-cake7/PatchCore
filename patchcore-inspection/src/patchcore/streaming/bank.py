@@ -14,12 +14,36 @@ entry features) are cached per mutation step: the observation, the action
 decoder, and the reward all consume the same bank state within a step, so
 they share one computation instead of re-running the k-NN each time.
 """
+import contextlib
 import os
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import numpy as np
 import torch
+
+
+@contextlib.contextmanager
+def pinned_global_seed(seed: int):
+    """Pin numpy's and torch's global RNGs inside the block, then restore.
+
+    The stock PatchCore coreset sampler draws unseeded start points
+    (np.random) and an unseeded random projection (torch.nn.Linear), which
+    makes otherwise-seeded streaming runs non-reproducible; wrap sampler.run
+    calls with this.
+    """
+    np_state = np.random.get_state()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    try:
+        yield
+    finally:
+        np.random.set_state(np_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 # Bound each [chunk, M] distance matrix to ~64M float32 entries (256MB), so
@@ -40,6 +64,20 @@ def knn_device() -> torch.device:
     if torch.cuda.is_available():
         return torch.device("cuda")
     return torch.device("cpu")
+
+
+def device_banner() -> str:
+    """One-line summary of where streaming compute runs; print at job start.
+
+    A CPU fallback on a GPU node has silently cost hours several times — make
+    it impossible to miss in the logs.
+    """
+    dev = knn_device()
+    backend = os.environ.get("STREAMING_EVAL_BACKEND", "faiss")
+    line = f"[streaming] knn/coreset device={dev.type}, eval backend={backend}"
+    if dev.type == "cpu":
+        line += "  *** CPU-ONLY: no CUDA visible — expect large slowdowns at scale ***"
+    return line
 
 
 def intra_batch_nn2(x: np.ndarray, device: Optional[torch.device] = None) -> np.ndarray:

@@ -67,8 +67,10 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
 @click.option("--eval_baselines", is_flag=True, help="Compare learned proxy return vs baselines")
 def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
          total_env_steps, seed, out, device, eval_baselines):
+    from patchcore.streaming.bank import device_banner
     from patchcore.streaming.ppo import PPOConfig, PPOTrainer
 
+    print(device_banner())
     if synthetic:
         env_fns = _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, seed)
     elif cache_dir:

@@ -70,6 +70,9 @@ export PYTHONPATH=${PKG_DIR}/src:${PYTHONPATH}
 # Environment
 # ------------------------------------------------------------------------------
 export TF_ENABLE_ONEDNN_OPTS=0
+# Per-stage eval scoring on GPU (torch cdist; matches faiss up to float noise).
+# Unset or set to "faiss" for byte-identical stock-PatchCore scoring.
+export STREAMING_EVAL_BACKEND=torch
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export HF_DATASETS_OFFLINE=1

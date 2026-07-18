@@ -35,6 +35,9 @@ def _load_cache_readers(cache_dir):
 @click.option("--min_rho", type=float, default=0.7)
 @click.option("--out", default=None)
 def main(cache_dir, synthetic, capacity, n_nn, min_rho, out):
+    from patchcore.streaming.bank import device_banner
+
+    print(device_banner())
     if synthetic:
         from patchcore.streaming.synthetic import (
             SyntheticConfig, make_all_test_stages, make_synthetic_stream,

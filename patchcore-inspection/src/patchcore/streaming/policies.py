@@ -148,9 +148,10 @@ class PeriodicCoresetPolicy(BasePolicy):
 
     name = "periodic_coreset"
 
-    def __init__(self, period: int = 50, device: str = "cpu"):
+    def __init__(self, period: int = 50, device: str = None, seed: int = 0):
         self.period = period
-        self.device = device
+        self.device = device  # None -> auto (GPU when available)
+        self.rng = np.random.default_rng(seed)
         self._buffer = []
         self._count = 0
 
@@ -158,6 +159,7 @@ class PeriodicCoresetPolicy(BasePolicy):
         import torch
 
         import patchcore.sampler
+        from patchcore.streaming.bank import knn_device
 
         self._buffer.append(env.current_batch.copy())
         self._count += 1
@@ -165,9 +167,14 @@ class PeriodicCoresetPolicy(BasePolicy):
             pool = np.concatenate([env.bank.vectors()] + self._buffer, axis=0)
             if len(pool) > env.capacity:
                 pct = env.capacity / len(pool)
-                pool = patchcore.sampler.ApproximateGreedyCoresetSampler(
-                    percentage=pct, device=torch.device(self.device)
-                ).run(np.ascontiguousarray(pool, dtype=np.float32))
+                device = torch.device(self.device) if self.device else knn_device()
+                sampler = patchcore.sampler.ApproximateGreedyCoresetSampler(
+                    percentage=pct, device=device
+                )
+                from patchcore.streaming.bank import pinned_global_seed
+
+                with pinned_global_seed(int(self.rng.integers(2**31))):
+                    pool = sampler.run(np.ascontiguousarray(pool, dtype=np.float32))
             env.replace_bank(pool)
             self._buffer = []
         return env.step_with_decision(np.empty(0, np.int64), np.empty(0, np.int64))

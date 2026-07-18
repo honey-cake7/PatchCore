@@ -66,6 +66,9 @@ def _build_policy(name, ppo_path, device):
 @click.option("--out", default="streaming_results")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
          action_mode, seeds, out):
+    from patchcore.streaming.bank import device_banner
+
+    print(device_banner())
     stream, tests, patch_shape, imagesize = _load_readers(cache_dir, synthetic)
     seeds = [int(s) for s in seeds.split(",")]
     names = [n for n in policy_names.split(",") if n]
@@ -79,7 +82,7 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
 
     def eval_fn(env, stage):
         return evaluate_bank_on_stage(
-            env.bank, tests[stage], n_nn, patch_shape, imagesize, "cpu"
+            env.bank, tests[stage], n_nn, patch_shape, imagesize
         )
 
     rows = []
@@ -89,11 +92,14 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
             continue
         for seed in seeds:
             env = make_env(seed)
+            # "cpu" here is only the PPO actor-critic's device — a 53-dim MLP
+            # queried one obs at a time, where transfer latency exceeds compute.
+            # All k-NN / coreset / eval work auto-selects the GPU.
             policy = _build_policy(name, ppo_path, "cpu")
             summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
             # forgetting: re-evaluate stage-0 test with the final bank
             forget_m = evaluate_bank_on_stage(
-                env.bank, tests[0], n_nn, patch_shape, imagesize, "cpu"
+                env.bank, tests[0], n_nn, patch_shape, imagesize
             )
             forget = forget_m["image_auroc"]
             for ev in summ["evals"]:

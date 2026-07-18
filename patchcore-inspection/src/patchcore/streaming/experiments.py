@@ -26,18 +26,29 @@ def stage_patches(reader, stage: int, max_images: Optional[int] = None) -> np.nd
 
 
 def coreset_bank(
-    features: np.ndarray, capacity: int, device="cpu", seed: int = 0
+    features: np.ndarray, capacity: int, device=None, seed: int = 0
 ) -> DynamicMemoryBank:
-    """Greedy-coreset ``features`` down to ``capacity`` and load into a bank."""
+    """Greedy-coreset ``features`` down to ``capacity`` and load into a bank.
+
+    ``device=None`` auto-selects the k-NN device (GPU when available) — the
+    greedy coreset is by far the slowest part of the gates and the
+    periodic-coreset baseline at large capacities.
+    """
     import torch
 
+    from patchcore.streaming.bank import knn_device
+
+    device = torch.device(device) if device else knn_device()
     features = np.ascontiguousarray(features, dtype=np.float32)
     if len(features) > capacity:
         pct = capacity / len(features)
         sampler = patchcore.sampler.ApproximateGreedyCoresetSampler(
-            percentage=pct, device=torch.device(device)
+            percentage=pct, device=device
         )
-        features = sampler.run(features)
+        from patchcore.streaming.bank import pinned_global_seed
+
+        with pinned_global_seed(seed):
+            features = sampler.run(features)
     return DynamicMemoryBank.from_vectors(features[:capacity], capacity=capacity, seed=seed)
 
 
@@ -49,7 +60,7 @@ def run_headroom(
     n_nearest_neighbours: int = 1,
     patch_shape=None,
     imagesize=None,
-    device: str = "cpu",
+    device: Optional[str] = None,
     max_images_per_stage: Optional[int] = None,
 ) -> List[Dict]:
     """Static stage-0 bank vs per-stage oracle coreset, evaluated per stage.
@@ -58,6 +69,9 @@ def run_headroom(
     later stages while the oracle holds — that gap is the headroom the learned
     policy can recover.
     """
+    from patchcore.streaming.bank import knn_device
+
+    device = str(device) if device else str(knn_device())
     n_stages = len(test_readers)
     static = coreset_bank(
         stage_patches(stream_reader, 0, max_images_per_stage), capacity, device
@@ -99,7 +113,7 @@ def headroom_gap(results: List[Dict]) -> float:
 
 # ---- Gate 2: proxy validation -------------------------------------------
 def generate_bank_states(
-    stream_reader, capacity: int, device: str = "cpu", seed: int = 0
+    stream_reader, capacity: int, device: Optional[str] = None, seed: int = 0
 ) -> List[DynamicMemoryBank]:
     """A diverse spread of bank states spanning good→bad coverage/redundancy.
 
@@ -147,7 +161,7 @@ def run_proxy_correlation(
     n_nearest_neighbours: int = 1,
     patch_shape=None,
     imagesize=None,
-    device: str = "cpu",
+    device: Optional[str] = None,
     seed: int = 0,
 ) -> Dict:
     """Correlate the label-free proxy against labeled AUROC over many banks.
@@ -159,6 +173,9 @@ def run_proxy_correlation(
     """
     from scipy import stats
 
+    from patchcore.streaming.bank import knn_device
+
+    device = str(device) if device else str(knn_device())
     n_stages = len(test_readers)
     # Per-stage reward scales from that stage's oracle bank (dataset-agnostic).
     scales = {}

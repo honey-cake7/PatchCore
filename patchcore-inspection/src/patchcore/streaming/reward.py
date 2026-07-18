@@ -14,17 +14,29 @@ deployed threshold stays calibrated):
 * U_t instability : maintenance churn plus the mean absolute change in a fixed
   probe set's NN-1 distances between consecutive steps (score-scale drift).
 """
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+
+
+def _default_churn_coef() -> float:
+    # Own knob (override with STREAMING_CHURN_COEF) so churn can be penalized
+    # independently of score-drift. The prior design folded churn into the
+    # instability term at gamma=0.1, which was ~0.006 of reward per step at
+    # M=20000 — far too weak to deter a policy that rewrites the whole bank
+    # every step. Sweep upward (roughly 1-10) to trade adaptation vs. churn;
+    # too high and the reward-maximizing policy collapses to no-op/static.
+    return float(os.environ.get("STREAMING_CHURN_COEF", "2.0"))
 
 
 @dataclass
 class RewardConfig:
     alpha: float = 1.0
     beta: float = 0.3
-    gamma: float = 0.1
+    gamma: float = 0.1                         # weight on score-drift (stability)
+    churn_coef: float = field(default_factory=_default_churn_coef)
     window_images: int = 32
     holdout_patch_frac: float = 0.1
     redundancy_delta: Optional[float] = None  # auto-set from warmup if None
@@ -66,7 +78,7 @@ class ProxyReward:
 
     def components(
         self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int
-    ) -> Tuple[float, float, float]:
+    ) -> Tuple[float, float, float, float]:
         cfg = self.cfg
         c = coverage(bank, holdout_patches) / (cfg.coverage_scale + 1e-8)
         delta = cfg.redundancy_delta if cfg.redundancy_delta else cfg.coverage_scale
@@ -82,16 +94,26 @@ class ProxyReward:
         else:
             score_drift = 0.0
         self._prev_probe_dists = probe_dists
-        u = churn + score_drift
-        return c, r, u
+        return c, r, churn, score_drift
 
     def compute(
         self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int
     ) -> Tuple[float, Dict[str, float]]:
-        c, r, u = self.components(bank, holdout_patches, n_admit, n_evict)
+        c, r, churn, score_drift = self.components(
+            bank, holdout_patches, n_admit, n_evict
+        )
         cfg = self.cfg
-        reward = -(cfg.alpha * c + cfg.beta * r + cfg.gamma * u)
-        return reward, {"C": c, "R": r, "U": u, "reward": reward}
+        reward = -(
+            cfg.alpha * c
+            + cfg.beta * r
+            + cfg.gamma * score_drift
+            + cfg.churn_coef * churn
+        )
+        # U kept for logging continuity (instability = churn + score-drift).
+        return reward, {
+            "C": c, "R": r, "U": churn + score_drift,
+            "churn": churn, "score_drift": score_drift, "reward": reward,
+        }
 
 
 def estimate_scales(bank, sample_patches: np.ndarray) -> Tuple[float, float]:
