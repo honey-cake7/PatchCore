@@ -2,7 +2,7 @@
 #SBATCH --job-name=streaming-polyppvt
 #SBATCH --partition=LocalQ
 #SBATCH --account=default
-#SBATCH --gres=shard:8
+#SBATCH --gres=shard:6
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
@@ -204,22 +204,22 @@ echo "========================================================="
 # ------------------------------------------------------------------------------
 # STEP 1: cache embeddings (GPU)
 # ------------------------------------------------------------------------------
-echo -e "\n[1/5] Caching embeddings (frozen ${BACKBONE}) ..."
-python -u bin/cache_embeddings.py \
-    --backbone_name             "${BACKBONE}" \
-    "${LAYERS[@]}" \
-    --data_path                 "${DATA_PATH}" \
-    --classname                 "${CLASSNAME}" \
-    --drift                     "${DRIFT}" \
-    --drift_mode                "${DRIFT_MODE}" \
-    --seed                      "${SEED}" \
-    --resize                    "${RESIZE}" \
-    --imagesize                 "${IMAGESIZE}" \
-    --pretrain_embed_dimension  "${PRE_DIM}" \
-    --target_embed_dimension    "${TGT_DIM}" \
-    --patchsize                 "${PATCHSIZE}" \
-    --gpu                       0 \
-    --out_dir                   "${CACHE_DIR}" || { echo "caching failed"; exit 1; }
+#echo -e "\n[1/5] Caching embeddings (frozen ${BACKBONE}) ..."
+#python -u bin/cache_embeddings.py \
+#    --backbone_name             "${BACKBONE}" \
+#    "${LAYERS[@]}" \
+#    --data_path                 "${DATA_PATH}" \
+#    --classname                 "${CLASSNAME}" \
+#    --drift                     "${DRIFT}" \
+#    --drift_mode                "${DRIFT_MODE}" \
+#    --seed                      "${SEED}" \
+#    --resize                    "${RESIZE}" \
+#    --imagesize                 "${IMAGESIZE}" \
+#    --pretrain_embed_dimension  "${PRE_DIM}" \
+#   --target_embed_dimension    "${TGT_DIM}" \
+#    --patchsize                 "${PATCHSIZE}" \
+#    --gpu                       0 \
+#    --out_dir                   "${CACHE_DIR}" || { echo "caching failed"; exit 1; }
 
 # ------------------------------------------------------------------------------
 # STEP 2: Gate 1 — headroom

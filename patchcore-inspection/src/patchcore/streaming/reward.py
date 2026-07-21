@@ -49,6 +49,15 @@ class RewardConfig:
     gamma: float = 0.1                         # weight on score-drift (stability)
     churn_coef: float = field(default_factory=_default_churn_coef)
     churn_budget: float = field(default_factory=_default_churn_budget)
+    # Weight on tail coverage (p90 of holdout NN-1 distances): anomaly scores
+    # come from the *worst*-covered patches, which the mean can hide.
+    c90_coef: float = 0.0
+    # Weight on probe retention (mean NN-1 distance of the fixed stage-0 probe
+    # set): a label-free forgetting signal. Policies that admit recent patches
+    # by evicting the old distribution (streaming-greedy-coreset) look perfect
+    # on coverage while collapsing stage-0 AUROC — this term is what separates
+    # them from policies that admit recent AND retain (fifo/periodic-coreset).
+    probe_coef: float = 0.0
     window_images: int = 32
     holdout_patch_frac: float = 0.1
     redundancy_delta: Optional[float] = None  # auto-set from warmup if None
@@ -70,7 +79,8 @@ def load_reward_weights(path: str) -> "RewardConfig":
         obj = json.load(f)
     weights = obj.get("recommended", obj)
     cfg = RewardConfig()
-    for key in ("alpha", "beta", "gamma", "churn_coef", "churn_budget"):
+    for key in ("alpha", "beta", "gamma", "churn_coef", "churn_budget",
+                "c90_coef", "probe_coef"):
         if key in weights:
             setattr(cfg, key, float(weights[key]))
     return cfg
@@ -110,28 +120,43 @@ class ProxyReward:
 
     def components(
         self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int
-    ) -> Tuple[float, float, float, float]:
+    ) -> Tuple[float, float, float, float, float, float]:
+        """Returns (C, R, churn, score_drift, C90, P)."""
         cfg = self.cfg
-        c = coverage(bank, holdout_patches) / (cfg.coverage_scale + 1e-8)
+        scale = cfg.coverage_scale + 1e-8
+        # holdout coverage: mean + p90 tail from one k-NN call
+        if len(holdout_patches) and len(bank):
+            dists, _ = bank.knn(
+                np.ascontiguousarray(holdout_patches, dtype=np.float32), k=1
+            )
+            d = dists[:, 0]
+            d = d[np.isfinite(d)]
+            c = float(d.mean()) / scale if len(d) else 0.0
+            c90 = float(np.percentile(d, 90)) / scale if len(d) else 0.0
+        else:
+            c = c90 = 0.0
         delta = cfg.redundancy_delta if cfg.redundancy_delta else cfg.coverage_scale
         r = redundancy(bank, delta, cfg.redundancy_sample)
         churn = (n_admit + n_evict) / max(bank.capacity, 1)
         probe_dists = self._probe_dists(bank)
+        # probe retention: the LEVEL of probe distances (label-free forgetting
+        # signal); score_drift is their step-to-step CHANGE (scale stability).
+        p = float(probe_dists.mean()) / scale if len(probe_dists) else 0.0
         if self._prev_probe_dists is not None and len(probe_dists) == len(
             self._prev_probe_dists
         ):
             score_drift = float(
                 np.abs(probe_dists - self._prev_probe_dists).mean()
-            ) / (cfg.coverage_scale + 1e-8)
+            ) / scale
         else:
             score_drift = 0.0
         self._prev_probe_dists = probe_dists
-        return c, r, churn, score_drift
+        return c, r, churn, score_drift, c90, p
 
     def compute(
         self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int
     ) -> Tuple[float, Dict[str, float]]:
-        c, r, churn, score_drift = self.components(
+        c, r, churn, score_drift, c90, p = self.components(
             bank, holdout_patches, n_admit, n_evict
         )
         cfg = self.cfg
@@ -141,6 +166,8 @@ class ProxyReward:
             + cfg.beta * r
             + cfg.gamma * score_drift
             + cfg.churn_coef * churn_excess
+            + cfg.c90_coef * c90
+            + cfg.probe_coef * p
         )
         # U kept for logging continuity (instability = churn + score-drift).
         # Raw churn stays in the log so offline reward-weight refits can
@@ -148,7 +175,7 @@ class ProxyReward:
         return reward, {
             "C": c, "R": r, "U": churn + score_drift,
             "churn": churn, "churn_excess": churn_excess,
-            "score_drift": score_drift, "reward": reward,
+            "score_drift": score_drift, "C90": c90, "P": p, "reward": reward,
         }
 
 

@@ -53,22 +53,37 @@ def _load_readers(cache_dir, synthetic):
               help="Weight of the stage-0 forgetting AUROC in the ranking target")
 @click.option("--min_rho", type=float, default=0.7,
               help="Exit non-zero if the best candidate's Spearman rho is below this")
+@click.option("--traces_out", default=None,
+              help="Pickle recorded traces here (default: <out dir>/reward_traces.pkl)")
+@click.option("--traces_in", default=None,
+              help="Refit from previously recorded traces; skips the stream passes")
 @click.option("--out", default="reward_weights.json")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
-         forget_weight, min_rho, out):
+         forget_weight, min_rho, traces_out, traces_in, out):
+    import pickle
+
     from patchcore.streaming.bank import device_banner
 
-    if not synthetic and not cache_dir:
-        raise click.UsageError("pass --cache_dir or --synthetic")
-    print(device_banner())
-    stream, tests, patch_shape, imagesize = _load_readers(cache_dir, synthetic)
-
-    traces = record_policy_traces(
-        stream, tests, capacity, warmup=warmup, n_nearest_neighbours=n_nn,
-        patch_shape=patch_shape, imagesize=imagesize,
-        policy_names=[n for n in policy_names.split(",") if n],
-        seeds=[int(s) for s in seeds.split(",")],
-    )
+    if traces_in:
+        with open(traces_in, "rb") as f:
+            traces = pickle.load(f)
+        print(f"loaded {len(traces)} traces from {traces_in} (skipping stream passes)")
+    else:
+        if not synthetic and not cache_dir:
+            raise click.UsageError("pass --cache_dir or --synthetic (or --traces_in)")
+        print(device_banner())
+        stream, tests, patch_shape, imagesize = _load_readers(cache_dir, synthetic)
+        traces = record_policy_traces(
+            stream, tests, capacity, warmup=warmup, n_nearest_neighbours=n_nn,
+            patch_shape=patch_shape, imagesize=imagesize,
+            policy_names=[n for n in policy_names.split(",") if n],
+            seeds=[int(s) for s in seeds.split(",")],
+        )
+        traces_out = traces_out or os.path.join(
+            os.path.dirname(os.path.abspath(out)), "reward_traces.pkl")
+        with open(traces_out, "wb") as f:
+            pickle.dump(traces, f)
+        print(f"saved traces -> {traces_out} (refit later with --traces_in)")
     result = fit_reward_weights(traces, forget_weight=forget_weight)
 
     with open(out, "w") as f:
