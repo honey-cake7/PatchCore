@@ -2,7 +2,7 @@
 #SBATCH --job-name=streaming-polyppvt
 #SBATCH --partition=LocalQ
 #SBATCH --account=default
-#SBATCH --gres=shard:40
+#SBATCH --gres=shard:8
 #SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
