@@ -139,8 +139,7 @@ class MemoryMaintenanceEnv:
         ids = list(range(min(self.warmup_images, self.reader.n_images)))
         return self.reader.flat_slice(ids)
 
-    def _init_bank(self) -> DynamicMemoryBank:
-        feats = self._warmup_features()
+    def _init_bank(self, feats: np.ndarray) -> DynamicMemoryBank:
         if self.init_bank_mode == "coreset_stage0" and len(feats):
             import torch
 
@@ -161,12 +160,19 @@ class MemoryMaintenanceEnv:
     def reset(self, episode_slice: Optional[slice] = None) -> np.ndarray:
         if self._init_snapshot is None:
             # First episode: pay the coreset cost once, then cache the result.
-            self.bank = self._init_bank()
-            self._init_snapshot = self.bank.snapshot()
             warm = self._warmup_features()
-            self._probe = warm[
-                self.rng.choice(len(warm), size=min(256, len(warm)), replace=False)
-            ]
+            # Hold the probe OUT of the initial bank. Probes that are exact
+            # bank members sit at distance ~0, which degenerates the probe
+            # retention term P into "are these exact patches still stored"
+            # (rewarding no-eviction policies, punishing re-coresets that keep
+            # coverage but not identity). Held out, P measures what it should:
+            # how well the bank still covers unseen stage-0 data.
+            p_idx = self.rng.choice(len(warm), size=min(256, len(warm)), replace=False)
+            self._probe = warm[p_idx]
+            keep = np.ones(len(warm), dtype=bool)
+            keep[p_idx] = False
+            self.bank = self._init_bank(warm[keep])
+            self._init_snapshot = self.bank.snapshot()
             cov_scale, delta = estimate_scales(self.bank, self._probe)
             self.reward_cfg.coverage_scale = cov_scale
             if self.reward_cfg.redundancy_delta is None:
