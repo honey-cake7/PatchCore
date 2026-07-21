@@ -66,6 +66,23 @@ class RunningNorm:
     def freeze(self) -> None:
         self.frozen = True
 
+    def state_dict(self) -> dict:
+        return {
+            "mean": self.mean.copy(),
+            "m2": self.m2.copy(),
+            "count": int(self.count),
+            "frozen": bool(self.frozen),
+        }
+
+    @classmethod
+    def from_state_dict(cls, state: dict) -> "RunningNorm":
+        norm = cls(len(state["mean"]))
+        norm.mean = np.asarray(state["mean"], dtype=np.float64).copy()
+        norm.m2 = np.asarray(state["m2"], dtype=np.float64).copy()
+        norm.count = int(state["count"])
+        norm.frozen = bool(state["frozen"])
+        return norm
+
 
 class MemoryMaintenanceEnv:
     def __init__(
@@ -79,6 +96,7 @@ class MemoryMaintenanceEnv:
         init_bank: str = "coreset_stage0",
         warmup_images: int = 100,
         n_nearest_neighbours: int = 1,
+        obs_norm: Optional["RunningNorm"] = None,
     ) -> None:
         self.reader = reader
         self.capacity = int(capacity)
@@ -95,7 +113,11 @@ class MemoryMaintenanceEnv:
         self._proj = self.rng.normal(
             size=(self.dim, self.obs_cfg.d_proj)
         ).astype(np.float32) / np.sqrt(self.dim)
-        self._norm = RunningNorm(OBS_DIM)
+        # An injected obs_norm (e.g. the one a checkpointed policy trained
+        # under, or one shared across vectorized training envs) is used as-is;
+        # otherwise each env fits its own during warmup.
+        self._norm = obs_norm if obs_norm is not None else RunningNorm(OBS_DIM)
+        self._last_obs: Optional[np.ndarray] = None
 
         self.bank: Optional[DynamicMemoryBank] = None
         self._proxy: Optional[ProxyReward] = None
@@ -192,7 +214,18 @@ class MemoryMaintenanceEnv:
         return self.reader.stage_of(self._t)
 
     # ---- observation -----------------------------------------------------
-    def _observe(self) -> np.ndarray:
+    @property
+    def last_obs(self) -> Optional[np.ndarray]:
+        """The observation most recently returned by reset()/step_with_decision().
+
+        Policies that need the current observation (PPO) must read this instead
+        of calling ``_observe()`` again: a second call would advance the
+        RunningNorm warmup twice per step, silently changing the normalization
+        the policy was trained under (and doubling the obs k-NN cost).
+        """
+        return self._last_obs
+
+    def _observe(self, update: bool = True) -> np.ndarray:
         cfg = self.obs_cfg
         bank = self.bank
         A = self._admissible
@@ -255,10 +288,12 @@ class MemoryMaintenanceEnv:
         obs = np.concatenate([scalar, proj_batch, proj_bank, [proj_diff]]).astype(np.float32)
         obs = np.nan_to_num(obs, nan=0.0, posinf=0.0, neginf=0.0)
 
-        self._norm.update(obs)
-        if self._norm.count >= cfg.warmup_steps:
-            self._norm.freeze()
-        return self._norm.normalize(obs)
+        if update:
+            self._norm.update(obs)
+            if self._norm.count >= cfg.warmup_steps:
+                self._norm.freeze()
+        self._last_obs = self._norm.normalize(obs)
+        return self._last_obs
 
     # ---- action decoding -------------------------------------------------
     def decode_action(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

@@ -154,6 +154,148 @@ def generate_bank_states(
     return states
 
 
+def record_policy_traces(
+    stream_reader,
+    test_readers: List,
+    capacity: int,
+    warmup: int = 100,
+    n_nearest_neighbours: int = 1,
+    patch_shape=None,
+    imagesize=None,
+    policy_names: Optional[List[str]] = None,
+    seeds: Optional[List[int]] = None,
+) -> List[Dict]:
+    """Drive each baseline policy over the stream, recording per-step reward
+    components alongside labeled per-stage AUROC and final forgetting.
+
+    One trace per (policy, seed). Because the proxy reward is linear in its
+    components, any candidate weighting can later be scored on these traces
+    offline (``fit_reward_weights``) — no policy re-runs per candidate.
+    """
+    from patchcore.streaming import policies as P
+    from patchcore.streaming.env import MemoryMaintenanceEnv
+
+    policy_names = policy_names or list(P.BASELINES)
+    seeds = seeds if seeds is not None else [0]
+
+    def eval_fn(env, stage):
+        return evaluate_bank_on_stage(
+            env.bank, test_readers[stage], n_nearest_neighbours, patch_shape,
+            imagesize,
+        )
+
+    traces = []
+    for name in policy_names:
+        cls = P.BASELINES[name]
+        for seed in seeds:
+            env = MemoryMaintenanceEnv(
+                stream_reader, capacity=capacity, warmup_images=warmup,
+                seed=seed, n_nearest_neighbours=n_nearest_neighbours,
+            )
+            policy = cls(k=8) if name in ("fifo", "random") else cls()
+            summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
+            forget_m = evaluate_bank_on_stage(
+                env.bank, test_readers[0], n_nearest_neighbours, patch_shape,
+                imagesize,
+            )
+            infos = summ["infos"]
+            traces.append({
+                "policy": name,
+                "seed": int(seed),
+                "C": np.asarray([i["C"] for i in infos], dtype=np.float64),
+                "R": np.asarray([i["R"] for i in infos], dtype=np.float64),
+                "churn": np.asarray([i["churn"] for i in infos], dtype=np.float64),
+                "score_drift": np.asarray(
+                    [i["score_drift"] for i in infos], dtype=np.float64
+                ),
+                "stage_aurocs": {
+                    int(ev["stage"]): float(ev["image_auroc"]) for ev in summ["evals"]
+                },
+                "forget_auroc": float(forget_m["image_auroc"]),
+            })
+            print(f"[trace] {name:26s} seed={seed} "
+                  f"aurocs={[round(v, 3) for _, v in sorted(traces[-1]['stage_aurocs'].items())]} "
+                  f"forget={traces[-1]['forget_auroc']:.3f}")
+    return traces
+
+
+def fit_reward_weights(
+    traces: List[Dict],
+    betas=(0.0, 0.15, 0.3, 0.6, 1.0),
+    gammas=(0.0, 0.1, 0.3),
+    churn_coefs=(0.0, 0.25, 0.5, 1.0, 2.0, 4.0),
+    churn_budgets=(0.0, 0.005, 0.01, 0.02),
+    forget_weight: float = 0.5,
+) -> Dict:
+    """Grid-fit reward weights so mean episode reward ranks policies like AUROC.
+
+    Target per trace: mean drifted-stage (stage>=1) image AUROC plus
+    ``forget_weight`` times the stage-0 forgetting AUROC — the two quantities
+    the learned policy is meant to maximize. Reports the Spearman rho of the
+    best candidate and of the current production ``RewardConfig`` defaults
+    (the misalignment baseline).
+    """
+    from scipy import stats
+
+    from patchcore.streaming.reward import RewardConfig
+
+    targets = []
+    mean_c, mean_r, mean_sd = [], [], []
+    for tr in traces:
+        drifted = [v for s, v in tr["stage_aurocs"].items() if s >= 1]
+        targets.append(float(np.mean(drifted)) + forget_weight * tr["forget_auroc"])
+        mean_c.append(tr["C"].mean())
+        mean_r.append(tr["R"].mean())
+        mean_sd.append(tr["score_drift"].mean())
+    targets = np.asarray(targets)
+    mean_c = np.asarray(mean_c)
+    mean_r = np.asarray(mean_r)
+    mean_sd = np.asarray(mean_sd)
+    # mean excess churn per trace, per candidate budget
+    mean_excess = {
+        b: np.asarray([np.maximum(tr["churn"] - b, 0.0).mean() for tr in traces])
+        for b in churn_budgets
+    }
+
+    def rho_for(beta, gamma, coef, budget):
+        proxy = -(mean_c + beta * mean_r + gamma * mean_sd + coef * mean_excess[budget])
+        return float(stats.spearmanr(proxy, targets).correlation)
+
+    best = None
+    for beta in betas:
+        for gamma in gammas:
+            for coef in churn_coefs:
+                for budget in churn_budgets:
+                    rho = rho_for(beta, gamma, coef, budget)
+                    if not np.isfinite(rho):
+                        continue
+                    if best is None or rho > best["rho_ranking"]:
+                        best = {
+                            "alpha": 1.0, "beta": float(beta), "gamma": float(gamma),
+                            "churn_coef": float(coef), "churn_budget": float(budget),
+                            "rho_ranking": rho,
+                        }
+
+    cur = RewardConfig()
+    cur_budget = min(churn_budgets, key=lambda b: abs(b - cur.churn_budget))
+    rho_current = rho_for(cur.beta, cur.gamma, cur.churn_coef, cur_budget)
+    return {
+        "recommended": {k: best[k] for k in
+                        ("alpha", "beta", "gamma", "churn_coef", "churn_budget")},
+        "rho_ranking": best["rho_ranking"],
+        "rho_ranking_current_weights": rho_current,
+        "current_weights": {
+            "alpha": cur.alpha, "beta": cur.beta, "gamma": cur.gamma,
+            "churn_coef": cur.churn_coef, "churn_budget": cur.churn_budget,
+        },
+        "forget_weight": float(forget_weight),
+        "n_traces": len(traces),
+        "trace_policies": [f"{t['policy']}:{t['seed']}" for t in traces],
+        "targets": {f"{t['policy']}:{t['seed']}": float(v)
+                    for t, v in zip(traces, targets)},
+    }
+
+
 def run_proxy_correlation(
     stream_reader,
     test_readers: List,

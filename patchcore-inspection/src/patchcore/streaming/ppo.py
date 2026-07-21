@@ -7,17 +7,20 @@ constraints; a compact PPO avoids all dependency risk. The environment applies
 dynamics, so the policy is a plain diagonal Gaussian over the raw action and
 ordinary Gaussian log-probs are exact — no tanh-Jacobian correction required.
 """
+import dataclasses
 from dataclasses import dataclass
-from typing import Callable, List
+from typing import Callable, List, Optional, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from patchcore.streaming.env import OBS_DIM
+from patchcore.streaming.env import OBS_DIM, RunningNorm
 
 
 ACTION_DIM = 6
+
+CHECKPOINT_FORMAT_VERSION = 2
 
 
 class ActorCritic(nn.Module):
@@ -48,28 +51,50 @@ class ActorCritic(nn.Module):
 class PPOConfig:
     rollout_steps: int = 256
     epochs: int = 4
-    minibatches: int = 8
+    minibatches: int = 64
     gamma: float = 0.995
     gae_lambda: float = 0.95
     clip: float = 0.2
     lr: float = 3e-4
+    lr_end: Optional[float] = None       # linear anneal target (None = constant)
     ent_coef: float = 1e-3
+    ent_coef_end: Optional[float] = None  # linear anneal target (None = constant)
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     total_env_steps: int = 200_000
     device: str = "cpu"
+    # "ewma": divide rewards by a running EWMA of per-step reward std (legacy).
+    # "fixed": estimate the scale once from the first rollout, then keep it —
+    #          the critic's target scale stays stationary across iterations.
+    # "none": no scaling (reward terms are already O(1) via estimate_scales).
+    reward_scale: str = "ewma"
+    # "gae": standard critic + GAE-lambda advantages.
+    # "grpo": critic-free group-relative advantages — discounted return-to-go
+    #         minus its mean across the vectorized envs at the same timestep.
+    #         Valid here because all envs replay the same cached stream in
+    #         lockstep, so the group mean is a matched baseline.
+    adv_mode: str = "gae"
 
 
 class PPOTrainer:
-    def __init__(self, env_fns: List[Callable], cfg: PPOConfig = None):
+    def __init__(self, env_fns: List[Callable], cfg: PPOConfig = None,
+                 obs_norm: Optional[RunningNorm] = None):
         self.cfg = cfg or PPOConfig()
         self.envs = [fn() for fn in env_fns]
         self.n_env = len(self.envs)
+        # One normalizer shared by every env (either injected — e.g. prefit on
+        # a full episode — or fresh). Per-env normalizers cannot be saved with
+        # the policy, which previously made eval see differently-normalized
+        # observations than training (train/eval mismatch).
+        self.obs_norm = obs_norm if obs_norm is not None else RunningNorm(OBS_DIM)
+        for env in self.envs:
+            env._norm = self.obs_norm
         self.device = torch.device(self.cfg.device)
         self.ac = ActorCritic().to(self.device)
         self.opt = torch.optim.Adam(self.ac.parameters(), lr=self.cfg.lr)
         self._obs = np.stack([e.reset() for e in self.envs])
         self._ret_rms_std = 1.0  # running return std for reward scaling
+        self._fixed_scale_set = False
 
     def _act(self, obs_np):
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device)
@@ -107,20 +132,37 @@ class PPOTrainer:
             )
         last_val = last_val.cpu().numpy()
 
-        # scale rewards by running return std (stabilizes advantages)
         flat_r = rew_buf.reshape(-1)
-        self._ret_rms_std = 0.9 * self._ret_rms_std + 0.1 * (flat_r.std() + 1e-6)
-        rew_buf = rew_buf / self._ret_rms_std
+        if cfg.reward_scale == "ewma":
+            self._ret_rms_std = 0.9 * self._ret_rms_std + 0.1 * (flat_r.std() + 1e-6)
+            rew_scaled = rew_buf / self._ret_rms_std
+        elif cfg.reward_scale == "fixed":
+            if not self._fixed_scale_set:
+                self._ret_rms_std = float(flat_r.std() + 1e-6)
+                self._fixed_scale_set = True
+            rew_scaled = rew_buf / self._ret_rms_std
+        else:
+            rew_scaled = rew_buf
 
-        adv = np.zeros((T, N), np.float32)
-        last_gae = np.zeros(N, np.float32)
-        for t in reversed(range(T)):
-            next_v = last_val if t == T - 1 else val_buf[t + 1]
-            next_nonterminal = 1.0 - done_buf[t]
-            delta = rew_buf[t] + cfg.gamma * next_v * next_nonterminal - val_buf[t]
-            last_gae = delta + cfg.gamma * cfg.gae_lambda * next_nonterminal * last_gae
-            adv[t] = last_gae
-        ret = adv + val_buf
+        if cfg.adv_mode == "grpo":
+            # Critic-free discounted return-to-go; group-relative baseline.
+            G = np.zeros((T, N), np.float32)
+            running = np.zeros(N, np.float32)
+            for t in reversed(range(T)):
+                running = rew_scaled[t] + cfg.gamma * running * (1.0 - done_buf[t])
+                G[t] = running
+            adv = G - G.mean(axis=1, keepdims=True)
+            ret = G
+        else:
+            adv = np.zeros((T, N), np.float32)
+            last_gae = np.zeros(N, np.float32)
+            for t in reversed(range(T)):
+                next_v = last_val if t == T - 1 else val_buf[t + 1]
+                next_nonterminal = 1.0 - done_buf[t]
+                delta = rew_scaled[t] + cfg.gamma * next_v * next_nonterminal - val_buf[t]
+                last_gae = delta + cfg.gamma * cfg.gae_lambda * next_nonterminal * last_gae
+                adv[t] = last_gae
+            ret = adv + val_buf
         return {
             "obs": obs_buf.reshape(-1, OBS_DIM),
             "act": act_buf.reshape(-1, ACTION_DIM),
@@ -130,8 +172,10 @@ class PPOTrainer:
             "mean_reward": float(flat_r.mean()),
         }
 
-    def update(self, batch):
+    def update(self, batch, ent_coef: Optional[float] = None):
         cfg = self.cfg
+        if ent_coef is None:
+            ent_coef = cfg.ent_coef
         obs = torch.as_tensor(batch["obs"], device=self.device)
         act = torch.as_tensor(batch["act"], device=self.device)
         old_logp = torch.as_tensor(batch["logp"], device=self.device)
@@ -152,9 +196,11 @@ class PPOTrainer:
                 surr1 = ratio * adv[b]
                 surr2 = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv[b]
                 pg_loss = -torch.min(surr1, surr2).mean()
-                v_loss = ((value - ret[b]) ** 2).mean()
                 ent = dist.entropy().sum(-1).mean()
-                loss = pg_loss + cfg.vf_coef * v_loss - cfg.ent_coef * ent
+                loss = pg_loss - ent_coef * ent
+                if cfg.adv_mode != "grpo":  # grpo has no value target
+                    v_loss = ((value - ret[b]) ** 2).mean()
+                    loss = loss + cfg.vf_coef * v_loss
                 self.opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.ac.parameters(), cfg.max_grad_norm)
@@ -166,15 +212,66 @@ class PPOTrainer:
         n_iters = max(1, cfg.total_env_steps // steps_per_iter)
         history = []
         for it in range(n_iters):
+            frac = it / max(n_iters - 1, 1)
+            if cfg.lr_end is not None:
+                lr = cfg.lr + frac * (cfg.lr_end - cfg.lr)
+                for g in self.opt.param_groups:
+                    g["lr"] = lr
+            ent_coef = cfg.ent_coef
+            if cfg.ent_coef_end is not None:
+                ent_coef = cfg.ent_coef + frac * (cfg.ent_coef_end - cfg.ent_coef)
             batch = self.collect()
-            self.update(batch)
+            self.update(batch, ent_coef=ent_coef)
             history.append(batch["mean_reward"])
             if (it + 1) % log_every == 0:
                 print(f"[ppo] iter {it+1}/{n_iters} mean_reward={batch['mean_reward']:.4f}")
         return history
 
     def save(self, path: str):
-        torch.save(self.ac.state_dict(), path)
+        env0 = self.envs[0]
+        torch.save(
+            {
+                "format_version": CHECKPOINT_FORMAT_VERSION,
+                "ac": self.ac.state_dict(),
+                "obs_norm": self.obs_norm.state_dict(),
+                "obs_dim": OBS_DIM,
+                "act_dim": ACTION_DIM,
+                "action_mode": env0.action_cfg.mode,
+                "reward_cfg": dataclasses.asdict(env0.reward_cfg),
+            },
+            path,
+        )
 
     def load(self, path: str):
-        self.ac.load_state_dict(torch.load(path, map_location=self.device))
+        ac, norm, _ = load_checkpoint(path, device=self.device)
+        self.ac.load_state_dict(ac.state_dict())
+        if norm is not None:
+            self.obs_norm = norm
+            for env in self.envs:
+                env._norm = self.obs_norm
+
+
+def load_checkpoint(path: str, device: str = "cpu") -> Tuple[ActorCritic, Optional[RunningNorm], dict]:
+    """Load a policy checkpoint; returns (actor_critic, obs_norm, meta).
+
+    Handles both format v2 (dict with normalizer + metadata) and legacy
+    checkpoints that are a raw ``state_dict`` — those return ``obs_norm=None``,
+    meaning eval will re-fit normalization from its own stream (the old,
+    train/eval-mismatched behavior).
+    """
+    # Our own artifact (contains numpy arrays for the normalizer); torch>=2.6
+    # defaults weights_only=True which rejects them.
+    obj = torch.load(path, map_location=device, weights_only=False)
+    if isinstance(obj, dict) and obj.get("format_version", 0) >= 2:
+        ac = ActorCritic(obj.get("obs_dim", OBS_DIM), obj.get("act_dim", ACTION_DIM))
+        ac.load_state_dict(obj["ac"])
+        ac.to(torch.device(device))
+        norm = RunningNorm.from_state_dict(obj["obs_norm"]) if obj.get("obs_norm") else None
+        meta = {k: obj[k] for k in ("action_mode", "reward_cfg") if k in obj}
+        return ac, norm, meta
+    print("[ppo] WARNING: legacy checkpoint (no obs normalizer saved) — "
+          "eval will re-fit observation normalization from its own stream.")
+    ac = ActorCritic()
+    ac.load_state_dict(obj)
+    ac.to(torch.device(device))
+    return ac, None, {}

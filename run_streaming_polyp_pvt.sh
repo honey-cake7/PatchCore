@@ -3,6 +3,7 @@
 #SBATCH --partition=LocalQ
 #SBATCH --account=default
 #SBATCH --gres=shard:40
+#SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --output=../logs/streaming_output_%j.log
@@ -23,7 +24,7 @@
 # ──────────────────────────────────────────────────────────────────────
 
 # Go to submission directory
-cd $SLURM_SUBMIT_DIR
+cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
 
 # ------------------------------------------------------------------------------
 # Project Paths
@@ -62,6 +63,51 @@ TORCH_LIB=$(python -c "import os,torch;print(os.path.join(os.path.dirname(torch.
 export LD_LIBRARY_PATH=${TORCH_LIB}:$CUDA_HOME/lib64:$LD_LIBRARY_PATH
 
 # ------------------------------------------------------------------------------
+# CUDA guard — the shard gres plugin can export an invalid CUDA_VISIBLE_DEVICES
+# (CUDA error 101 "invalid device ordinal"), which silently pushes the whole
+# pipeline onto CPU. Probe with a real tensor alloc (torch.cuda.is_available()
+# alone can pass while device init fails), repair CVD if a GPU is physically
+# present, and fail loudly otherwise. ALLOW_CPU=1 to run CPU-only on purpose.
+# ------------------------------------------------------------------------------
+ALLOW_CPU=${ALLOW_CPU:-0}
+echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES-<unset>}"
+echo "SLURM_JOB_GPUS       : ${SLURM_JOB_GPUS-<unset>}"
+echo "SLURM_STEP_GPUS      : ${SLURM_STEP_GPUS-<unset>}"
+command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || echo "nvidia-smi not found"
+
+cuda_probe() {
+    python -c "import torch; torch.zeros(1).cuda(); print('CUDA probe OK:', torch.cuda.get_device_name(0))" 2>&1
+}
+if ! PROBE_OUT=$(cuda_probe); then
+    echo "CUDA probe FAILED:"
+    echo "${PROBE_OUT}"
+    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+        echo "*** GPUs are visible to nvidia-smi but not to torch."
+        echo "*** Resetting CUDA_VISIBLE_DEVICES (was: '${CUDA_VISIBLE_DEVICES-<unset>}') -> 0 and re-probing."
+        export CUDA_VISIBLE_DEVICES=0
+        if ! PROBE_OUT=$(cuda_probe); then
+            echo "CUDA probe still failing after reset:"
+            echo "${PROBE_OUT}"
+            if [ "${ALLOW_CPU}" != "1" ]; then
+                echo "FATAL: no usable GPU (check --gres request vs node gres.conf). Set ALLOW_CPU=1 to force a CPU run."
+                exit 1
+            fi
+            echo "ALLOW_CPU=1 set — continuing on CPU."
+        else
+            echo "${PROBE_OUT}"
+        fi
+    else
+        if [ "${ALLOW_CPU}" != "1" ]; then
+            echo "FATAL: no GPU on this node/allocation. Set ALLOW_CPU=1 to force a CPU run."
+            exit 1
+        fi
+        echo "ALLOW_CPU=1 set — continuing on CPU."
+    fi
+else
+    echo "${PROBE_OUT}"
+fi
+
+# ------------------------------------------------------------------------------
 # Python
 # ------------------------------------------------------------------------------
 export PYTHONPATH=${PKG_DIR}/src:${PYTHONPATH}
@@ -87,7 +133,8 @@ echo "========================================================="
 # ------------------------------------------------------------------------------
 # Verify Environment
 # ------------------------------------------------------------------------------
-python - <<'EOF'
+ALLOW_CPU=${ALLOW_CPU} python - <<'EOF' || { echo "environment verification failed"; exit 1; }
+import os, sys
 import torch, faiss, timm, patchcore
 print("="*60)
 print("Environment OK")
@@ -98,6 +145,9 @@ print("faiss          :", faiss.__version__)
 print("timm           :", timm.__version__)
 print("patchcore      : OK")
 print("="*60)
+if not torch.cuda.is_available() and os.environ.get("ALLOW_CPU") != "1":
+    print("FATAL: torch sees no CUDA device (set ALLOW_CPU=1 to run CPU-only).")
+    sys.exit(1)
 EOF
 
 # ------------------------------------------------------------------------------
@@ -120,7 +170,7 @@ RESIZE=${RESIZE:-256}
 IMAGESIZE=${IMAGESIZE:-224}
 
 # streaming / RL settings
-CAPACITY=${CAPACITY:-2000}                     # memory budget M
+CAPACITY=${CAPACITY:-20000}                     # memory budget M
 WARMUP=${WARMUP:-100}                          # warmup images for stage-0 bank + reward scales
 N_NN=${N_NN:-5}                                # k for k-NN scoring (matches train_polyp_pvt.sh)
 # Episodes are only (stream length - warmup) steps, so 200k total env steps
@@ -174,18 +224,27 @@ python -u bin/cache_embeddings.py \
 # ------------------------------------------------------------------------------
 # STEP 2: Gate 1 — headroom
 # ------------------------------------------------------------------------------
-echo -e "\n[2/5] Gate 1 (headroom) ..."
-python -u bin/run_gate1.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
-    --n_nn "${N_NN}" --out "${RESULT_DIR}/gate1.json"
+#echo -e "\n[2/5] Gate 1 (headroom) ..."
+#python -u bin/run_gate1.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
+#    --n_nn "${N_NN}" --out "${RESULT_DIR}/gate1.json"
 
 
 # ------------------------------------------------------------------------------
 # STEP 3: Gate 2 — proxy validation
 # ------------------------------------------------------------------------------
-echo -e "\n[3/5] Gate 2 (proxy validation) ..."
-python -u bin/run_gate2.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
-    --n_nn "${N_NN}" --out "${RESULT_DIR}/gate2.json"
+#echo -e "\n[3/5] Gate 2 (proxy validation) ..."
+#python -u bin/run_gate2.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" \
+#    --n_nn "${N_NN}" --out "${RESULT_DIR}/gate2.json"
 
+
+# ------------------------------------------------------------------------------
+# STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC)
+# ------------------------------------------------------------------------------
+echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
+python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
+
+REWARD_JSON_ARG=""
+[ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
 
 # ------------------------------------------------------------------------------
 # STEP 4: train PPO
@@ -198,6 +257,7 @@ python -u bin/train_ppo.py \
     --total_env_steps  "${PPO_STEPS}" \
     --seed             "${TRAIN_SEEDS}" \
     --out              "${PPO_OUT}" \
+    ${REWARD_JSON_ARG} \
     --eval_baselines || { echo "PPO training failed"; exit 1; }
 
 # ------------------------------------------------------------------------------
@@ -212,6 +272,7 @@ python -u bin/run_streaming_baseline.py \
     --policies   "${POLICIES}" \
     --ppo_path   "${PPO_OUT}" \
     --seeds      "${EVAL_SEEDS}" \
+    ${REWARD_JSON_ARG} \
     --out        "${RESULT_DIR}" || { echo "benchmark failed"; exit 1; }
 
 echo "========================================================="

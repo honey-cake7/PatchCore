@@ -40,17 +40,16 @@ def _load_readers(cache_dir, synthetic):
 
 
 def _build_policy(name, ppo_path, device):
+    """Returns (policy, obs_norm, meta). obs_norm/meta are None except for PPO
+    v2 checkpoints, which carry the normalizer + action mode they trained under."""
     if name == "ppo":
-        import torch
-
         from patchcore.streaming.policies import PPOPolicy
-        from patchcore.streaming.ppo import ActorCritic
+        from patchcore.streaming.ppo import load_checkpoint
 
-        ac = ActorCritic()
-        ac.load_state_dict(torch.load(ppo_path, map_location=device))
-        return PPOPolicy(ac, device=device)
+        ac, norm, meta = load_checkpoint(ppo_path, device=device)
+        return PPOPolicy(ac, device=device), norm, meta
     cls = P.BASELINES[name]
-    return cls(k=8) if name in ("fifo", "random") else cls()
+    return (cls(k=8) if name in ("fifo", "random") else cls()), None, None
 
 
 @click.command()
@@ -63,21 +62,34 @@ def _build_policy(name, ppo_path, device):
 @click.option("--ppo_path", default="ppo_policy.pt")
 @click.option("--action_mode", default="continuous6")
 @click.option("--seeds", default="0,1,2")
+@click.option("--reward_json", default=None,
+              help="Fitted reward weights (bin/fit_reward_weights.py output)")
 @click.option("--out", default="streaming_results")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
-         action_mode, seeds, out):
+         action_mode, seeds, reward_json, out):
+    import dataclasses
+
     from patchcore.streaming.bank import device_banner
+    from patchcore.streaming.reward import RewardConfig, load_reward_weights
 
     print(device_banner())
     stream, tests, patch_shape, imagesize = _load_readers(cache_dir, synthetic)
     seeds = [int(s) for s in seeds.split(",")]
     names = [n for n in policy_names.split(",") if n]
     os.makedirs(out, exist_ok=True)
+    reward_cfg = load_reward_weights(reward_json) if reward_json else RewardConfig()
+    if reward_json:
+        print(f"[reward] weights from {reward_json}: alpha={reward_cfg.alpha} "
+              f"beta={reward_cfg.beta} gamma={reward_cfg.gamma} "
+              f"churn_coef={reward_cfg.churn_coef} churn_budget={reward_cfg.churn_budget}")
 
-    def make_env(seed):
+    def make_env(seed, obs_norm=None, mode=None):
         return MemoryMaintenanceEnv(
             stream, capacity=capacity, warmup_images=warmup, seed=seed,
-            action_cfg=ActionConfig(mode=action_mode), n_nearest_neighbours=n_nn,
+            action_cfg=ActionConfig(mode=mode or action_mode),
+            n_nearest_neighbours=n_nn, obs_norm=obs_norm,
+            # fresh copy per env: reset() writes warmup scales into the config
+            reward_cfg=dataclasses.replace(reward_cfg),
         )
 
     def eval_fn(env, stage):
@@ -91,11 +103,16 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
             print(f"[skip] ppo policy not found at {ppo_path}")
             continue
         for seed in seeds:
-            env = make_env(seed)
             # "cpu" here is only the PPO actor-critic's device — a 53-dim MLP
             # queried one obs at a time, where transfer latency exceeds compute.
             # All k-NN / coreset / eval work auto-selects the GPU.
-            policy = _build_policy(name, ppo_path, "cpu")
+            policy, ppo_norm, ppo_meta = _build_policy(name, ppo_path, "cpu")
+            # PPO must run under the normalizer + action mode it trained with
+            # (v2 checkpoints); the norm is frozen so sharing across seeds is safe.
+            env = make_env(
+                seed, obs_norm=ppo_norm,
+                mode=(ppo_meta or {}).get("action_mode"),
+            )
             summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
             # forgetting: re-evaluate stage-0 test with the final bank
             forget_m = evaluate_bank_on_stage(

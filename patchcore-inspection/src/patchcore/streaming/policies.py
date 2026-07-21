@@ -195,7 +195,11 @@ class PPOPolicy(BasePolicy):
     def decide(self, env):
         import torch
 
-        obs = env._observe()
+        # Reuse the obs the env already computed for this state; re-observing
+        # would double-update the RunningNorm warmup relative to training.
+        obs = env.last_obs
+        if obs is None:
+            obs = env._observe(update=False)
         with torch.no_grad():
             t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             dist, _ = self.ac(t)
@@ -234,4 +238,5 @@ def run_policy(env, policy, per_stage_eval=None):
         "total_evict": int(sum(i["n_evict"] for i in infos)),
         "evals": evals,
         "rewards": rewards,
+        "infos": infos,
     }

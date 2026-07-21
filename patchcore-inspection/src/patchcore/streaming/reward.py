@@ -26,9 +26,20 @@ def _default_churn_coef() -> float:
     # independently of score-drift. The prior design folded churn into the
     # instability term at gamma=0.1, which was ~0.006 of reward per step at
     # M=20000 — far too weak to deter a policy that rewrites the whole bank
-    # every step. Sweep upward (roughly 1-10) to trade adaptation vs. churn;
-    # too high and the reward-maximizing policy collapses to no-op/static.
+    # every step. Only churn ABOVE churn_budget is penalized (see below), so
+    # ordinary maintenance is free; the coefficient prices wholesale rewrites.
     return float(os.environ.get("STREAMING_CHURN_COEF", "2.0"))
+
+
+def _default_churn_budget() -> float:
+    # Per-step churn (admit+evict as a fraction of capacity) below this budget
+    # is free. A flat linear churn tax made low-churn-but-inaccurate policies
+    # (random/reservoir) out-score every adaptive policy on the proxy while
+    # losing on AUROC — the exact misalignment RL then optimized into. 0.01
+    # covers fifo/greedy-coreset-scale maintenance; a full periodic re-coreset
+    # (churn ≈ 2.0 on its rewrite step) still pays. Override with
+    # STREAMING_CHURN_BUDGET.
+    return float(os.environ.get("STREAMING_CHURN_BUDGET", "0.01"))
 
 
 @dataclass
@@ -37,11 +48,32 @@ class RewardConfig:
     beta: float = 0.3
     gamma: float = 0.1                         # weight on score-drift (stability)
     churn_coef: float = field(default_factory=_default_churn_coef)
+    churn_budget: float = field(default_factory=_default_churn_budget)
     window_images: int = 32
     holdout_patch_frac: float = 0.1
     redundancy_delta: Optional[float] = None  # auto-set from warmup if None
     redundancy_sample: int = 2048
     coverage_scale: float = 1.0               # normalizer for C (set from warmup)
+
+
+def load_reward_weights(path: str) -> "RewardConfig":
+    """Build a RewardConfig from a fitted-weights JSON (bin/fit_reward_weights.py).
+
+    Accepts either the fit output ({"recommended": {...}}) or a bare weights
+    dict. Unknown keys are ignored; missing keys keep their defaults. Callers
+    must hand each env its own copy (``dataclasses.replace(cfg)``) because
+    ``env.reset()`` writes the warmup scales into the config in place.
+    """
+    import json
+
+    with open(path) as f:
+        obj = json.load(f)
+    weights = obj.get("recommended", obj)
+    cfg = RewardConfig()
+    for key in ("alpha", "beta", "gamma", "churn_coef", "churn_budget"):
+        if key in weights:
+            setattr(cfg, key, float(weights[key]))
+    return cfg
 
 
 def coverage(bank, patches: np.ndarray) -> float:
@@ -103,16 +135,20 @@ class ProxyReward:
             bank, holdout_patches, n_admit, n_evict
         )
         cfg = self.cfg
+        churn_excess = max(0.0, churn - cfg.churn_budget)
         reward = -(
             cfg.alpha * c
             + cfg.beta * r
             + cfg.gamma * score_drift
-            + cfg.churn_coef * churn
+            + cfg.churn_coef * churn_excess
         )
         # U kept for logging continuity (instability = churn + score-drift).
+        # Raw churn stays in the log so offline reward-weight refits can
+        # re-derive churn_excess under any candidate budget.
         return reward, {
             "C": c, "R": r, "U": churn + score_drift,
-            "churn": churn, "score_drift": score_drift, "reward": reward,
+            "churn": churn, "churn_excess": churn_excess,
+            "score_drift": score_drift, "reward": reward,
         }
 
 
