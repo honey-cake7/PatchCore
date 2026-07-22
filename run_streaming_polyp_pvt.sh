@@ -245,8 +245,11 @@ echo "========================================================="
 #echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
 #python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
 
-#REWARD_JSON_ARG=""
-#[ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
+# Keep this active even when step 3.5 is commented out: it only points at the
+# already-fitted weights file. Without it train/benchmark fall back to the
+# DEFAULT reward config (q_coef=0 — the misaligned reward).
+REWARD_JSON_ARG=""
+[ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
 
 # ------------------------------------------------------------------------------
 # STEP 4: train PPO
