@@ -111,6 +111,9 @@ def _fit_obs_norm(env_fn, seed=0):
 @click.option("--gamma", type=float, default=None, help="Override reward gamma")
 @click.option("--churn_coef", type=float, default=None, help="Override churn coefficient")
 @click.option("--churn_budget", type=float, default=None, help="Override churn budget")
+@click.option("--reward_form", default="level", type=click.Choice(["level", "delta"]),
+              help="delta = potential-based shaping: reward the step change in "
+                   "state cost (action-local signal; same optimal policy)")
 @click.option("--norm_mode", default="episode", type=click.Choice(["episode", "running"]),
               help="Obs normalization: prefit+frozen over a full episode, or legacy running warmup")
 @click.option("--reward_scale", default="fixed", type=click.Choice(["ewma", "fixed", "none"]))
@@ -121,13 +124,16 @@ def _fit_obs_norm(env_fn, seed=0):
 @click.option("--lr_end", type=float, default=None, help="Linear LR anneal target")
 def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
          total_env_steps, seed, out, device, eval_baselines, reward_json,
-         beta, gamma, churn_coef, churn_budget, norm_mode, reward_scale,
-         adv_mode, ent_coef, ent_coef_end, lr, lr_end):
+         beta, gamma, churn_coef, churn_budget, reward_form, norm_mode,
+         reward_scale, adv_mode, ent_coef, ent_coef_end, lr, lr_end):
     from patchcore.streaming.bank import device_banner
     from patchcore.streaming.ppo import PPOConfig, PPOTrainer
 
     print(device_banner())
     reward_cfg = _build_reward_cfg(reward_json, beta, gamma, churn_coef, churn_budget)
+    reward_cfg.reward_form = reward_form
+    if reward_form == "delta":
+        print("[reward] potential-based delta shaping enabled")
     if synthetic:
         env_fns = _make_synthetic_env_fns(
             n_env, capacity, warmup, action_mode, seed, reward_cfg)

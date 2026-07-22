@@ -66,6 +66,14 @@ class RewardConfig:
     # AUROC. Empirically Q alone nearly reproduces the policy ranking that no
     # weighting of the absolute terms could.
     q_coef: float = 0.0
+    # "level": reward = -(state cost) - (action cost)   [default]
+    # "delta": potential-based shaping — reward the step CHANGE in state cost
+    #   instead of its level. The episode return telescopes to the same
+    #   objective (final-minus-initial state cost plus action costs), so the
+    #   optimal policy is preserved, but the per-step signal becomes
+    #   action-local: at large M a single decision barely moves the state
+    #   terms' level, which buries the advantage signal in state inertia.
+    reward_form: str = "level"
     window_images: int = 32
     holdout_patch_frac: float = 0.1
     redundancy_delta: Optional[float] = None  # auto-set from warmup if None
@@ -119,6 +127,7 @@ class ProxyReward:
         self.cfg = cfg
         self.probe = np.ascontiguousarray(probe, dtype=np.float32)
         self._prev_probe_dists: Optional[np.ndarray] = None
+        self._prev_potential_cost: Optional[float] = None
 
     def _probe_dists(self, bank) -> np.ndarray:
         if len(self.probe) == 0 or len(bank) == 0:
@@ -170,15 +179,20 @@ class ProxyReward:
         cfg = self.cfg
         churn_excess = max(0.0, churn - cfg.churn_budget)
         q = c90 / c if c > 1e-8 else 0.0
-        reward = -(
-            cfg.alpha * c
-            + cfg.beta * r
-            + cfg.gamma * score_drift
-            + cfg.churn_coef * churn_excess
-            + cfg.c90_coef * c90
-            + cfg.probe_coef * p
-            + cfg.q_coef * q
+        # state-quality cost (function of the bank state only) vs action costs
+        # (score_drift is already a step delta; churn is per-action)
+        potential_cost = (
+            cfg.alpha * c + cfg.beta * r + cfg.c90_coef * c90
+            + cfg.probe_coef * p + cfg.q_coef * q
         )
+        action_cost = cfg.gamma * score_drift + cfg.churn_coef * churn_excess
+        if cfg.reward_form == "delta":
+            prev = self._prev_potential_cost
+            state_term = 0.0 if prev is None else potential_cost - prev
+            self._prev_potential_cost = potential_cost
+            reward = -(state_term + action_cost)
+        else:
+            reward = -(potential_cost + action_cost)
         # U kept for logging continuity (instability = churn + score-drift).
         # Raw churn stays in the log so offline reward-weight refits can
         # re-derive churn_excess under any candidate budget.
@@ -186,7 +200,7 @@ class ProxyReward:
             "C": c, "R": r, "U": churn + score_drift,
             "churn": churn, "churn_excess": churn_excess,
             "score_drift": score_drift, "C90": c90, "P": p, "Q": q,
-            "reward": reward,
+            "potential_cost": potential_cost, "reward": reward,
         }
 
 

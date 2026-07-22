@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=streaming-polyppvt
+#SBATCH --job-name=grpo-streaming
 #SBATCH --partition=LocalQ
 #SBATCH --account=default
 #SBATCH --gres=shard:6
@@ -178,6 +178,8 @@ N_NN=${N_NN:-5}                                # k for k-NN scoring (matches tra
 # ~10x more compute for a 53-dim-obs MLP policy. Raise via PPO_STEPS=... if
 # the mean_reward curve is still climbing at the end of training.
 PPO_STEPS=${PPO_STEPS:-200000}
+ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, critic-free)
+REWARD_FORM=${REWARD_FORM:-level}              # level | delta (potential-based shaping)
 TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
 POLICIES=${POLICIES:-static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo}
@@ -240,11 +242,11 @@ echo "========================================================="
 # ------------------------------------------------------------------------------
 # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC)
 # ------------------------------------------------------------------------------
-echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
-python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
+#echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
+#python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
 
-REWARD_JSON_ARG=""
-[ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
+#REWARD_JSON_ARG=""
+#[ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
 
 # ------------------------------------------------------------------------------
 # STEP 4: train PPO
@@ -257,6 +259,8 @@ python -u bin/train_ppo.py \
     --total_env_steps  "${PPO_STEPS}" \
     --seed             "${TRAIN_SEEDS}" \
     --out              "${PPO_OUT}" \
+    --adv_mode         "${ADV_MODE}" \
+    --reward_form      "${REWARD_FORM}" \
     ${REWARD_JSON_ARG} \
     --eval_baselines || { echo "PPO training failed"; exit 1; }
 
