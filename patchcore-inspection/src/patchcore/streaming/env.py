@@ -7,8 +7,8 @@ held-out slice of the recent window. Both the learned policy and the hand-design
 baselines drive the same transition via :meth:`step_with_decision`.
 """
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Deque, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Deque, Optional, Tuple
 
 import numpy as np
 
@@ -141,8 +141,6 @@ class MemoryMaintenanceEnv:
 
     def _init_bank(self, feats: np.ndarray) -> DynamicMemoryBank:
         if self.init_bank_mode == "coreset_stage0" and len(feats):
-            import torch
-
             import patchcore.sampler
 
             if len(feats) > self.capacity:
@@ -306,7 +304,6 @@ class MemoryMaintenanceEnv:
         """Map a raw policy action to (admit_idx into current_batch, evict_slots)."""
         a = np.tanh(np.asarray(action, dtype=np.float32))
         mode = self.action_cfg.mode
-        A = self._admissible
         nn = self._batch_nn
         cap = int(self.action_cfg.admit_cap_frac * self.capacity)
 

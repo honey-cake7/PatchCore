@@ -62,7 +62,9 @@ def _build_reward_cfg(reward_json, beta, gamma, churn_coef, churn_budget):
     if reward_json:
         print(f"[reward] loaded weights from {reward_json}: "
               f"alpha={cfg.alpha} beta={cfg.beta} gamma={cfg.gamma} "
-              f"churn_coef={cfg.churn_coef} churn_budget={cfg.churn_budget}")
+              f"churn_coef={cfg.churn_coef} churn_budget={cfg.churn_budget} "
+              f"c90_coef={cfg.c90_coef} probe_coef={cfg.probe_coef} "
+              f"q_coef={cfg.q_coef}")
     for name, val in (("beta", beta), ("gamma", gamma),
                       ("churn_coef", churn_coef), ("churn_budget", churn_budget)):
         if val is not None:

@@ -81,7 +81,9 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
     if reward_json:
         print(f"[reward] weights from {reward_json}: alpha={reward_cfg.alpha} "
               f"beta={reward_cfg.beta} gamma={reward_cfg.gamma} "
-              f"churn_coef={reward_cfg.churn_coef} churn_budget={reward_cfg.churn_budget}")
+              f"churn_coef={reward_cfg.churn_coef} churn_budget={reward_cfg.churn_budget} "
+              f"c90_coef={reward_cfg.c90_coef} probe_coef={reward_cfg.probe_coef} "
+              f"q_coef={reward_cfg.q_coef}")
 
     def make_env(seed, obs_norm=None, mode=None):
         return MemoryMaintenanceEnv(

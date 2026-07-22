@@ -224,12 +224,14 @@ def record_policy_traces(
 
 def fit_reward_weights(
     traces: List[Dict],
+    alphas=(0.0, 0.25, 1.0),
     betas=(0.0, 0.15, 0.3, 0.6, 1.0),
     gammas=(0.0, 0.1, 0.3),
     churn_coefs=(0.0, 0.25, 0.5, 1.0, 2.0, 4.0),
     churn_budgets=(0.0, 0.005, 0.01, 0.02),
     c90_coefs=(0.0, 0.25, 0.5, 1.0, 2.0),
     probe_coefs=(0.0, 0.25, 0.5, 1.0, 2.0, 4.0),
+    q_coefs=(0.0, 1.0, 2.0, 4.0, 8.0),
     forget_weight: float = 0.5,
 ) -> Dict:
     """Grid-fit reward weights so mean episode reward ranks policies like AUROC.
@@ -246,7 +248,7 @@ def fit_reward_weights(
     from patchcore.streaming.reward import RewardConfig
 
     targets = []
-    mean_c, mean_r, mean_sd, mean_c90, mean_p = [], [], [], [], []
+    mean_c, mean_r, mean_sd, mean_c90, mean_p, mean_q = [], [], [], [], [], []
     for tr in traces:
         drifted = [v for s, v in tr["stage_aurocs"].items() if s >= 1]
         targets.append(float(np.mean(drifted)) + forget_weight * tr["forget_auroc"])
@@ -256,52 +258,63 @@ def fit_reward_weights(
         # older traces lack C90/P; treat as absent (coef grid still explores 0)
         mean_c90.append(tr["C90"].mean() if "C90" in tr else 0.0)
         mean_p.append(tr["P"].mean() if "P" in tr else 0.0)
+        # scale-invariant tail ratio, derivable from any trace that has C90
+        mean_q.append(
+            float(np.mean(tr["C90"] / np.maximum(tr["C"], 1e-8)))
+            if "C90" in tr else 0.0
+        )
     targets = np.asarray(targets)
     mean_c = np.asarray(mean_c)
     mean_r = np.asarray(mean_r)
     mean_sd = np.asarray(mean_sd)
     mean_c90 = np.asarray(mean_c90)
     mean_p = np.asarray(mean_p)
+    mean_q = np.asarray(mean_q)
     # mean excess churn per trace, per candidate budget
     mean_excess = {
         b: np.asarray([np.maximum(tr["churn"] - b, 0.0).mean() for tr in traces])
         for b in churn_budgets
     }
 
-    def rho_for(beta, gamma, coef, budget, c90c, probec):
-        proxy = -(mean_c + beta * mean_r + gamma * mean_sd
+    def rho_for(alpha, beta, gamma, coef, budget, c90c, probec, qc):
+        proxy = -(alpha * mean_c + beta * mean_r + gamma * mean_sd
                   + coef * mean_excess[budget]
-                  + c90c * mean_c90 + probec * mean_p)
+                  + c90c * mean_c90 + probec * mean_p + qc * mean_q)
         return float(stats.spearmanr(proxy, targets).correlation)
 
     candidates = []
-    for beta in betas:
-        for gamma in gammas:
-            for coef in churn_coefs:
-                for budget in churn_budgets:
-                    for c90c in c90_coefs:
-                        for probec in probe_coefs:
-                            rho = rho_for(beta, gamma, coef, budget, c90c, probec)
-                            if not np.isfinite(rho):
-                                continue
-                            candidates.append({
-                                "alpha": 1.0, "beta": float(beta),
-                                "gamma": float(gamma),
-                                "churn_coef": float(coef),
-                                "churn_budget": float(budget),
-                                "c90_coef": float(c90c),
-                                "probe_coef": float(probec),
-                                "rho_ranking": rho,
-                            })
+    for alpha in alphas:
+        for beta in betas:
+            for gamma in gammas:
+                for coef in churn_coefs:
+                    for budget in churn_budgets:
+                        for c90c in c90_coefs:
+                            for probec in probe_coefs:
+                                for qc in q_coefs:
+                                    rho = rho_for(alpha, beta, gamma, coef,
+                                                  budget, c90c, probec, qc)
+                                    if not np.isfinite(rho):
+                                        continue
+                                    candidates.append({
+                                        "alpha": float(alpha),
+                                        "beta": float(beta),
+                                        "gamma": float(gamma),
+                                        "churn_coef": float(coef),
+                                        "churn_budget": float(budget),
+                                        "c90_coef": float(c90c),
+                                        "probe_coef": float(probec),
+                                        "q_coef": float(qc),
+                                        "rho_ranking": rho,
+                                    })
     candidates.sort(key=lambda d: -d["rho_ranking"])
     best = candidates[0]
 
     cur = RewardConfig()
     cur_budget = min(churn_budgets, key=lambda b: abs(b - cur.churn_budget))
-    rho_current = rho_for(cur.beta, cur.gamma, cur.churn_coef, cur_budget,
-                          cur.c90_coef, cur.probe_coef)
+    rho_current = rho_for(cur.alpha, cur.beta, cur.gamma, cur.churn_coef,
+                          cur_budget, cur.c90_coef, cur.probe_coef, cur.q_coef)
     weight_keys = ("alpha", "beta", "gamma", "churn_coef", "churn_budget",
-                   "c90_coef", "probe_coef")
+                   "c90_coef", "probe_coef", "q_coef")
     return {
         "recommended": {k: best[k] for k in weight_keys},
         "rho_ranking": best["rho_ranking"],

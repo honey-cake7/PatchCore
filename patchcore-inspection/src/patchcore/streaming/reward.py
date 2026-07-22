@@ -58,6 +58,14 @@ class RewardConfig:
     # on coverage while collapsing stage-0 AUROC — this term is what separates
     # them from policies that admit recent AND retain (fifo/periodic-coreset).
     probe_coef: float = 0.0
+    # Weight on the tail ratio Q = C90/C of holdout scores. AUROC is
+    # scale-invariant — it measures normal/anomaly score SEPARATION, which
+    # absolute distance levels (C, P) cannot see: a re-coreset that doubles
+    # every distance keeps AUROC intact. Q is the label-free scale-invariant
+    # stand-in: a heavy right tail of normal scores is what actually erodes
+    # AUROC. Empirically Q alone nearly reproduces the policy ranking that no
+    # weighting of the absolute terms could.
+    q_coef: float = 0.0
     window_images: int = 32
     holdout_patch_frac: float = 0.1
     redundancy_delta: Optional[float] = None  # auto-set from warmup if None
@@ -80,7 +88,7 @@ def load_reward_weights(path: str) -> "RewardConfig":
     weights = obj.get("recommended", obj)
     cfg = RewardConfig()
     for key in ("alpha", "beta", "gamma", "churn_coef", "churn_budget",
-                "c90_coef", "probe_coef"):
+                "c90_coef", "probe_coef", "q_coef"):
         if key in weights:
             setattr(cfg, key, float(weights[key]))
     return cfg
@@ -161,6 +169,7 @@ class ProxyReward:
         )
         cfg = self.cfg
         churn_excess = max(0.0, churn - cfg.churn_budget)
+        q = c90 / c if c > 1e-8 else 0.0
         reward = -(
             cfg.alpha * c
             + cfg.beta * r
@@ -168,6 +177,7 @@ class ProxyReward:
             + cfg.churn_coef * churn_excess
             + cfg.c90_coef * c90
             + cfg.probe_coef * p
+            + cfg.q_coef * q
         )
         # U kept for logging continuity (instability = churn + score-drift).
         # Raw churn stays in the log so offline reward-weight refits can
@@ -175,7 +185,8 @@ class ProxyReward:
         return reward, {
             "C": c, "R": r, "U": churn + score_drift,
             "churn": churn, "churn_excess": churn_excess,
-            "score_drift": score_drift, "C90": c90, "P": p, "reward": reward,
+            "score_drift": score_drift, "C90": c90, "P": p, "Q": q,
+            "reward": reward,
         }
 
 
