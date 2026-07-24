@@ -170,7 +170,7 @@ RESIZE=${RESIZE:-256}
 IMAGESIZE=${IMAGESIZE:-224}
 
 # streaming / RL settings
-CAPACITY=${CAPACITY:-20000}                     # memory budget M
+CAPACITY=${CAPACITY:-2000}                     # memory budget M
 WARMUP=${WARMUP:-100}                          # warmup images for stage-0 bank + reward scales
 N_NN=${N_NN:-5}                                # k for k-NN scoring (matches train_polyp_pvt.sh)
 # Episodes are only (stream length - warmup) steps, so 200k total env steps
@@ -242,8 +242,8 @@ echo "========================================================="
 # ------------------------------------------------------------------------------
 # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC)
 # ------------------------------------------------------------------------------
-#echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
-#python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
+echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
+python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
 
 # Keep this active even when step 3.5 is commented out: it only points at the
 # already-fitted weights file. Without it train/benchmark fall back to the
