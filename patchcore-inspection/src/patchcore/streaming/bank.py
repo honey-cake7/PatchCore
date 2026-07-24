@@ -153,6 +153,15 @@ class DynamicMemoryBank:
         self._nn2_step = -1
         self._ent_cache: Optional[np.ndarray] = None
         self._ent_step = -1
+        # Sampled NN-2 cache (reward + observation both sample within a step).
+        self._nn2_sample_cache: Optional[np.ndarray] = None
+        self._nn2_sample_step = -1
+        # Stale-tolerant per-slot NN-2 for eviction ranking: the exact O(M^2)
+        # recompute runs only every ``nn2_refresh_every`` mutations (the
+        # ranking drifts slowly); override with STREAMING_NN2_REFRESH.
+        self.nn2_refresh_every = int(os.environ.get("STREAMING_NN2_REFRESH", "64"))
+        self._nn2_slot: Optional[np.ndarray] = None
+        self._nn2_slot_step: Optional[int] = None
 
     # ---- basic state -----------------------------------------------------
     def __len__(self) -> int:
@@ -332,17 +341,60 @@ class DynamicMemoryBank:
             return nn2
         if sample >= self._size:
             return self._member_nn2()
+        # reuse this step's sampled distances (reward and observation both
+        # sample NN-2 within one step; the second call is a free subsample)
+        if (self._nn2_sample_step == self._step
+                and self._nn2_sample_cache is not None
+                and len(self._nn2_sample_cache) >= sample):
+            cache = self._nn2_sample_cache
+            if len(cache) > sample:
+                return self._rng.choice(cache, size=sample, replace=False)
+            return cache
         slots = self._rng.choice(self.active_slots(), size=sample, replace=False)
         dists, _ = self.knn(self._store[slots], k=2)
-        return dists[:, 1]
+        nn2 = dists[:, 1]
+        self._nn2_sample_cache = nn2
+        self._nn2_sample_step = self._step
+        return nn2
+
+    def _eviction_redundancy(self) -> np.ndarray:
+        """Per-active-member NN-2 for the eviction ranking, in active-slot order.
+
+        The exact all-vs-all NN-2 is O(M^2) — at M=20000 that is ~0.8 TFLOP,
+        and a policy that evicts every step invalidates the per-step cache
+        every step, making it the dominant training cost. Eviction only needs
+        a slowly-drifting *ranking*, so the exact recompute runs every
+        ``nn2_refresh_every`` mutations; between refreshes we serve a
+        slot-indexed stale copy (members added since the refresh fall back to
+        the median, which leaves them mid-ranking until the next refresh).
+        """
+        slots = self.active_slots()
+        stale = (
+            self._nn2_slot is None
+            or self._nn2_slot_step is None
+            or self._step - self._nn2_slot_step >= self.nn2_refresh_every
+        )
+        if stale:
+            nn2 = self._member_nn2()
+            self._nn2_slot = np.full(self.capacity, np.nan, dtype=np.float32)
+            self._nn2_slot[slots] = nn2
+            self._nn2_slot_step = self._step
+            return nn2
+        red = self._nn2_slot[slots]
+        missing = np.isnan(red)
+        if missing.any():
+            known = red[~missing]
+            fill = float(np.median(known)) if len(known) else 0.0
+            red = np.where(missing, fill, red)
+        return red.astype(np.float32)
 
     def entry_features(self) -> np.ndarray:
         """Per-active-entry features ``[m, 4]`` for the eviction utility.
 
-        Columns: normalized age, negative hit rate, negative NN-2 redundancy,
-        distance to the recent-insertion centroid. All are computed so that a
-        higher weighted sum means "more worth keeping". Cached per mutation
-        step.
+        Columns: normalized age, negative hit rate, negative NN-2 redundancy
+        (stale-tolerant, see :meth:`_eviction_redundancy`), distance to the
+        recent-insertion centroid. All are computed so that a higher weighted
+        sum means "more worth keeping". Cached per mutation step.
         """
         if self._ent_step == self._step and self._ent_cache is not None:
             return self._ent_cache
@@ -355,7 +407,7 @@ class DynamicMemoryBank:
         exposure = np.maximum(self._step - self.insert_step[slots], 1)
         hit_rate = self.hit_count[slots] / exposure
         hit_rate = hit_rate / (hit_rate.max() + 1e-6)
-        red = self._member_nn2() if m >= 2 else np.zeros(m, np.float32)
+        red = self._eviction_redundancy() if m >= 2 else np.zeros(m, np.float32)
         red_n = red / (red.max() + 1e-6)
         centroid = self._store[slots[self.insert_step[slots] >= np.median(
             self.insert_step[slots])]].mean(axis=0, keepdims=True) if m else 0.0
@@ -393,6 +445,9 @@ class DynamicMemoryBank:
         self._base_dirty = True
         self._nn2_step = -1
         self._ent_step = -1
+        self._nn2_sample_step = -1
+        self._nn2_slot = None
+        self._nn2_slot_step = None
 
     def install_into(self, scorer):
         """Load the active vectors into a stock NearestNeighbourScorer.

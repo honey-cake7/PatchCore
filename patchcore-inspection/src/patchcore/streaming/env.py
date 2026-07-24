@@ -31,6 +31,10 @@ class ObsConfig:
     ewma_lambda: float = 0.05
     slope_horizon: int = 20
     warmup_steps: int = 128        # steps over which RunningNorm adapts, then freezes
+    # Cap on holdout-window patches queried per step for coverage/reward. The
+    # full window is ~window_images * holdout patches (thousands); a fixed-size
+    # subsample is statistically equivalent and bounds the per-step k-NN cost.
+    max_window_query: int = 2048
 
 
 @dataclass
@@ -118,6 +122,10 @@ class MemoryMaintenanceEnv:
         # otherwise each env fits its own during warmup.
         self._norm = obs_norm if obs_norm is not None else RunningNorm(OBS_DIM)
         self._last_obs: Optional[np.ndarray] = None
+        # (cov_mean, cov_p90) from this step's reward computation — the
+        # observation reads the same window against the same bank, so
+        # recomputing its k-NN would be pure duplication.
+        self._win_cov_cache: Optional[Tuple[float, float]] = None
 
         self.bank: Optional[DynamicMemoryBank] = None
         self._proxy: Optional[ProxyReward] = None
@@ -186,6 +194,7 @@ class MemoryMaintenanceEnv:
         self._ewma = 0.0
         self._prev_coverage = 0.0
         self._pending_churn = (0, 0)
+        self._win_cov_cache = None
 
         start = self.warmup_images if episode_slice is None else episode_slice.start
         stop = self.reader.n_images if episode_slice is None else episode_slice.stop
@@ -250,12 +259,19 @@ class MemoryMaintenanceEnv:
         else:
             density = [0.0, 0.0, 0.0]
 
-        # sliding-window coverage
+        # sliding-window coverage — reuse this step's reward-side computation
+        # when available (same window, same bank state)
         if self._window:
-            win = np.concatenate(list(self._window), axis=0)
-            wd, _ = bank.knn(win, k=1)
-            wd = np.where(np.isfinite(wd[:, 0]), wd[:, 0], 0.0)
-            cov_mean = wd.mean(); cov_p90 = np.percentile(wd, 90)
+            if self._win_cov_cache is not None:
+                cov_mean, cov_p90 = self._win_cov_cache
+            else:
+                win = np.concatenate(list(self._window), axis=0)
+                if len(win) > cfg.max_window_query:
+                    win = win[self.rng.choice(
+                        len(win), size=cfg.max_window_query, replace=False)]
+                wd, _ = bank.knn(win, k=1)
+                wd = np.where(np.isfinite(wd[:, 0]), wd[:, 0], 0.0)
+                cov_mean = wd.mean(); cov_p90 = np.percentile(wd, 90)
         else:
             cov_mean = cov_p90 = 0.0
         cov_delta = cov_mean - self._prev_coverage
@@ -388,9 +404,14 @@ class MemoryMaintenanceEnv:
 
         self._window.append(self._holdout)
         holdout = np.concatenate(list(self._window), axis=0)
+        if len(holdout) > self.obs_cfg.max_window_query:
+            holdout = holdout[self.rng.choice(
+                len(holdout), size=self.obs_cfg.max_window_query, replace=False)]
         reward, comps = self._proxy.compute(
             self.bank, holdout, tot_admit, tot_evict
         )
+        scale = self.reward_cfg.coverage_scale
+        self._win_cov_cache = (comps["C"] * scale, comps["C90"] * scale)
 
         # drift EWMA over batch novelty mean
         nov = float(self._batch_nn.mean()) if len(self._batch_nn) else 0.0
