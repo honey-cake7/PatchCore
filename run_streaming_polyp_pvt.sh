@@ -179,6 +179,8 @@ N_NN=${N_NN:-5}                                # k for k-NN scoring (matches tra
 # the mean_reward curve is still climbing at the end of training.
 PPO_STEPS=${PPO_STEPS:-200000}
 ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, critic-free)
+CLIP_MODE=${CLIP_MODE:-gppo}                   # clip | gppo (gradient-preserving)
+CLIP_HIGH=${CLIP_HIGH:-}                       # optional decoupled upper epsilon
 REWARD_FORM=${REWARD_FORM:-level}              # level | delta (potential-based shaping)
 TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
@@ -251,6 +253,9 @@ python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAP
 REWARD_JSON_ARG=""
 [ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
 
+CLIP_HIGH_ARG=""
+[ -n "${CLIP_HIGH}" ] && CLIP_HIGH_ARG="--clip_high ${CLIP_HIGH}"
+
 # ------------------------------------------------------------------------------
 # STEP 4: train PPO
 # ------------------------------------------------------------------------------
@@ -263,6 +268,8 @@ python -u bin/train_ppo.py \
     --seed             "${TRAIN_SEEDS}" \
     --out              "${PPO_OUT}" \
     --adv_mode         "${ADV_MODE}" \
+    --clip_mode        "${CLIP_MODE}" \
+    ${CLIP_HIGH_ARG} \
     --reward_form      "${REWARD_FORM}" \
     ${REWARD_JSON_ARG} \
     --eval_baselines || { echo "PPO training failed"; exit 1; }

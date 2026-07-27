@@ -74,6 +74,13 @@ class PPOConfig:
     #         Valid here because all envs replay the same cached stream in
     #         lockstep, so the group mean is a matched baseline.
     adv_mode: str = "gae"
+    # "clip": standard PPO hard clip (zero gradient once the ratio leaves the
+    #         trust region).
+    # "gppo": gradient-preserving clip — same forward loss, but the gradient of
+    #         clipped samples flows at the boundary value instead of being zeroed
+    #         (straight-through: clamp(r.detach()) * exp(logp - logp.detach())).
+    clip_mode: str = "clip"
+    clip_high: Optional[float] = None  # upper epsilon (clip-higher); None = clip
 
 
 class PPOTrainer:
@@ -193,8 +200,19 @@ class PPOTrainer:
                 dist, value = self.ac(obs[b])
                 logp = dist.log_prob(act[b]).sum(-1)
                 ratio = torch.exp(logp - old_logp[b])
+                lo = 1.0 - cfg.clip
+                hi = 1.0 + (cfg.clip_high if cfg.clip_high is not None else cfg.clip)
                 surr1 = ratio * adv[b]
-                surr2 = torch.clamp(ratio, 1 - cfg.clip, 1 + cfg.clip) * adv[b]
+                if cfg.clip_mode == "gppo":
+                    # forward value == clamp(ratio); backward grad flows at the
+                    # boundary magnitude instead of being zeroed. exp(logp - sg(logp))
+                    # is the straight-through factor (== ratio / sg(ratio)) computed
+                    # in log-space: ratio itself underflows to 0 for far-off-policy
+                    # samples and 0/0 would poison the weights with NaNs.
+                    clipped = torch.clamp(ratio.detach(), lo, hi) * torch.exp(logp - logp.detach())
+                else:
+                    clipped = torch.clamp(ratio, lo, hi)
+                surr2 = clipped * adv[b]
                 pg_loss = -torch.min(surr1, surr2).mean()
                 ent = dist.entropy().sum(-1).mean()
                 loss = pg_loss - ent_coef * ent

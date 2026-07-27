@@ -118,6 +118,10 @@ def _fit_obs_norm(env_fn, seed=0):
               help="Obs normalization: prefit+frozen over a full episode, or legacy running warmup")
 @click.option("--reward_scale", default="fixed", type=click.Choice(["ewma", "fixed", "none"]))
 @click.option("--adv_mode", default="gae", type=click.Choice(["gae", "grpo"]))
+@click.option("--clip_mode", default="clip", type=click.Choice(["clip", "gppo"]),
+              help="gppo = gradient-preserving clip (clipped samples keep a bounded gradient)")
+@click.option("--clip_high", type=float, default=None,
+              help="Decoupled upper clip epsilon (clip-higher); default = --clip value")
 @click.option("--ent_coef", type=float, default=1e-3)
 @click.option("--ent_coef_end", type=float, default=None, help="Linear entropy anneal target")
 @click.option("--lr", type=float, default=3e-4)
@@ -125,7 +129,8 @@ def _fit_obs_norm(env_fn, seed=0):
 def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
          total_env_steps, seed, out, device, eval_baselines, reward_json,
          beta, gamma, churn_coef, churn_budget, reward_form, norm_mode,
-         reward_scale, adv_mode, ent_coef, ent_coef_end, lr, lr_end):
+         reward_scale, adv_mode, clip_mode, clip_high, ent_coef, ent_coef_end,
+         lr, lr_end):
     from patchcore.streaming.bank import device_banner
     from patchcore.streaming.ppo import PPOConfig, PPOTrainer
 
@@ -148,8 +153,10 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
     cfg = PPOConfig(
         total_env_steps=total_env_steps, device=device,
         reward_scale=reward_scale, adv_mode=adv_mode,
+        clip_mode=clip_mode, clip_high=clip_high,
         ent_coef=ent_coef, ent_coef_end=ent_coef_end, lr=lr, lr_end=lr_end,
     )
+    print(f"[ppo] adv_mode={adv_mode} clip_mode={clip_mode} clip_high={clip_high}")
     trainer = PPOTrainer(env_fns, cfg, obs_norm=obs_norm)
     history = trainer.train()
     trainer.save(out)
