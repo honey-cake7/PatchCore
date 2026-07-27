@@ -177,7 +177,11 @@ N_NN=${N_NN:-5}                                # k for k-NN scoring (matches tra
 # already replays the stream dozens of times per env; the old 2M default was
 # ~10x more compute for a 53-dim-obs MLP policy. Raise via PPO_STEPS=... if
 # the mean_reward curve is still climbing at the end of training.
-PPO_STEPS=${PPO_STEPS:-200000}
+PPO_STEPS=${PPO_STEPS:-100000}
+# GPPO preserves gradients on clipped samples (bigger effective steps), so run
+# hot early and anneal cold: fast initial progress, small updates near the end.
+PPO_LR=${PPO_LR:-1e-3}                         # starting learning rate
+PPO_LR_END=${PPO_LR_END:-1e-5}                 # linear anneal target
 ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, critic-free)
 CLIP_MODE=${CLIP_MODE:-gppo}                   # clip | gppo (gradient-preserving)
 CLIP_HIGH=${CLIP_HIGH:-}                       # optional decoupled upper epsilon
@@ -244,8 +248,8 @@ echo "========================================================="
 # ------------------------------------------------------------------------------
 # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC)
 # ------------------------------------------------------------------------------
-echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
-python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
+#echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
+#python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
 
 # Keep this active even when step 3.5 is commented out: it only points at the
 # already-fitted weights file. Without it train/benchmark fall back to the
@@ -270,6 +274,8 @@ python -u bin/train_ppo.py \
     --adv_mode         "${ADV_MODE}" \
     --clip_mode        "${CLIP_MODE}" \
     ${CLIP_HIGH_ARG} \
+    --lr               "${PPO_LR}" \
+    --lr_end           "${PPO_LR_END}" \
     --reward_form      "${REWARD_FORM}" \
     ${REWARD_JSON_ARG} \
     --eval_baselines || { echo "PPO training failed"; exit 1; }

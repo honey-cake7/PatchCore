@@ -7,6 +7,7 @@ constraints; a compact PPO avoids all dependency risk. The environment applies
 dynamics, so the policy is a plain diagonal Gaussian over the raw action and
 ordinary Gaussian log-probs are exact — no tanh-Jacobian correction required.
 """
+import copy
 import dataclasses
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
@@ -81,6 +82,13 @@ class PPOConfig:
     #         (straight-through: clamp(r.detach()) * exp(logp - logp.detach())).
     clip_mode: str = "clip"
     clip_high: Optional[float] = None  # upper epsilon (clip-higher); None = clip
+    # Keep the best policy seen during training instead of the last one.
+    # Scored by rolling mean_reward over best_window iters — one window
+    # ≈ one full replay of the stream (episode ~2301 steps / 256-step
+    # rollouts ≈ 9), which cancels the episode-phase oscillation in the
+    # per-iter reward. Runs shorter than best_window keep the final policy.
+    save_best: bool = True
+    best_window: int = 9
 
 
 class PPOTrainer:
@@ -229,6 +237,7 @@ class PPOTrainer:
         steps_per_iter = cfg.rollout_steps * self.n_env
         n_iters = max(1, cfg.total_env_steps // steps_per_iter)
         history = []
+        best_score, best_iter, best_state = -float("inf"), -1, None
         for it in range(n_iters):
             frac = it / max(n_iters - 1, 1)
             if cfg.lr_end is not None:
@@ -239,10 +248,21 @@ class PPOTrainer:
             if cfg.ent_coef_end is not None:
                 ent_coef = cfg.ent_coef + frac * (cfg.ent_coef_end - cfg.ent_coef)
             batch = self.collect()
-            self.update(batch, ent_coef=ent_coef)
             history.append(batch["mean_reward"])
+            # mean_reward measures the pre-update policy, so snapshot before
+            # update() — the weights that produced the score, not their successor.
+            if cfg.save_best and len(history) >= cfg.best_window:
+                score = sum(history[-cfg.best_window:]) / cfg.best_window
+                if score > best_score:
+                    best_score, best_iter = score, it + 1
+                    best_state = copy.deepcopy(self.ac.state_dict())
+            self.update(batch, ent_coef=ent_coef)
             if (it + 1) % log_every == 0:
                 print(f"[ppo] iter {it+1}/{n_iters} mean_reward={batch['mean_reward']:.4f}")
+        if best_state is not None:
+            self.ac.load_state_dict(best_state)
+            print(f"[ppo] restored best policy from iter {best_iter} "
+                  f"(rolling[{cfg.best_window}] mean_reward={best_score:.4f})")
         return history
 
     def save(self, path: str):
