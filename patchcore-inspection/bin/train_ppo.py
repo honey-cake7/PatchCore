@@ -44,14 +44,29 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
     from patchcore.streaming.cache import EmbeddingCacheReader
 
     reader = EmbeddingCacheReader(os.path.join(cache_dir, "stream"))
+
+    # Every env replays the same stream, so the expensive warmup coreset (and
+    # probe/projection/reward scales) is computed once on a prototype and
+    # shared; each env keeps its own seed for per-step randomness.
+    print("[env] computing warmup coreset once (shared across envs) ...")
+    proto = MemoryMaintenanceEnv(
+        reader, capacity=capacity, warmup_images=warmup, seed=base_seed,
+        action_cfg=ActionConfig(mode=action_mode),
+        reward_cfg=dataclasses.replace(reward_cfg),
+    )
+    proto.reset()
+    init_state = proto.export_init_state()
+
     fns = []
     for i in range(n_env):
         def fn(seed=base_seed + i):
-            return MemoryMaintenanceEnv(
+            env = MemoryMaintenanceEnv(
                 reader, capacity=capacity, warmup_images=warmup, seed=seed,
                 action_cfg=ActionConfig(mode=action_mode),
                 reward_cfg=dataclasses.replace(reward_cfg),
             )
+            env.import_init_state(init_state)
+            return env
 
         fns.append(fn)
     return fns

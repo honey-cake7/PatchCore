@@ -163,6 +163,40 @@ class MemoryMaintenanceEnv:
             )
         return DynamicMemoryBank(self.capacity, self.dim)
 
+    def export_init_state(self) -> dict:
+        """Warm-start state for cloning this env's (expensive) initialization.
+
+        The warmup coreset dominates env construction cost. Vectorized training
+        envs replaying the same stream can pay it once: reset() one prototype,
+        export, and import_init_state() into the others. Sharing the projection
+        also makes a shared obs_norm exact — per-env random projections would
+        see it fitted under a different projection than they apply.
+        """
+        assert self._init_snapshot is not None, "reset() the prototype env first"
+        return {
+            "snapshot": self._init_snapshot,
+            "probe": self._probe,
+            "proj": self._proj,
+            "coverage_scale": self.reward_cfg.coverage_scale,
+            "redundancy_delta": self.reward_cfg.redundancy_delta,
+        }
+
+    def import_init_state(self, state: dict) -> None:
+        """Adopt a prototype env's init (see export_init_state).
+
+        Must run before the first reset(); reset() then takes the cheap
+        restore path (bank.restore copies, so the snapshot is shared safely).
+        Per-step randomness (holdout splits, k-NN subsampling) stays governed
+        by this env's own seed.
+        """
+        assert self.bank is None and self._init_snapshot is None, \
+            "import_init_state must precede the first reset()"
+        self._init_snapshot = state["snapshot"]
+        self._probe = state["probe"]
+        self._proj = state["proj"]
+        self.reward_cfg.coverage_scale = state["coverage_scale"]
+        self.reward_cfg.redundancy_delta = state["redundancy_delta"]
+
     def reset(self, episode_slice: Optional[slice] = None) -> np.ndarray:
         if self._init_snapshot is None:
             # First episode: pay the coreset cost once, then cache the result.
