@@ -221,6 +221,22 @@ SUMMARY_CSV=results/streaming/summary_${BB_TAG}_${DRIFT}.csv
 CLIP_HIGH_ARG=""
 [ -n "${CLIP_HIGH}" ] && CLIP_HIGH_ARG="--clip_high ${CLIP_HIGH}"
 
+# A cache is only trustworthy if every manifest.json is present: the writer
+# preallocates the memmap first and writes manifest.json LAST (commit marker),
+# so a job cut off mid-caching leaves dirs without manifests. Directory
+# existence alone must not skip step 1 — an interrupted cache would wedge the
+# class until a manual RECACHE=1.
+cache_complete() {
+    local dir=$1 n=0 d
+    [ -f "${dir}/stream/manifest.json" ] || return 1
+    for d in "${dir}"/test/stage_*/; do
+        [ -d "${d}" ] || continue
+        n=$((n + 1))
+        [ -f "${d%/}/manifest.json" ] || return 1
+    done
+    [ "${n}" -ge 1 ]
+}
+
 # ------------------------------------------------------------------------------
 # Per-class pipeline (steps 1, 3.5, 4, 5). A failure aborts THIS class only;
 # the loop moves on so one bad class can't strand the rest of the sweep.
@@ -239,10 +255,16 @@ run_one_class() {
     echo " [${CLASSNAME}] cache=${CACHE_DIR}  results=${RESULT_DIR}"
     echo "========================================================="
 
-    # STEP 1: cache embeddings (GPU) — skipped when the cache already exists
-    if [ -d "${CACHE_DIR}/stream" ] && [ "${RECACHE}" != "1" ]; then
-        echo -e "\n[${CLASSNAME} 1/5] Cache exists at ${CACHE_DIR}/stream — skipping (RECACHE=1 to redo)."
+    # STEP 1: cache embeddings (GPU) — skipped when a COMPLETE cache exists
+    if [ "${RECACHE}" != "1" ] && cache_complete "${CACHE_DIR}"; then
+        echo -e "\n[${CLASSNAME} 1/5] Complete cache at ${CACHE_DIR} — skipping (RECACHE=1 to redo)."
     else
+        if [ -d "${CACHE_DIR}/stream" ] && [ "${RECACHE}" != "1" ]; then
+            echo -e "\n[${CLASSNAME} 1/5] INCOMPLETE cache at ${CACHE_DIR} (interrupted run?) — re-caching."
+        fi
+        # start from a clean dir: partial memmaps / stale stage dirs from an
+        # older config must not survive into the fresh cache
+        rm -rf "${CACHE_DIR}"
         echo -e "\n[${CLASSNAME} 1/5] Caching embeddings (frozen ${BACKBONE}) ..."
         python -u bin/cache_embeddings.py \
             --backbone_name             "${BACKBONE}" \
@@ -391,7 +413,9 @@ def mean_of(p, m):
     n = counts[(p, "mean", m)]
     return sums[(p, "mean", m)] / n if n else float("-inf")
 
-print(f"\nCross-class averages — {n_classes} classes × {n_seeds} seeds, best policy first")
+n_cls = f"{n_classes} class" + ("es" if n_classes != 1 else "")
+n_sd = f"{n_seeds} seed" + ("s" if n_seeds != 1 else "")
+print(f"\nCross-class averages — {n_cls} × {n_sd}, best policy first")
 for m in metrics:
     print("┌" + ("─ " + titles[m] + " ").ljust(inner + 2, "─") + "┐")
     print("│ " + "policy".ljust(name_w) + "".join(c.rjust(col_w) for c in cols) + " │")
