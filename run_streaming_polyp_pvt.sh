@@ -177,7 +177,7 @@ N_NN=${N_NN:-5}                                # k for k-NN scoring (matches tra
 # already replays the stream dozens of times per env; the old 2M default was
 # ~10x more compute for a 53-dim-obs MLP policy. Raise via PPO_STEPS=... if
 # the mean_reward curve is still climbing at the end of training.
-PPO_STEPS=${PPO_STEPS:-100000}
+PPO_STEPS=${PPO_STEPS:-200000}
 # GPPO preserves gradients on clipped samples (bigger effective steps), so run
 # hot early and anneal cold: fast initial progress, small updates near the end.
 PPO_LR=${PPO_LR:-1e-3}                         # starting learning rate
