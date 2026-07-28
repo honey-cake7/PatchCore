@@ -199,6 +199,8 @@ ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, cri
 CLIP_MODE=${CLIP_MODE:-gppo}                   # clip | gppo (gradient-preserving)
 CLIP_HIGH=${CLIP_HIGH:-}                       # optional decoupled upper epsilon
 REWARD_FORM=${REWARD_FORM:-level}              # level | delta (potential-based shaping)
+FORGET_WEIGHT=${FORGET_WEIGHT:-0.5}            # reward-fit target: drifted AUROC + w*forgetting
+MIN_RHO=${MIN_RHO:-0.7}                        # reward fit fails below this Spearman rho
 TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
 POLICIES=${POLICIES:-static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo}
@@ -263,8 +265,10 @@ run_one_class() {
             echo -e "\n[${CLASSNAME} 1/5] INCOMPLETE cache at ${CACHE_DIR} (interrupted run?) — re-caching."
         fi
         # start from a clean dir: partial memmaps / stale stage dirs from an
-        # older config must not survive into the fresh cache
+        # older config must not survive into the fresh cache; reward traces
+        # recorded against the old cache are stale with it
         rm -rf "${CACHE_DIR}"
+        rm -f "${RESULT_DIR}/reward_traces.pkl"
         echo -e "\n[${CLASSNAME} 1/5] Caching embeddings (frozen ${BACKBONE}) ..."
         python -u bin/cache_embeddings.py \
             --backbone_name             "${BACKBONE}" \
@@ -283,9 +287,13 @@ run_one_class() {
             --out_dir                   "${CACHE_DIR}" || { echo "[${CLASSNAME}] caching failed"; return 1; }
     fi
 
-    # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC)
-    echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights ..."
-    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "[${CLASSNAME}] reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || return 1; }
+    # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC).
+    # Saved traces make refits (e.g. a new FORGET_WEIGHT) take seconds instead
+    # of replaying every baseline rollout.
+    local TRACES_ARG=""
+    [ -f "${RESULT_DIR}/reward_traces.pkl" ] && TRACES_ARG="--traces_in ${RESULT_DIR}/reward_traces.pkl"
+    echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (forget_weight=${FORGET_WEIGHT}) ..."
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} --out "${RESULT_DIR}/reward_weights.json" || { echo "[${CLASSNAME}] reward-weight fit failed (rho below ${MIN_RHO}?)"; [ "${FORCE}" = "1" ] || return 1; }
 
     # Without the fitted weights train/benchmark fall back to the DEFAULT
     # reward config (q_coef=0 — the misaligned reward).
@@ -373,7 +381,11 @@ print(f"combined results -> {out}")
 
 metrics = ["image_auroc", "pixel_auroc", "pro"]
 policies = list(dict.fromkeys(r["policy"] for r in rows))
-stages = sorted({r["stage"] for r in rows})
+# "final_forgetting" is a pseudo-stage (stage-0 test re-scored with the final
+# bank) — keep it out of the stage columns and the stage mean, mirroring
+# run_streaming_baseline's own summary.
+FORGET = "final_forgetting"
+stages = sorted({r["stage"] for r in rows if r["stage"] != FORGET})
 sums = defaultdict(float)
 counts = defaultdict(int)
 for r in rows:
@@ -382,7 +394,10 @@ for r in rows:
             v = float(r[m])
         except (TypeError, ValueError):
             continue
-        for s in (r["stage"], "mean"):
+        if v != v:  # NaN (e.g. pixel/pro can be absent for forgetting rows)
+            continue
+        keys = (FORGET,) if r["stage"] == FORGET else (r["stage"], "mean")
+        for s in keys:
             sums[(r["policy"], s, m)] += v
             counts[(r["policy"], s, m)] += 1
 
@@ -391,8 +406,8 @@ with open(mean_csv, "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["policy", "stage"] + metrics)
     for p in policies:
-        for s in stages + ["mean"]:
-            w.writerow([p, s] + [
+        for s in stages + [FORGET, "mean"]:
+            w.writerow([p, "forget" if s == FORGET else s] + [
                 round(sums[(p, s, m)] / counts[(p, s, m)], 4) if counts[(p, s, m)] else ""
                 for m in metrics
             ])
@@ -400,9 +415,10 @@ with open(mean_csv, "w", newline="") as f:
 titles = {"image_auroc": "image AUROC", "pixel_auroc": "pixel AUROC", "pro": "PRO"}
 n_classes = len({r["class"] for r in rows})
 n_seeds = len({r["seed"] for r in rows})
+col_keys = stages + [FORGET, "mean"]
+cols = [f"stage{s}" for s in stages] + ["forget", "mean"]
 name_w = max(len(p) for p in policies + ["policy"]) + 2
-col_w = 8
-cols = [f"stage{s}" for s in stages] + ["mean"]
+col_w = max(8, max(len(c) for c in cols) + 2)
 inner = name_w + col_w * len(cols)
 
 def cell(p, s, m):
@@ -415,13 +431,13 @@ def mean_of(p, m):
 
 n_cls = f"{n_classes} class" + ("es" if n_classes != 1 else "")
 n_sd = f"{n_seeds} seed" + ("s" if n_seeds != 1 else "")
-print(f"\nCross-class averages — {n_cls} × {n_sd}, best policy first")
+print(f"\nCross-class averages — {n_cls} × {n_sd}, best stage-mean first")
 for m in metrics:
     print("┌" + ("─ " + titles[m] + " ").ljust(inner + 2, "─") + "┐")
     print("│ " + "policy".ljust(name_w) + "".join(c.rjust(col_w) for c in cols) + " │")
     print("├" + "─" * (inner + 2) + "┤")
     for p in sorted(policies, key=lambda p: mean_of(p, m), reverse=True):
-        row = "".join(cell(p, s, m).rjust(col_w) for s in stages + ["mean"])
+        row = "".join(cell(p, s, m).rjust(col_w) for s in col_keys)
         print("│ " + p.ljust(name_w) + row + " │")
     print("└" + "─" * (inner + 2) + "┘")
 print(f"per-policy cross-class averages -> {mean_csv}")
