@@ -1,41 +1,43 @@
 #!/bin/bash
-# Submit the streaming RL pipeline for HyperKvasir (polyp-pvt) and every MVTec
-# class (wideresnet50) as independent SLURM jobs — they run in parallel up to
-# the cluster's GPU capacity; the rest queue.
+# Submit the streaming RL pipeline as TWO SLURM jobs:
+#   1. HyperKvasir (polyp-pvt)  — one class
+#   2. MVTec (wideresnet50)     — all 15 classes looped inside ONE job
 #
-# Each job gets its own TAG (classname_backbone_drift), so caches, reward fits,
-# policies and results never collide. Logs land in ../logs/streaming_<name>_<jobid>.
+# Each job ends with a RUN SUMMARY block in its log plus combined CSVs:
+#   results/streaming/summary_<backbone>_<drift>.csv        (all rows, class column)
+#   results/streaming/summary_<backbone>_<drift>_mean.csv   (cross-class averages)
+# Per-class artifacts: results/streaming/<class>_<backbone>_<drift>/
 #
-#   ./submit_all_streaming.sh                # submit everything
+#   ./submit_all_streaming.sh                # submit both
 #   ONLY=hyperkvasir ./submit_all_streaming.sh
 #   ONLY=mvtec ./submit_all_streaming.sh
+#
+# CLASSNAMES is passed via the environment (--export=ALL): sbatch's
+# --export=NAME=VALUE parsing splits on commas and would mangle a list value.
 
 DATASET_ROOT=${DATASET_ROOT:-/home/user1/aniket/Patchcore/dataset}
 ONLY=${ONLY:-all}
 
-submit() {
-    local name=$1 backbone=$2 data_path=$3 classname=$4
-    shift 4
-    sbatch --job-name="stream-${name}" \
-        --output="../logs/streaming_${name}_%j.log" \
-        --error="../logs/streaming_${name}_%j.err" \
-        --export=ALL,BACKBONE="${backbone}",DATA_PATH="${data_path}",CLASSNAME="${classname}" \
-        "$@" run_streaming.sh
-}
-
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "hyperkvasir" ]; then
     echo "Submitting HyperKvasir (polyp-pvt) ..."
-    # --mem matches train_hyperkvasir.sh: the hyperkvasir stream is large
-    submit hyperkvasir polyp-pvt "${DATASET_ROOT}/hyperkvasir_patchcore" hyperkvasir --mem=12G
+    BACKBONE=polyp-pvt \
+    DATA_PATH="${DATASET_ROOT}/hyperkvasir_patchcore" \
+    CLASSNAMES="hyperkvasir" \
+    sbatch --job-name=stream-hyperkvasir \
+        --output="../logs/streaming_output_%j.log" \
+        --error="../logs/streaming_error_%j.log" \
+        --export=ALL --mem=12G run_streaming.sh
 fi
 
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
-    MVTEC_CLASSES=(bottle cable capsule carpet grid hazelnut leather metal_nut
-                   pill screw tile toothbrush transistor wood zipper)
-    for cls in "${MVTEC_CLASSES[@]}"; do
-        echo "Submitting MVTec/${cls} (wideresnet50) ..."
-        submit "mvtec-${cls}" wideresnet50 "${DATASET_ROOT}/mvtec" "${cls}"
-    done
+    echo "Submitting MVTec (wideresnet50, 15 classes in one job) ..."
+    BACKBONE=wideresnet50 \
+    DATA_PATH="${DATASET_ROOT}/mvtec" \
+    CLASSNAMES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper" \
+    sbatch --job-name=stream-mvtec \
+        --output="../logs/streaming_output_%j.log" \
+        --error="../logs/streaming_error_%j.log" \
+        --export=ALL run_streaming.sh
 fi
 
-echo "All jobs submitted. Watch with: squeue -u \$USER"
+echo "Submitted. Watch with: squeue -u \$USER"

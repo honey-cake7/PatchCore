@@ -203,13 +203,10 @@ TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
 POLICIES=${POLICIES:-static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo}
 
-# output locations — TAG keys every artifact, so parallel jobs never collide
-BB_TAG=$(echo "${BACKBONE}" | tr -d '-')
-TAG=${TAG:-${CLASSNAME}_${BB_TAG}_${DRIFT}}
-CACHE_DIR=${CACHE_DIR:-cache/${TAG}}
-RESULT_DIR=${RESULT_DIR:-results/streaming/${TAG}}
-PPO_OUT=${PPO_OUT:-${RESULT_DIR}/ppo_${TAG}.pt}
-mkdir -p "${RESULT_DIR}" "$(dirname "${CACHE_DIR}")"
+# Class list: space-separated; classes run SEQUENTIALLY in this one job.
+# Per-class artifacts land in results/streaming/<class>_<backbone>_<drift>/ and
+# a combined CSV + status summary is written/printed at the end of the job.
+CLASSNAMES=${CLASSNAMES:-${CLASSNAME:-kvasir}}
 
 # PVTv2 weights (download with download_and_inspect_pvt_weights.sh)
 export POLYP_PVT_WEIGHTS=${POLYP_PVT_WEIGHTS:-${PROJECT_ROOT}/models/PolypPVT.pth}
@@ -218,89 +215,204 @@ export PVTV2_B2_WEIGHTS=${PVTV2_B2_WEIGHTS:-${PROJECT_ROOT}/models/pvt_v2_b2.pth
 FORCE=${FORCE:-0}
 RECACHE=${RECACHE:-0}
 
-echo "========================================================="
-echo " Streaming PatchCore | backbone=${BACKBONE} drift=${DRIFT}/${DRIFT_MODE}"
-echo " data=${DATA_PATH}/${CLASSNAME}  M=${CAPACITY}  k=${N_NN}"
-echo " cache=${CACHE_DIR}  results=${RESULT_DIR}"
-echo "========================================================="
-
-# ------------------------------------------------------------------------------
-# STEP 1: cache embeddings (GPU) — skipped when the cache already exists
-# ------------------------------------------------------------------------------
-if [ -d "${CACHE_DIR}/stream" ] && [ "${RECACHE}" != "1" ]; then
-    echo -e "\n[1/5] Cache exists at ${CACHE_DIR}/stream — skipping (RECACHE=1 to redo)."
-else
-    echo -e "\n[1/5] Caching embeddings (frozen ${BACKBONE}) ..."
-    python -u bin/cache_embeddings.py \
-        --backbone_name             "${BACKBONE}" \
-        "${LAYERS[@]}" \
-        --data_path                 "${DATA_PATH}" \
-        --classname                 "${CLASSNAME}" \
-        --drift                     "${DRIFT}" \
-        --drift_mode                "${DRIFT_MODE}" \
-        --seed                      "${SEED}" \
-        --resize                    "${RESIZE}" \
-        --imagesize                 "${IMAGESIZE}" \
-        --pretrain_embed_dimension  "${PRE_DIM}" \
-        --target_embed_dimension    "${TGT_DIM}" \
-        --patchsize                 "${PATCHSIZE}" \
-        --gpu                       0 \
-        --out_dir                   "${CACHE_DIR}" || { echo "caching failed"; exit 1; }
-fi
-
-# ------------------------------------------------------------------------------
-# STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC)
-# ------------------------------------------------------------------------------
-echo -e "\n[3.5/5] Fitting proxy-reward weights ..."
-python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || exit 1; }
-
-# Keep this active even when step 3.5 is commented out: it only points at the
-# already-fitted weights file. Without it train/benchmark fall back to the
-# DEFAULT reward config (q_coef=0 — the misaligned reward).
-REWARD_JSON_ARG=""
-[ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
+BB_TAG=$(echo "${BACKBONE}" | tr -d '-')
+SUMMARY_CSV=results/streaming/summary_${BB_TAG}_${DRIFT}.csv
 
 CLIP_HIGH_ARG=""
 [ -n "${CLIP_HIGH}" ] && CLIP_HIGH_ARG="--clip_high ${CLIP_HIGH}"
 
 # ------------------------------------------------------------------------------
-# STEP 4: train PPO
+# Per-class pipeline (steps 1, 3.5, 4, 5). A failure aborts THIS class only;
+# the loop moves on so one bad class can't strand the rest of the sweep.
 # ------------------------------------------------------------------------------
-echo -e "\n[4/5] Training PPO maintenance policy ..."
-python -u bin/train_ppo.py \
-    --cache_dir        "${CACHE_DIR}" \
-    --capacity         "${CAPACITY}" \
-    --warmup           "${WARMUP}" \
-    --total_env_steps  "${PPO_STEPS}" \
-    --seed             "${TRAIN_SEEDS}" \
-    --out              "${PPO_OUT}" \
-    --adv_mode         "${ADV_MODE}" \
-    --clip_mode        "${CLIP_MODE}" \
-    ${CLIP_HIGH_ARG} \
-    --lr               "${PPO_LR}" \
-    --lr_end           "${PPO_LR_END}" \
-    --reward_form      "${REWARD_FORM}" \
-    ${REWARD_JSON_ARG} \
-    --eval_baselines || { echo "PPO training failed"; exit 1; }
+run_one_class() {
+    local CLASSNAME=$1
+    local TAG=${CLASSNAME}_${BB_TAG}_${DRIFT}
+    local CACHE_DIR=cache/${TAG}
+    local RESULT_DIR=results/streaming/${TAG}
+    local PPO_OUT=${RESULT_DIR}/ppo_${TAG}.pt
+    mkdir -p "${RESULT_DIR}" "$(dirname "${CACHE_DIR}")"
+
+    echo "========================================================="
+    echo " [${CLASSNAME}] backbone=${BACKBONE} drift=${DRIFT}/${DRIFT_MODE}"
+    echo " [${CLASSNAME}] data=${DATA_PATH}/${CLASSNAME}  M=${CAPACITY}  k=${N_NN}"
+    echo " [${CLASSNAME}] cache=${CACHE_DIR}  results=${RESULT_DIR}"
+    echo "========================================================="
+
+    # STEP 1: cache embeddings (GPU) — skipped when the cache already exists
+    if [ -d "${CACHE_DIR}/stream" ] && [ "${RECACHE}" != "1" ]; then
+        echo -e "\n[${CLASSNAME} 1/5] Cache exists at ${CACHE_DIR}/stream — skipping (RECACHE=1 to redo)."
+    else
+        echo -e "\n[${CLASSNAME} 1/5] Caching embeddings (frozen ${BACKBONE}) ..."
+        python -u bin/cache_embeddings.py \
+            --backbone_name             "${BACKBONE}" \
+            "${LAYERS[@]}" \
+            --data_path                 "${DATA_PATH}" \
+            --classname                 "${CLASSNAME}" \
+            --drift                     "${DRIFT}" \
+            --drift_mode                "${DRIFT_MODE}" \
+            --seed                      "${SEED}" \
+            --resize                    "${RESIZE}" \
+            --imagesize                 "${IMAGESIZE}" \
+            --pretrain_embed_dimension  "${PRE_DIM}" \
+            --target_embed_dimension    "${TGT_DIM}" \
+            --patchsize                 "${PATCHSIZE}" \
+            --gpu                       0 \
+            --out_dir                   "${CACHE_DIR}" || { echo "[${CLASSNAME}] caching failed"; return 1; }
+    fi
+
+    # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC)
+    echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights ..."
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --out "${RESULT_DIR}/reward_weights.json" || { echo "[${CLASSNAME}] reward-weight fit failed (rho below threshold?)"; [ "${FORCE}" = "1" ] || return 1; }
+
+    # Without the fitted weights train/benchmark fall back to the DEFAULT
+    # reward config (q_coef=0 — the misaligned reward).
+    local REWARD_JSON_ARG=""
+    [ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
+
+    # STEP 4: train PPO
+    echo -e "\n[${CLASSNAME} 4/5] Training PPO maintenance policy ..."
+    python -u bin/train_ppo.py \
+        --cache_dir        "${CACHE_DIR}" \
+        --capacity         "${CAPACITY}" \
+        --warmup           "${WARMUP}" \
+        --total_env_steps  "${PPO_STEPS}" \
+        --seed             "${TRAIN_SEEDS}" \
+        --out              "${PPO_OUT}" \
+        --adv_mode         "${ADV_MODE}" \
+        --clip_mode        "${CLIP_MODE}" \
+        ${CLIP_HIGH_ARG} \
+        --lr               "${PPO_LR}" \
+        --lr_end           "${PPO_LR_END}" \
+        --reward_form      "${REWARD_FORM}" \
+        ${REWARD_JSON_ARG} \
+        --eval_baselines || { echo "[${CLASSNAME}] PPO training failed"; return 1; }
+
+    # STEP 5: benchmark all policies
+    echo -e "\n[${CLASSNAME} 5/5] Benchmarking policies ..."
+    python -u bin/run_streaming_baseline.py \
+        --cache_dir  "${CACHE_DIR}" \
+        --capacity   "${CAPACITY}" \
+        --warmup     "${WARMUP}" \
+        --n_nn       "${N_NN}" \
+        --policies   "${POLICIES}" \
+        --ppo_path   "${PPO_OUT}" \
+        --seeds      "${EVAL_SEEDS}" \
+        ${REWARD_JSON_ARG} \
+        --out        "${RESULT_DIR}" || { echo "[${CLASSNAME}] benchmark failed"; return 1; }
+
+    echo "[${CLASSNAME}] DONE -> ${RESULT_DIR}/results.csv"
+}
 
 # ------------------------------------------------------------------------------
-# STEP 5: benchmark all policies
+# Loop over classes, then combine per-class results into one CSV + summary
 # ------------------------------------------------------------------------------
-echo -e "\n[5/5] Benchmarking policies ..."
-python -u bin/run_streaming_baseline.py \
-    --cache_dir  "${CACHE_DIR}" \
-    --capacity   "${CAPACITY}" \
-    --warmup     "${WARMUP}" \
-    --n_nn       "${N_NN}" \
-    --policies   "${POLICIES}" \
-    --ppo_path   "${PPO_OUT}" \
-    --seeds      "${EVAL_SEEDS}" \
-    ${REWARD_JSON_ARG} \
-    --out        "${RESULT_DIR}" || { echo "benchmark failed"; exit 1; }
+declare -a OK_CLASSES=() FAILED_CLASSES=()
+for cls in ${CLASSNAMES}; do
+    if run_one_class "${cls}"; then
+        OK_CLASSES+=("${cls}")
+    else
+        FAILED_CLASSES+=("${cls}")
+        echo "[${cls}] FAILED — continuing with remaining classes."
+    fi
+done
+
+# One combined table across all classes (adds a leading "class" column), plus
+# cross-class AVERAGES per policy (over classes & seeds) printed to the log and
+# saved next to it as summary_*_mean.csv.
+CLASSNAMES="${CLASSNAMES}" BB_TAG="${BB_TAG}" DRIFT="${DRIFT}" \
+SUMMARY_CSV="${SUMMARY_CSV}" python - <<'EOF'
+import csv, os
+from collections import defaultdict
+
+classes = os.environ["CLASSNAMES"].split()
+bb, drift = os.environ["BB_TAG"], os.environ["DRIFT"]
+out = os.environ["SUMMARY_CSV"]
+
+rows = []
+for c in classes:
+    path = f"results/streaming/{c}_{bb}_{drift}/results.csv"
+    if not os.path.exists(path):
+        continue
+    with open(path) as f:
+        for row in csv.DictReader(f):
+            row["class"] = c
+            rows.append(row)
+if not rows:
+    print("no per-class results.csv found; nothing to combine")
+    raise SystemExit(0)
+
+fields = ["class", "policy", "seed", "stage", "image_auroc", "pixel_auroc", "pro"]
+with open(out, "w", newline="") as f:
+    w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+    w.writeheader()
+    w.writerows(rows)
+print(f"combined results -> {out}")
+
+metrics = ["image_auroc", "pixel_auroc", "pro"]
+policies = list(dict.fromkeys(r["policy"] for r in rows))
+stages = sorted({r["stage"] for r in rows})
+sums = defaultdict(float)
+counts = defaultdict(int)
+for r in rows:
+    for m in metrics:
+        try:
+            v = float(r[m])
+        except (TypeError, ValueError):
+            continue
+        for s in (r["stage"], "mean"):
+            sums[(r["policy"], s, m)] += v
+            counts[(r["policy"], s, m)] += 1
+
+mean_csv = out.replace(".csv", "_mean.csv")
+with open(mean_csv, "w", newline="") as f:
+    w = csv.writer(f)
+    w.writerow(["policy", "stage"] + metrics)
+    for p in policies:
+        for s in stages + ["mean"]:
+            w.writerow([p, s] + [
+                round(sums[(p, s, m)] / counts[(p, s, m)], 4) if counts[(p, s, m)] else ""
+                for m in metrics
+            ])
+
+titles = {"image_auroc": "image AUROC", "pixel_auroc": "pixel AUROC", "pro": "PRO"}
+n_classes = len({r["class"] for r in rows})
+n_seeds = len({r["seed"] for r in rows})
+name_w = max(len(p) for p in policies + ["policy"]) + 2
+col_w = 8
+cols = [f"stage{s}" for s in stages] + ["mean"]
+inner = name_w + col_w * len(cols)
+
+def cell(p, s, m):
+    n = counts[(p, s, m)]
+    return f"{sums[(p, s, m)] / n:.3f}" if n else "–"
+
+def mean_of(p, m):
+    n = counts[(p, "mean", m)]
+    return sums[(p, "mean", m)] / n if n else float("-inf")
+
+print(f"\nCross-class averages — {n_classes} classes × {n_seeds} seeds, best policy first")
+for m in metrics:
+    print("┌" + ("─ " + titles[m] + " ").ljust(inner + 2, "─") + "┐")
+    print("│ " + "policy".ljust(name_w) + "".join(c.rjust(col_w) for c in cols) + " │")
+    print("├" + "─" * (inner + 2) + "┤")
+    for p in sorted(policies, key=lambda p: mean_of(p, m), reverse=True):
+        row = "".join(cell(p, s, m).rjust(col_w) for s in stages + ["mean"])
+        print("│ " + p.ljust(name_w) + row + " │")
+    print("└" + "─" * (inner + 2) + "┘")
+print(f"per-policy cross-class averages -> {mean_csv}")
+EOF
 
 echo "========================================================="
-echo " DONE. Artifacts under ${RESULT_DIR}/"
-echo "   gate1.json / gate2.json   — gate outcomes"
-echo "   ${PPO_OUT}                — trained PPO policy"
-echo "   ${RESULT_DIR}/results.csv — per-stage AUROC/PRO for every policy"
+echo " RUN SUMMARY (${BACKBONE}, ${DRIFT})"
+for cls in "${OK_CLASSES[@]}"; do
+    echo "   ${cls} : OK      results/streaming/${cls}_${BB_TAG}_${DRIFT}/"
+done
+for cls in "${FAILED_CLASSES[@]}"; do
+    echo "   ${cls} : FAILED  (search this log for '[${cls}]')"
+done
+echo " Combined table : ${SUMMARY_CSV}"
+echo " Class averages : ${SUMMARY_CSV%.csv}_mean.csv (also printed above)"
+echo " Per class      : results/streaming/<class>_${BB_TAG}_${DRIFT}/{results.csv, ppo_*.pt, reward_weights.json}"
 echo "========================================================="
+[ ${#FAILED_CLASSES[@]} -eq 0 ] || exit 1
