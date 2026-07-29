@@ -268,7 +268,7 @@ run_one_class() {
         # older config must not survive into the fresh cache; reward traces
         # recorded against the old cache are stale with it
         rm -rf "${CACHE_DIR}"
-        rm -f "${RESULT_DIR}/reward_traces.pkl"
+        rm -f "${RESULT_DIR}/reward_traces.pkl" "${RESULT_DIR}/reward_traces.cfg"
         echo -e "\n[${CLASSNAME} 1/5] Caching embeddings (frozen ${BACKBONE}) ..."
         python -u bin/cache_embeddings.py \
             --backbone_name             "${BACKBONE}" \
@@ -289,11 +289,20 @@ run_one_class() {
 
     # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC).
     # Saved traces make refits (e.g. a new FORGET_WEIGHT) take seconds instead
-    # of replaying every baseline rollout.
+    # of replaying every baseline rollout — but traces bake in warmup/capacity,
+    # so only reuse them when those still match (sidecar check).
     local TRACES_ARG=""
-    [ -f "${RESULT_DIR}/reward_traces.pkl" ] && TRACES_ARG="--traces_in ${RESULT_DIR}/reward_traces.pkl"
+    if [ -f "${RESULT_DIR}/reward_traces.pkl" ] \
+        && [ "$(cat "${RESULT_DIR}/reward_traces.cfg" 2>/dev/null)" = "${WARMUP}:${CAPACITY}" ]; then
+        TRACES_ARG="--traces_in ${RESULT_DIR}/reward_traces.pkl"
+    fi
     echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (forget_weight=${FORGET_WEIGHT}) ..."
-    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} --out "${RESULT_DIR}/reward_weights.json" || { echo "[${CLASSNAME}] reward-weight fit failed (rho below ${MIN_RHO}?)"; [ "${FORCE}" = "1" ] || return 1; }
+    if python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} --out "${RESULT_DIR}/reward_weights.json"; then
+        echo "${WARMUP}:${CAPACITY}" > "${RESULT_DIR}/reward_traces.cfg"
+    else
+        echo "[${CLASSNAME}] reward-weight fit failed (rho below ${MIN_RHO}?)"
+        [ "${FORCE}" = "1" ] || return 1
+    fi
 
     # Without the fitted weights train/benchmark fall back to the DEFAULT
     # reward config (q_coef=0 — the misaligned reward).

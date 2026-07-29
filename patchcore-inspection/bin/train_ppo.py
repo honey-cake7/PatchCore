@@ -175,11 +175,13 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
         # The best-checkpoint score is a rolling mean over one full stream
         # replay; the window must track this dataset's episode length or the
         # selection inherits stream-phase bias (default 9 fits only kvasir).
+        # Floor of 3: streams shorter than a rollout (small MVTec classes)
+        # would otherwise select on a single noisy iteration.
         from patchcore.streaming.cache import EmbeddingCacheReader
 
         episode_steps = EmbeddingCacheReader(
             os.path.join(cache_dir, "stream")).n_images - warmup
-        cfg.best_window = max(1, round(episode_steps / cfg.rollout_steps))
+        cfg.best_window = max(3, round(episode_steps / cfg.rollout_steps))
     print(f"[ppo] adv_mode={adv_mode} clip_mode={clip_mode} clip_high={clip_high} "
           f"best_window={cfg.best_window}")
     trainer = PPOTrainer(env_fns, cfg, obs_norm=obs_norm)

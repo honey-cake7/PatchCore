@@ -31,8 +31,14 @@ fi
 
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     echo "Submitting MVTec (wideresnet50, 15 classes in one job) ..."
+    # MVTec streams are tiny (60-391 train images vs kvasir's 2401), so the
+    # kvasir-scale defaults misbehave: WARMUP=100 eats half the stream (and
+    # exceeds toothbrush's 60 images entirely), and 100k PPO steps replays a
+    # ~200-step episode hundreds of times. Scale them down; both overridable.
     BACKBONE=wideresnet50 \
     DATA_PATH="${DATASET_ROOT}/mvtec" \
+    WARMUP="${WARMUP:-30}" \
+    PPO_STEPS="${PPO_STEPS:-30000}" \
     CLASSNAMES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper" \
     sbatch --job-name=stream-mvtec \
         --output="../logs/streaming_output_%j.log" \
