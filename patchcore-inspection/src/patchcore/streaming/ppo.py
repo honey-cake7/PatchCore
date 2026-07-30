@@ -9,6 +9,7 @@ ordinary Gaussian log-probs are exact — no tanh-Jacobian correction required.
 """
 import copy
 import dataclasses
+import time
 from dataclasses import dataclass
 from typing import Callable, List, Optional, Tuple
 
@@ -247,7 +248,9 @@ class PPOTrainer:
             ent_coef = cfg.ent_coef
             if cfg.ent_coef_end is not None:
                 ent_coef = cfg.ent_coef + frac * (cfg.ent_coef_end - cfg.ent_coef)
+            t0 = time.time()
             batch = self.collect()
+            collect_s = time.time() - t0
             history.append(batch["mean_reward"])
             # mean_reward measures the pre-update policy, so snapshot before
             # update() — the weights that produced the score, not their successor.
@@ -256,9 +259,12 @@ class PPOTrainer:
                 if score > best_score:
                     best_score, best_iter = score, it + 1
                     best_state = copy.deepcopy(self.ac.state_dict())
+            t0 = time.time()
             self.update(batch, ent_coef=ent_coef)
+            update_s = time.time() - t0
             if (it + 1) % log_every == 0:
-                print(f"[ppo] iter {it+1}/{n_iters} mean_reward={batch['mean_reward']:.4f}")
+                print(f"[ppo] iter {it+1}/{n_iters} mean_reward={batch['mean_reward']:.4f} "
+                      f"collect={collect_s:.1f}s update={update_s:.1f}s")
         if best_state is not None:
             self.ac.load_state_dict(best_state)
             print(f"[ppo] restored best policy from iter {best_iter} "

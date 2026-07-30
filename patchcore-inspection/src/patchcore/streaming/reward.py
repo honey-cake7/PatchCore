@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Dict, Optional, Tuple
 
 import numpy as np
+import torch
 
 
 def _default_churn_coef() -> float:
@@ -102,11 +103,16 @@ def load_reward_weights(path: str) -> "RewardConfig":
     return cfg
 
 
-def coverage(bank, patches: np.ndarray) -> float:
-    """Mean NN-1 distance from ``patches`` [n, D] to the bank (lower is better)."""
+def coverage(bank, patches) -> float:
+    """Mean NN-1 distance from ``patches`` [n, D] to the bank (lower is better).
+
+    ``patches`` may be numpy or a torch tensor already on the bank's device.
+    """
     if len(patches) == 0 or len(bank) == 0:
         return 0.0
-    dists, _ = bank.knn(np.ascontiguousarray(patches, dtype=np.float32), k=1)
+    if not isinstance(patches, torch.Tensor):
+        patches = np.ascontiguousarray(patches, dtype=np.float32)
+    dists, _ = bank.knn(patches, k=1)
     d = dists[:, 0]
     d = d[np.isfinite(d)]
     return float(d.mean()) if len(d) else 0.0
@@ -126,13 +132,18 @@ class ProxyReward:
     def __init__(self, cfg: RewardConfig, probe: np.ndarray) -> None:
         self.cfg = cfg
         self.probe = np.ascontiguousarray(probe, dtype=np.float32)
+        # The probe set is fixed for the life of this reward; cache it on the
+        # k-NN device so the per-step probe query skips the host->device upload.
+        self._probe_dev: Optional[torch.Tensor] = None
         self._prev_probe_dists: Optional[np.ndarray] = None
         self._prev_potential_cost: Optional[float] = None
 
     def _probe_dists(self, bank) -> np.ndarray:
         if len(self.probe) == 0 or len(bank) == 0:
             return np.zeros(len(self.probe), dtype=np.float32)
-        d, _ = bank.knn(self.probe, k=1)
+        if self._probe_dev is None or self._probe_dev.device != bank.device:
+            self._probe_dev = torch.from_numpy(self.probe).to(bank.device)
+        d, _ = bank.knn(self._probe_dev, k=1)
         return np.where(np.isfinite(d[:, 0]), d[:, 0], 0.0)
 
     def components(
@@ -143,9 +154,10 @@ class ProxyReward:
         scale = cfg.coverage_scale + 1e-8
         # holdout coverage: mean + p90 tail from one k-NN call
         if len(holdout_patches) and len(bank):
-            dists, _ = bank.knn(
-                np.ascontiguousarray(holdout_patches, dtype=np.float32), k=1
-            )
+            if not isinstance(holdout_patches, torch.Tensor):
+                holdout_patches = np.ascontiguousarray(
+                    holdout_patches, dtype=np.float32)
+            dists, _ = bank.knn(holdout_patches, k=1)
             d = dists[:, 0]
             d = d[np.isfinite(d)]
             c = float(d.mean()) / scale if len(d) else 0.0

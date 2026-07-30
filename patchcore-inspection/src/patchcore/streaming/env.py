@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from typing import Deque, Optional, Tuple
 
 import numpy as np
+import torch
 
 from patchcore.streaming.bank import (
     DynamicMemoryBank,
@@ -133,7 +134,11 @@ class MemoryMaintenanceEnv:
         # on every subsequent reset instead of re-subsampling each episode.
         self._init_snapshot = None
         self._probe: Optional[np.ndarray] = None
-        self._window: Deque[np.ndarray] = deque(maxlen=self.obs_cfg.window_images)
+        # Holdout window kept as device tensors: each image's holdout enters
+        # once (uploaded/gathered on load) and is re-queried for window_images
+        # steps — re-concatenating + re-uploading it every step was a large
+        # share of the per-step host->device traffic.
+        self._window: Deque[torch.Tensor] = deque(maxlen=self.obs_cfg.window_images)
         self._novelty_hist: Deque[float] = deque(maxlen=self.obs_cfg.slope_horizon)
         self._ewma = 0.0
         self._prev_coverage = 0.0
@@ -242,10 +247,23 @@ class MemoryMaintenanceEnv:
         patches = self.reader.image_patches(self._t)
         n_hold = max(1, int(len(patches) * self.reward_cfg.holdout_patch_frac))
         perm = self.rng.permutation(len(patches))
-        self._holdout = patches[perm[:n_hold]]
         self._admissible = patches[perm[n_hold:]]
+        # Device copy of the image, uploaded once per step (and shared across
+        # lockstep envs when the reader memoizes it); holdout/admissible are
+        # on-device gathers, so the novelty, reward-window and intra-batch
+        # queries all skip per-call uploads.
+        dev = self.bank.device
+        patches_dev = getattr(self.reader, "image_patches_dev", None)
+        if patches_dev is not None:
+            patches_t = patches_dev(self._t, dev)
+        else:
+            patches_t = torch.from_numpy(
+                np.ascontiguousarray(patches, dtype=np.float32)).to(dev)
+        pidx = torch.from_numpy(perm).to(dev)
+        self._holdout_dev = patches_t[pidx[:n_hold]]
+        self._admissible_dev = patches_t[pidx[n_hold:]]
         # batch novelty distances vs current bank (also used by baselines)
-        d, _ = self.bank.knn(self._admissible, k=1)
+        d, _ = self.bank.knn(self._admissible_dev, k=1)
         self._batch_nn = np.where(np.isfinite(d[:, 0]), d[:, 0], 0.0)
 
     @property
@@ -287,7 +305,7 @@ class MemoryMaintenanceEnv:
 
         # intra-batch density: each admissible patch to nearest other patch
         if len(A) > 1:
-            intra = intra_batch_nn2(A)
+            intra = intra_batch_nn2(self._admissible_dev, device=bank.device)
             intra_log = np.log1p(intra)
             density = [intra_log.mean(), np.median(intra_log), np.percentile(intra_log, 90)]
         else:
@@ -299,10 +317,12 @@ class MemoryMaintenanceEnv:
             if self._win_cov_cache is not None:
                 cov_mean, cov_p90 = self._win_cov_cache
             else:
-                win = np.concatenate(list(self._window), axis=0)
+                win = torch.cat(tuple(self._window), dim=0) \
+                    if len(self._window) > 1 else self._window[0]
                 if len(win) > cfg.max_window_query:
-                    win = win[self.rng.choice(
-                        len(win), size=cfg.max_window_query, replace=False)]
+                    sel = self.rng.choice(
+                        len(win), size=cfg.max_window_query, replace=False)
+                    win = win[torch.from_numpy(sel).to(win.device)]
                 wd, _ = bank.knn(win, k=1)
                 wd = np.where(np.isfinite(wd[:, 0]), wd[:, 0], 0.0)
                 cov_mean = wd.mean(); cov_p90 = np.percentile(wd, 90)
@@ -436,11 +456,13 @@ class MemoryMaintenanceEnv:
         tot_admit = n_admit + pend_admit
         tot_evict = len(evict_slots) + pend_evict
 
-        self._window.append(self._holdout)
-        holdout = np.concatenate(list(self._window), axis=0)
+        self._window.append(self._holdout_dev)
+        holdout = torch.cat(tuple(self._window), dim=0) \
+            if len(self._window) > 1 else self._window[0]
         if len(holdout) > self.obs_cfg.max_window_query:
-            holdout = holdout[self.rng.choice(
-                len(holdout), size=self.obs_cfg.max_window_query, replace=False)]
+            sel = self.rng.choice(
+                len(holdout), size=self.obs_cfg.max_window_query, replace=False)
+            holdout = holdout[torch.from_numpy(sel).to(holdout.device)]
         reward, comps = self._proxy.compute(
             self.bank, holdout, tot_admit, tot_evict
         )

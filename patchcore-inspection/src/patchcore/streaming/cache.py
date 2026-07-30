@@ -125,6 +125,30 @@ class EmbeddingCacheReader:
         """Patch features for image ``i`` as an in-memory array ([P, D])."""
         return np.asarray(self.embeddings[i], dtype=np.float32)
 
+    def image_patches_dev(self, i: int, device):
+        """Patch features for image ``i`` as a device tensor, memoized.
+
+        Vectorized training envs replay the same stream in lockstep, so all of
+        them need the same image on the k-NN device at the same step; the memo
+        makes the host->device upload happen once instead of once per env. Two
+        slots cover the step/reset boundary; callers must not mutate the
+        returned tensor in place (index it — gathers copy).
+        """
+        import torch
+
+        key = (int(i), str(device))
+        memo = getattr(self, "_dev_memo", None)
+        if memo is None:
+            memo = self._dev_memo = {}
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        t = torch.from_numpy(self.image_patches(i)).to(device)
+        memo[key] = t
+        while len(memo) > 2:  # dict preserves insertion order: drop oldest
+            memo.pop(next(iter(memo)))
+        return t
+
     def stage_of(self, i: int) -> int:
         return int(self._stage_of[i])
 

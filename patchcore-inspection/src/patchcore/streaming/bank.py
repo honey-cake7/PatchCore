@@ -80,14 +80,21 @@ def device_banner() -> str:
     return line
 
 
-def intra_batch_nn2(x: np.ndarray, device: Optional[torch.device] = None) -> np.ndarray:
-    """Distance of each row of ``x`` to its nearest *other* row ([n] float32)."""
+def intra_batch_nn2(x, device: Optional[torch.device] = None) -> np.ndarray:
+    """Distance of each row of ``x`` to its nearest *other* row ([n] float32).
+
+    ``x`` may be a numpy array or a torch tensor already on the k-NN device
+    (the latter skips the host->device upload on the hot path).
+    """
     n = len(x)
     if n < 2:
         return np.zeros(n, dtype=np.float32)
-    t = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(
-        device or knn_device()
-    )
+    if isinstance(x, torch.Tensor):
+        t = x.to(device or knn_device(), dtype=torch.float32)
+    else:
+        t = torch.from_numpy(np.ascontiguousarray(x, dtype=np.float32)).to(
+            device or knn_device()
+        )
     d = torch.cdist(t, t)
     d.fill_diagonal_(float("inf"))
     return d.min(dim=1).values.cpu().numpy().astype(np.float32)
@@ -143,11 +150,14 @@ class DynamicMemoryBank:
 
         self._size = 0
         self._step = 0                 # logical mutation clock
+        # Device mirror of the FULL store: [capacity, D] vectors + [capacity]
+        # active mask. Maintained incrementally by add()/evict() (a full
+        # re-gather + re-upload per mutation was the dominant training cost:
+        # ~8MB of host->device traffic per env step at M=2000). `_base_dirty`
+        # now only means "full re-sync needed" (init / restore).
         self._base_dirty = True
-        self._base: Optional[torch.Tensor] = None  # active vectors on device
-        # Maps a compact index position (0..size-1, in active-slot order) back to
-        # the underlying slot id; rebuilt with the device tensor.
-        self._index_to_slot = np.empty(0, dtype=np.int64)
+        self._base: Optional[torch.Tensor] = None
+        self._active_dev: Optional[torch.Tensor] = None
         # Per-mutation-step caches of derived per-member quantities.
         self._nn2_cache: Optional[np.ndarray] = None
         self._nn2_step = -1
@@ -174,6 +184,11 @@ class DynamicMemoryBank:
     @property
     def step(self) -> int:
         return self._step
+
+    @property
+    def device(self) -> torch.device:
+        """Device of the k-NN mirror (callers cache query tensors on it)."""
+        return self._device
 
     def active_slots(self) -> np.ndarray:
         return np.flatnonzero(self._active)
@@ -211,6 +226,10 @@ class DynamicMemoryBank:
         self.hit_count[slots] = 0
         self.last_hit_step[slots] = self._step
         self._size += n
+        if not self._base_dirty and self._base is not None:
+            idx = torch.from_numpy(slots).to(self._device)
+            self._base[idx] = torch.from_numpy(vectors).to(self._device)
+            self._active_dev[idx] = True
         self._mark_mutated()
         return slots
 
@@ -222,40 +241,52 @@ class DynamicMemoryBank:
             return
         self._active[slot_ids] = False
         self._size -= len(slot_ids)
+        if not self._base_dirty and self._active_dev is not None:
+            self._active_dev[torch.from_numpy(slot_ids).to(self._device)] = False
         self._mark_mutated()
 
     def _mark_mutated(self) -> None:
         self._step += 1
-        self._base_dirty = True
 
     # ---- indexing / queries ---------------------------------------------
     def _ensure_base(self) -> None:
+        """Full re-sync of the device mirror (init / restore only).
+
+        Steady-state mutations keep the mirror current incrementally in
+        add()/evict(); the [capacity, D] layout means a slot's row position
+        never changes, so k-NN column indices ARE slot ids.
+        """
         if not self._base_dirty:
             return
-        slots = self.active_slots()
-        self._index_to_slot = slots
-        if len(slots) == 0:
-            self._base = None
-        else:
-            self._base = torch.from_numpy(
-                np.ascontiguousarray(self._store[slots])
-            ).to(self._device)
+        self._base = torch.from_numpy(
+            np.ascontiguousarray(self._store)
+        ).to(self._device)
+        self._active_dev = torch.from_numpy(self._active.copy()).to(self._device)
         self._base_dirty = False
 
     def knn(
-        self, queries: np.ndarray, k: int = 1, record_hits: bool = False
+        self, queries, k: int = 1, record_hits: bool = False
     ) -> Tuple[np.ndarray, np.ndarray]:
         """k nearest neighbours of ``queries`` ([n, D]) among active entries.
 
+        ``queries`` may be a numpy array or a torch tensor already on the
+        bank's device (skips the host->device upload on the hot path).
         Returns ``(distances [n, k], slot_ids [n, k])``. Missing neighbours
         (fewer than ``k`` active entries) are returned as ``inf`` distance and
         ``-1`` slot id. When ``record_hits`` is set, the nearest slot's hit
         statistics are updated (used by eviction utility features).
         """
-        queries = np.ascontiguousarray(queries, dtype=np.float32)
-        if queries.ndim == 1:
-            queries = queries[None]
-        n = len(queries)
+        q_dev: Optional[torch.Tensor] = None
+        if isinstance(queries, torch.Tensor):
+            q_dev = queries.to(self._device, dtype=torch.float32)
+            if q_dev.ndim == 1:
+                q_dev = q_dev[None]
+            n = len(q_dev)
+        else:
+            queries = np.ascontiguousarray(queries, dtype=np.float32)
+            if queries.ndim == 1:
+                queries = queries[None]
+            n = len(queries)
         if n == 0:
             return (
                 np.zeros((0, k), dtype=np.float32),
@@ -268,17 +299,23 @@ class DynamicMemoryBank:
             )
         self._ensure_base()
         kk = min(k, self._size)
-        chunk = max(256, _KNN_CHUNK_ENTRIES // self._size)
+        # Distances run against the full [capacity, D] mirror; inactive slots
+        # are masked to +inf before topk, so the column index IS the slot id.
+        inactive = ~self._active_dev
+        chunk = max(256, _KNN_CHUNK_ENTRIES // self.capacity)
         dist_chunks, idx_chunks = [], []
         for start in range(0, n, chunk):
-            q = torch.from_numpy(queries[start:start + chunk]).to(self._device)
+            if q_dev is not None:
+                q = q_dev[start:start + chunk]
+            else:
+                q = torch.from_numpy(queries[start:start + chunk]).to(self._device)
             d = torch.cdist(q, self._base)
+            d.masked_fill_(inactive.unsqueeze(0), float("inf"))
             dd, ii = torch.topk(d, kk, dim=1, largest=False)
             dist_chunks.append(dd.cpu().numpy())
             idx_chunks.append(ii.cpu().numpy())
         dists = np.concatenate(dist_chunks, axis=0)
-        idxs = np.concatenate(idx_chunks, axis=0)
-        slots = self._index_to_slot[idxs]
+        slots = np.concatenate(idx_chunks, axis=0).astype(np.int64)
         if record_hits and kk >= 1:
             nearest = slots[:, 0]
             np.add.at(self.hit_count, nearest, 1)
@@ -304,8 +341,11 @@ class DynamicMemoryBank:
         p = torch.from_numpy(np.ascontiguousarray(proj, dtype=np.float32)).to(
             self._device
         )
-        # mean-then-project == project-then-mean (linearity), but O(D*p) cheaper
-        return (self._base.mean(dim=0) @ p).cpu().numpy().astype(np.float32)
+        # mean-then-project == project-then-mean (linearity), but O(D*p) cheaper.
+        # Masked sum over the full mirror: cheaper than gathering active rows.
+        mask = self._active_dev.unsqueeze(1).to(self._base.dtype)
+        mean = (self._base * mask).sum(dim=0) / self._size
+        return (mean @ p).cpu().numpy().astype(np.float32)
 
     def _member_nn2(self) -> np.ndarray:
         """NN-2 distance of every active member to the rest, in active-slot
@@ -316,9 +356,23 @@ class DynamicMemoryBank:
         if self._size < 2:
             nn2 = np.zeros(0, dtype=np.float32)
         else:
-            # k=2: the nearest is the member itself (distance 0); take the second.
-            dists, _ = self.knn(self._store[self.active_slots()], k=2)
-            nn2 = dists[:, 1]
+            # All-vs-all on the device mirror with self-distances masked out —
+            # no CPU gather / query upload (equivalent to the old k=2 query
+            # where the nearest hit was the member itself). Chunked rows keep
+            # the distance matrix memory-safe at large M.
+            self._ensure_base()
+            inactive = ~self._active_dev
+            chunk = max(256, _KNN_CHUNK_ENTRIES // self.capacity)
+            mins = []
+            for start in range(0, self.capacity, chunk):
+                stop = min(start + chunk, self.capacity)
+                d = torch.cdist(self._base[start:stop], self._base)
+                d.masked_fill_(inactive.unsqueeze(0), float("inf"))
+                rows = torch.arange(stop - start, device=self._device)
+                d[rows, rows + start] = float("inf")  # self-distance
+                mins.append(d.min(dim=1).values)
+            nn2_all = torch.cat(mins).cpu().numpy()
+            nn2 = nn2_all[self.active_slots()].astype(np.float32)
         self._nn2_cache = nn2
         self._nn2_step = self._step
         return nn2
@@ -351,7 +405,10 @@ class DynamicMemoryBank:
                 return self._rng.choice(cache, size=sample, replace=False)
             return cache
         slots = self._rng.choice(self.active_slots(), size=sample, replace=False)
-        dists, _ = self.knn(self._store[slots], k=2)
+        # Gather the sampled members on-device instead of uploading them.
+        self._ensure_base()
+        q = self._base[torch.from_numpy(slots).to(self._device)]
+        dists, _ = self.knn(q, k=2)
         nn2 = dists[:, 1]
         self._nn2_sample_cache = nn2
         self._nn2_sample_step = self._step

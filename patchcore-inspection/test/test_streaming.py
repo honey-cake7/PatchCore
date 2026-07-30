@@ -47,6 +47,44 @@ def test_bank_add_evict_capacity_and_reuse():
     assert len(bank) == 10 and set(reused).issubset(set(slots[:3]))
 
 
+def test_bank_incremental_mirror_matches_bruteforce():
+    """Interleaved add/evict/restore must keep the device mirror consistent.
+
+    The mirror is updated incrementally per mutation (not rebuilt), so drift
+    between numpy state and device state would only surface under exactly this
+    kind of mutation churn.
+    """
+    import torch
+
+    rng = np.random.default_rng(3)
+    bank = DynamicMemoryBank(capacity=60, dim=16)
+    bank.add(rng.normal(size=(40, 16)).astype("float32"))
+    bank.knn(rng.normal(size=(4, 16)).astype("float32"))  # builds the mirror
+    snap = bank.snapshot()
+    for _ in range(30):
+        active = bank.active_slots()
+        bank.evict(rng.choice(active, size=rng.integers(1, 4), replace=False))
+        bank.add(rng.normal(size=(rng.integers(1, 4), 16)).astype("float32"))
+        q = rng.normal(size=(8, 16)).astype("float32")
+        d, slots = bank.knn(q, k=2)
+        ref = bank.vectors()
+        bf = np.sqrt(((q[:, None] - ref[None]) ** 2).sum(-1))
+        bf.sort(axis=1)
+        assert np.allclose(d, bf[:, :2], atol=1e-3)
+        assert bank._active[slots].all()  # returned ids are active slots
+        # tensor queries (the no-upload hot path) agree with numpy queries
+        dt, st = bank.knn(torch.from_numpy(q), k=2)
+        assert np.allclose(dt, d, atol=1e-5) and np.array_equal(st, slots)
+        # member NN-2 against numpy reference
+        nn2 = bank._member_nn2()
+        dd = np.sqrt(((ref[:, None] - ref[None]) ** 2).sum(-1))
+        np.fill_diagonal(dd, np.inf)
+        assert np.allclose(np.sort(nn2), np.sort(dd.min(1)), atol=1e-3)
+    bank.restore(snap)
+    d, _ = bank.knn(snap.store[snap.active][:5], k=1)
+    assert np.allclose(d[:, 0], 0.0, atol=1e-2)  # restored members found
+
+
 def test_bank_snapshot_restore():
     rng = np.random.default_rng(1)
     bank = DynamicMemoryBank(capacity=50, dim=8)
