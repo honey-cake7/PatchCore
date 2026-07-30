@@ -139,6 +139,7 @@ class DynamicMemoryBank:
         self.capacity = int(capacity)
         self.dim = int(dim)
         self._device = device or knn_device()
+        self._seed = seed
         self._rng = np.random.default_rng(seed)
 
         self._store = np.zeros((self.capacity, self.dim), dtype=np.float32)
@@ -258,10 +259,16 @@ class DynamicMemoryBank:
         """
         if not self._base_dirty:
             return
-        self._base = torch.from_numpy(
-            np.ascontiguousarray(self._store)
-        ).to(self._device)
-        self._active_dev = torch.from_numpy(self._active.copy()).to(self._device)
+        store_t = torch.from_numpy(np.ascontiguousarray(self._store))
+        active_t = torch.from_numpy(self._active.copy())
+        if self._base is not None and self._base.shape == store_t.shape:
+            # Refill in place: avoids a device free + re-alloc per episode
+            # reset (restore() is the only steady-state path through here).
+            self._base.copy_(store_t)
+            self._active_dev.copy_(active_t)
+        else:
+            self._base = store_t.to(self._device)
+            self._active_dev = active_t.to(self._device)
         self._base_dirty = False
 
     def knn(
@@ -499,6 +506,10 @@ class DynamicMemoryBank:
         self.last_hit_step = snap.last_hit_step.copy()
         self._size = snap.size
         self._step = snap.step
+        # Envs reuse one bank object across episode resets; re-seeding keeps
+        # the redundancy-subsample draws episode-aligned, exactly as when each
+        # episode constructed a fresh bank.
+        self._rng = np.random.default_rng(self._seed)
         self._base_dirty = True
         self._nn2_step = -1
         self._ent_step = -1

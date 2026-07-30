@@ -146,10 +146,20 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
          beta, gamma, churn_coef, churn_budget, reward_form, norm_mode,
          reward_scale, adv_mode, clip_mode, clip_high, ent_coef, ent_coef_end,
          lr, lr_end):
+    import torch
+
     from patchcore.streaming.bank import device_banner
     from patchcore.streaming.ppo import PPOConfig, PPOTrainer
 
+    # Torch sizes its CPU thread pool from the node's core count, not the
+    # SLURM cgroup — on a shared node every tiny actor-critic op then forks an
+    # oversubscribed thread pool and stalls (observed: ~100ms per 8x53 MLP
+    # forward). The hot path is small-op bound, so a handful of threads wins.
+    n_threads = int(os.environ.get("STREAMING_TORCH_THREADS", "4"))
+    torch.set_num_threads(n_threads)
     print(device_banner())
+    print(f"[torch] cpu threads capped at {n_threads} "
+          f"(STREAMING_TORCH_THREADS to override)")
     reward_cfg = _build_reward_cfg(reward_json, beta, gamma, churn_coef, churn_budget)
     reward_cfg.reward_form = reward_form
     if reward_form == "delta":

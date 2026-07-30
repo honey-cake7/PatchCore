@@ -138,6 +138,13 @@ class ProxyReward:
         self._prev_probe_dists: Optional[np.ndarray] = None
         self._prev_potential_cost: Optional[float] = None
 
+    def reset_state(self) -> None:
+        """Clear per-episode state (envs reuse the reward across resets to
+        keep the device-cached probe; the step-to-step deltas must not leak
+        across episode boundaries)."""
+        self._prev_probe_dists = None
+        self._prev_potential_cost = None
+
     def _probe_dists(self, bank) -> np.ndarray:
         if len(self.probe) == 0 or len(bank) == 0:
             return np.zeros(len(self.probe), dtype=np.float32)

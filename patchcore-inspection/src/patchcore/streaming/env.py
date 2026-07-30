@@ -230,9 +230,17 @@ class MemoryMaintenanceEnv:
                 self.reward_cfg.redundancy_delta = delta
         else:
             # Later episodes: restore the cached warmup bank (cheap memcpy).
-            self.bank = DynamicMemoryBank(self.capacity, self.dim)
+            # Reuse the existing bank object — creating a fresh one would free
+            # and re-allocate the [capacity, D] device mirror every episode
+            # (CUDA alloc churn adds up at ~90 resets per training iteration).
+            if self.bank is None:
+                self.bank = DynamicMemoryBank(self.capacity, self.dim)
             self.bank.restore(self._init_snapshot)
-        self._proxy = ProxyReward(self.reward_cfg, self._probe)
+        # Same reuse for the reward: keeps the device-cached probe tensor.
+        if self._proxy is None:
+            self._proxy = ProxyReward(self.reward_cfg, self._probe)
+        else:
+            self._proxy.reset_state()
 
         self._window.clear()
         self._novelty_hist.clear()
