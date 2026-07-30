@@ -130,8 +130,12 @@ class PPOTrainer:
         val_buf = np.zeros((T, N), np.float32)
         done_buf = np.zeros((T, N), np.float32)
 
+        act_s = reset_s = 0.0
+        n_resets = 0
         for t in range(T):
+            t0 = time.perf_counter()
             action, logp, value = self._act(self._obs)
+            act_s += time.perf_counter() - t0
             obs_buf[t], act_buf[t], logp_buf[t], val_buf[t] = (
                 self._obs, action, logp, value
             )
@@ -139,7 +143,13 @@ class PPOTrainer:
             for i, env in enumerate(self.envs):
                 o, r, d, _ = env.step(action[i])
                 rew_buf[t, i], done_buf[t, i] = r, float(d)
-                next_obs[i] = env.reset() if d else o
+                if d:
+                    t0 = time.perf_counter()
+                    next_obs[i] = env.reset()
+                    reset_s += time.perf_counter() - t0
+                    n_resets += 1
+                else:
+                    next_obs[i] = o
             self._obs = next_obs
 
         with torch.no_grad():
@@ -186,6 +196,8 @@ class PPOTrainer:
             for key, val in getattr(env, "perf", {}).items():
                 perf[key] = perf.get(key, 0.0) + val
                 env.perf[key] = 0.0
+        perf["act"] = act_s
+        perf[f"reset({n_resets}x)"] = reset_s
         return {
             "obs": obs_buf.reshape(-1, OBS_DIM),
             "act": act_buf.reshape(-1, ACTION_DIM),
