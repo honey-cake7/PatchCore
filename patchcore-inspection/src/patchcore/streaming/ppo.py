@@ -179,6 +179,13 @@ class PPOTrainer:
                 last_gae = delta + cfg.gamma * cfg.gae_lambda * next_nonterminal * last_gae
                 adv[t] = last_gae
             ret = adv + val_buf
+        # Drain the envs' wall-clock attribution for this rollout (summed
+        # across envs; reset so each iteration reports only its own cost).
+        perf = {}
+        for env in self.envs:
+            for key, val in getattr(env, "perf", {}).items():
+                perf[key] = perf.get(key, 0.0) + val
+                env.perf[key] = 0.0
         return {
             "obs": obs_buf.reshape(-1, OBS_DIM),
             "act": act_buf.reshape(-1, ACTION_DIM),
@@ -186,6 +193,7 @@ class PPOTrainer:
             "adv": adv.reshape(-1),
             "ret": ret.reshape(-1),
             "mean_reward": float(flat_r.mean()),
+            "perf": perf,
         }
 
     def update(self, batch, ent_coef: Optional[float] = None):
@@ -263,8 +271,12 @@ class PPOTrainer:
             self.update(batch, ent_coef=ent_coef)
             update_s = time.time() - t0
             if (it + 1) % log_every == 0:
+                perf = batch.get("perf", {})
+                other = collect_s - sum(perf.values())
+                detail = " ".join(f"{k}={v:.1f}" for k, v in perf.items())
                 print(f"[ppo] iter {it+1}/{n_iters} mean_reward={batch['mean_reward']:.4f} "
-                      f"collect={collect_s:.1f}s update={update_s:.1f}s")
+                      f"collect={collect_s:.1f}s ({detail} other={other:.1f}) "
+                      f"update={update_s:.1f}s")
         if best_state is not None:
             self.ac.load_state_dict(best_state)
             print(f"[ppo] restored best policy from iter {best_iter} "

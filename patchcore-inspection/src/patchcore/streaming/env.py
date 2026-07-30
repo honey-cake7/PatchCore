@@ -6,6 +6,7 @@ deterministic given the cached stream; the reward is the label-free proxy on a
 held-out slice of the recent window. Both the learned policy and the hand-designed
 baselines drive the same transition via :meth:`step_with_decision`.
 """
+import time
 from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Optional, Tuple
@@ -146,6 +147,11 @@ class MemoryMaintenanceEnv:
         # step's churn so wholesale rewrites (periodic-coreset) are metered on
         # the same footing as admit/evict policies.
         self._pending_churn = (0, 0)
+        # Wall-clock attribution of step cost, drained by PPOTrainer per iter
+        # (decode = action decoding incl. eviction features; reward = proxy
+        # k-NNs; load = memmap read + device gathers + novelty k-NN; obs =
+        # observation features). Cheap enough to keep always-on.
+        self.perf = {"decode": 0.0, "reward": 0.0, "load": 0.0, "obs": 0.0}
 
     # ---- initialization --------------------------------------------------
     def _warmup_features(self) -> np.ndarray:
@@ -435,7 +441,9 @@ class MemoryMaintenanceEnv:
 
     # ---- transition ------------------------------------------------------
     def step(self, action: np.ndarray):
+        t0 = time.perf_counter()
         admit_idx, evict_slots = self.decode_action(action)
+        self.perf["decode"] += time.perf_counter() - t0
         return self.step_with_decision(admit_idx, evict_slots)
 
     def step_with_decision(self, admit_idx: np.ndarray, evict_slots: np.ndarray):
@@ -456,6 +464,7 @@ class MemoryMaintenanceEnv:
         tot_admit = n_admit + pend_admit
         tot_evict = len(evict_slots) + pend_evict
 
+        t0 = time.perf_counter()
         self._window.append(self._holdout_dev)
         holdout = torch.cat(tuple(self._window), dim=0) \
             if len(self._window) > 1 else self._window[0]
@@ -466,6 +475,7 @@ class MemoryMaintenanceEnv:
         reward, comps = self._proxy.compute(
             self.bank, holdout, tot_admit, tot_evict
         )
+        self.perf["reward"] += time.perf_counter() - t0
         scale = self.reward_cfg.coverage_scale
         self._win_cov_cache = (comps["C"] * scale, comps["C90"] * scale)
 
@@ -484,8 +494,13 @@ class MemoryMaintenanceEnv:
         }
         if done:
             return self._observe_terminal(), reward, True, info
+        t0 = time.perf_counter()
         self._load_current()
-        return self._observe(), reward, False, info
+        t1 = time.perf_counter()
+        obs = self._observe()
+        self.perf["load"] += t1 - t0
+        self.perf["obs"] += time.perf_counter() - t1
+        return obs, reward, False, info
 
     def _observe_terminal(self) -> np.ndarray:
         self._t -= 1
