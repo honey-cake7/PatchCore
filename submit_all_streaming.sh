@@ -34,11 +34,15 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     # MVTec streams are tiny (60-391 train images vs kvasir's 2401), so the
     # kvasir-scale defaults misbehave: WARMUP=100 eats half the stream (and
     # exceeds toothbrush's 60 images entirely), and 100k PPO steps replays a
-    # ~200-step episode hundreds of times. Scale them down; both overridable.
+    # ~200-step episode hundreds of times. Scale them down; all overridable.
+    # PPO_LR/PPO_STEPS: validate candidates with ./sweep_ppo_train.sh, then
+    # bake the winning values here.
     BACKBONE=wideresnet50 \
     DATA_PATH="${DATASET_ROOT}/mvtec" \
     WARMUP="${WARMUP:-30}" \
     PPO_STEPS="${PPO_STEPS:-30000}" \
+    PPO_LR="${PPO_LR:-1e-3}" \
+    PPO_LR_END="${PPO_LR_END:-1e-5}" \
     CLASSNAMES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper" \
     sbatch --job-name=stream-mvtec \
         --output="../logs/streaming_output_%j.log" \

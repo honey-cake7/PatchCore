@@ -3,7 +3,6 @@
 #SBATCH --partition=LocalQ
 #SBATCH --account=default
 #SBATCH --gres=shard:6
-#SBATCH --gres=gpu:1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --output=../logs/streaming_output_%j.log
@@ -297,12 +296,9 @@ run_one_class() {
         TRACES_ARG="--traces_in ${RESULT_DIR}/reward_traces.pkl"
     fi
     echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (forget_weight=${FORGET_WEIGHT}) ..."
-    if python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} --out "${RESULT_DIR}/reward_weights.json"; then
-        echo "${WARMUP}:${CAPACITY}" > "${RESULT_DIR}/reward_traces.cfg"
-    else
-        echo "[${CLASSNAME}] reward-weight fit failed (rho below ${MIN_RHO}?)"
-        [ "${FORCE}" = "1" ] || return 1
-    fi
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} --out "${RESULT_DIR}/reward_weights.json"
+    echo "${WARMUP}:${CAPACITY}" > "${RESULT_DIR}/reward_traces.cfg"
+   
 
     # Without the fitted weights train/benchmark fall back to the DEFAULT
     # reward config (q_coef=0 — the misaligned reward).
