@@ -94,10 +94,16 @@ class PPOConfig:
 
 class PPOTrainer:
     def __init__(self, env_fns: List[Callable], cfg: PPOConfig = None,
-                 obs_norm: Optional[RunningNorm] = None):
+                 obs_norm: Optional[RunningNorm] = None, lockstep: bool = False):
         self.cfg = cfg or PPOConfig()
         self.envs = [fn() for fn in env_fns]
         self.n_env = len(self.envs)
+        # lockstep=True: all envs replay the SAME stream (cache path), so
+        # their per-step k-NN queries have identical shapes and collect() can
+        # fuse them into one batched cdist per phase instead of n_env separate
+        # dispatch+sync round-trips. Trajectory-equal to sequential stepping.
+        self.lockstep = lockstep
+        self._probe_stack = None
         # One normalizer shared by every env (either injected — e.g. prefit on
         # a full episode — or fresh). Per-env normalizers cannot be saved with
         # the policy, which previously made eval see differently-normalized
@@ -120,6 +126,89 @@ class PPOTrainer:
             logp = dist.log_prob(action).sum(-1)
         return action.cpu().numpy(), logp.cpu().numpy(), value.cpu().numpy()
 
+    def _lockstep_step(self, action, next_obs):
+        """One synchronized step of all envs with fused cross-env k-NNs.
+
+        Phases: decode+mutate per env -> ONE batched cdist per query family
+        (reward window, probe, member NN-2, next-image novelty, intra-batch)
+        -> per-env numpy assembly. Trajectory-equal to sequential env.step():
+        distances are identical and every rng draw stays inside the env at the
+        same sequence position. Fills ``next_obs`` in place unless done (all
+        envs finish together); returns (rewards [N], done, batched-knn secs).
+        """
+        from patchcore.streaming.bank import (
+            batched_bank_knn, batched_intra_nn2, batched_member_nn2,
+        )
+
+        envs = self.envs
+        cfg0 = envs[0].reward_cfg
+        bknn = 0.0
+
+        holds = [env.lockstep_begin(action[i]) for i, env in enumerate(envs)]
+        banks = [env.bank for env in envs]
+
+        t0 = time.perf_counter()
+        wd, _ = batched_bank_knn(banks, torch.stack(holds), k=1)
+        probe_rows = None
+        if len(envs[0]._proxy.probe) and (cfg0.probe_coef != 0 or cfg0.gamma != 0):
+            if (self._probe_stack is None
+                    or self._probe_stack.shape[0] != self.n_env):
+                # Per-env probes (identical objects when envs share init
+                # state, but never assume it); fixed for the envs' lifetime.
+                self._probe_stack = torch.stack([
+                    torch.from_numpy(env._proxy.probe).to(banks[0].device)
+                    for env in envs
+                ])
+            pd, _ = batched_bank_knn(banks, self._probe_stack, k=1)
+            probe_rows = pd[:, :, 0]
+        if cfg0.beta != 0:
+            batched_member_nn2(banks)  # injects each bank's per-step cache
+        bknn += time.perf_counter() - t0
+
+        dones = [
+            env.lockstep_reward(
+                wd[i, :, 0],
+                None if probe_rows is None else probe_rows[i],
+            )
+            for i, env in enumerate(envs)
+        ]
+        assert all(d == dones[0] for d in dones), "lockstep envs diverged"
+        rewards = np.asarray([env._pend_result[0] for env in envs], np.float32)
+        if dones[0]:
+            # Same rng consumption as the sequential path: the terminal obs is
+            # computed (and discarded by the caller) once per episode.
+            for env in envs:
+                env._observe_terminal()
+            return rewards, True, bknn
+
+        adm = [env.lockstep_load() for env in envs]
+        t0 = time.perf_counter()
+        aq = torch.stack(adm)
+        nd, _ = batched_bank_knn(banks, aq, k=1)
+        intra = batched_intra_nn2(aq)
+        if cfg0.beta == 0:
+            # The observation's redundancy features need member NN-2 that the
+            # (skipped) reward term no longer provides. Mirror the sequential
+            # member_redundancy(sample=1024) branch exactly, rng included.
+            obs_sample = 1024
+            if len(banks[0]) > obs_sample:
+                slot_rows = [env.lockstep_member_draw(obs_sample) for env in envs]
+                mq = torch.stack([
+                    b._base[torch.from_numpy(s).to(b._device)]
+                    for b, s in zip(banks, slot_rows)
+                ])
+                md, _ = batched_bank_knn(banks, mq, k=2)
+                for i, b in enumerate(banks):
+                    b._nn2_sample_cache = md[i, :, 1].astype(np.float32)
+                    b._nn2_sample_step = b._step
+            else:
+                batched_member_nn2(banks)
+        bknn += time.perf_counter() - t0
+
+        for i, env in enumerate(envs):
+            next_obs[i] = env.lockstep_obs(nd[i, :, 0], intra[i])
+        return rewards, False, bknn
+
     def collect(self):
         cfg = self.cfg
         T, N = cfg.rollout_steps, self.n_env
@@ -130,7 +219,7 @@ class PPOTrainer:
         val_buf = np.zeros((T, N), np.float32)
         done_buf = np.zeros((T, N), np.float32)
 
-        act_s = reset_s = 0.0
+        act_s = reset_s = bknn_s = 0.0
         n_resets = 0
         for t in range(T):
             t0 = time.perf_counter()
@@ -140,16 +229,28 @@ class PPOTrainer:
                 self._obs, action, logp, value
             )
             next_obs = np.zeros_like(self._obs)
-            for i, env in enumerate(self.envs):
-                o, r, d, _ = env.step(action[i])
-                rew_buf[t, i], done_buf[t, i] = r, float(d)
-                if d:
-                    t0 = time.perf_counter()
-                    next_obs[i] = env.reset()
-                    reset_s += time.perf_counter() - t0
-                    n_resets += 1
-                else:
-                    next_obs[i] = o
+            if self.lockstep:
+                rews, dones, step_bknn = self._lockstep_step(action, next_obs)
+                bknn_s += step_bknn
+                rew_buf[t] = rews
+                done_buf[t] = float(dones)
+                if dones:
+                    for i, env in enumerate(self.envs):
+                        t0 = time.perf_counter()
+                        next_obs[i] = env.reset()
+                        reset_s += time.perf_counter() - t0
+                        n_resets += 1
+            else:
+                for i, env in enumerate(self.envs):
+                    o, r, d, _ = env.step(action[i])
+                    rew_buf[t, i], done_buf[t, i] = r, float(d)
+                    if d:
+                        t0 = time.perf_counter()
+                        next_obs[i] = env.reset()
+                        reset_s += time.perf_counter() - t0
+                        n_resets += 1
+                    else:
+                        next_obs[i] = o
             self._obs = next_obs
 
         with torch.no_grad():
@@ -198,6 +299,8 @@ class PPOTrainer:
                 env.perf[key] = 0.0
         perf["act"] = act_s
         perf[f"reset({n_resets}x)"] = reset_s
+        if self.lockstep:
+            perf["bknn"] = bknn_s
         return {
             "obs": obs_buf.reshape(-1, OBS_DIM),
             "act": act_buf.reshape(-1, ACTION_DIM),

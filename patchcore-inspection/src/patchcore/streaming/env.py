@@ -258,6 +258,14 @@ class MemoryMaintenanceEnv:
 
     # ---- per-step data ---------------------------------------------------
     def _load_current(self) -> None:
+        self._load_data()
+        # batch novelty distances vs current bank (also used by baselines)
+        d, _ = self.bank.knn(self._admissible_dev, k=1)
+        self._batch_nn = np.where(np.isfinite(d[:, 0]), d[:, 0], 0.0)
+
+    def _load_data(self) -> None:
+        """Everything in _load_current except the novelty k-NN (which the
+        lockstep path batches across envs)."""
         patches = self.reader.image_patches(self._t)
         n_hold = max(1, int(len(patches) * self.reward_cfg.holdout_patch_frac))
         perm = self.rng.permutation(len(patches))
@@ -276,9 +284,6 @@ class MemoryMaintenanceEnv:
         pidx = torch.from_numpy(perm).to(dev)
         self._holdout_dev = patches_t[pidx[:n_hold]]
         self._admissible_dev = patches_t[pidx[n_hold:]]
-        # batch novelty distances vs current bank (also used by baselines)
-        d, _ = self.bank.knn(self._admissible_dev, k=1)
-        self._batch_nn = np.where(np.isfinite(d[:, 0]), d[:, 0], 0.0)
 
     @property
     def current_batch(self) -> np.ndarray:
@@ -304,7 +309,8 @@ class MemoryMaintenanceEnv:
         """
         return self._last_obs
 
-    def _observe(self, update: bool = True) -> np.ndarray:
+    def _observe(self, update: bool = True,
+                 intra_nn2: Optional[np.ndarray] = None) -> np.ndarray:
         cfg = self.obs_cfg
         bank = self.bank
         A = self._admissible
@@ -319,7 +325,8 @@ class MemoryMaintenanceEnv:
 
         # intra-batch density: each admissible patch to nearest other patch
         if len(A) > 1:
-            intra = intra_batch_nn2(self._admissible_dev, device=bank.device)
+            intra = intra_nn2 if intra_nn2 is not None else intra_batch_nn2(
+                self._admissible_dev, device=bank.device)
             intra_log = np.log1p(intra)
             density = [intra_log.mean(), np.median(intra_log), np.percentile(intra_log, 90)]
         else:
@@ -455,6 +462,25 @@ class MemoryMaintenanceEnv:
         return self.step_with_decision(admit_idx, evict_slots)
 
     def step_with_decision(self, admit_idx: np.ndarray, evict_slots: np.ndarray):
+        holdout, tot_admit, tot_evict = self._apply_decision(admit_idx, evict_slots)
+        reward, info, done = self._reward_step(holdout, tot_admit, tot_evict)
+        if done:
+            return self._observe_terminal(), reward, True, info
+        t0 = time.perf_counter()
+        self._load_current()
+        t1 = time.perf_counter()
+        obs = self._observe()
+        self.perf["load"] += t1 - t0
+        self.perf["obs"] += time.perf_counter() - t1
+        return obs, reward, False, info
+
+    def _apply_decision(self, admit_idx: np.ndarray, evict_slots: np.ndarray):
+        """Mutate the bank + build this step's holdout-window query.
+
+        Returns ``(holdout_query, tot_admit, tot_evict)``. Shared by the
+        monolithic step and the lockstep (batched k-NN) path — the rng draws
+        here must stay in this order for the two paths to be trajectory-equal.
+        """
         admit_idx = np.asarray(admit_idx, dtype=np.int64)
         evict_slots = np.asarray(evict_slots, dtype=np.int64)
         # enforce budget: never let admissions exceed free capacity after evictions
@@ -472,7 +498,6 @@ class MemoryMaintenanceEnv:
         tot_admit = n_admit + pend_admit
         tot_evict = len(evict_slots) + pend_evict
 
-        t0 = time.perf_counter()
         self._window.append(self._holdout_dev)
         holdout = torch.cat(tuple(self._window), dim=0) \
             if len(self._window) > 1 else self._window[0]
@@ -480,8 +505,15 @@ class MemoryMaintenanceEnv:
             sel = self.rng.choice(
                 len(holdout), size=self.obs_cfg.max_window_query, replace=False)
             holdout = holdout[torch.from_numpy(sel).to(holdout.device)]
+        return holdout, tot_admit, tot_evict
+
+    def _reward_step(self, holdout, tot_admit, tot_evict,
+                     holdout_dists=None, probe_dists=None):
+        """Reward + step bookkeeping; optional injected batched distances."""
+        t0 = time.perf_counter()
         reward, comps = self._proxy.compute(
-            self.bank, holdout, tot_admit, tot_evict
+            self.bank, holdout, tot_admit, tot_evict,
+            holdout_dists=holdout_dists, probe_dists=probe_dists,
         )
         self.perf["reward"] += time.perf_counter() - t0
         scale = self.reward_cfg.coverage_scale
@@ -500,15 +532,53 @@ class MemoryMaintenanceEnv:
             "n_admit": tot_admit, "n_evict": tot_evict,
             "occupancy": self.bank.occupancy, **comps,
         }
-        if done:
-            return self._observe_terminal(), reward, True, info
+        return reward, info, done
+
+    # ---- lockstep (batched k-NN) protocol --------------------------------
+    # Vectorized training envs replay the same stream in lockstep, so their
+    # per-step k-NN queries have identical shapes and can run as ONE batched
+    # cdist across envs (see PPOTrainer.collect). The phases below are the
+    # monolithic step cut at its k-NN boundaries; all rng draws stay in the
+    # same order, so lockstep and sequential stepping are trajectory-equal.
+    def lockstep_begin(self, action: np.ndarray):
+        """decode + mutate + window build; returns the holdout query tensor."""
         t0 = time.perf_counter()
-        self._load_current()
-        t1 = time.perf_counter()
-        obs = self._observe()
-        self.perf["load"] += t1 - t0
-        self.perf["obs"] += time.perf_counter() - t1
-        return obs, reward, False, info
+        admit_idx, evict_slots = self.decode_action(action)
+        self.perf["decode"] += time.perf_counter() - t0
+        self._pend = self._apply_decision(admit_idx, evict_slots)
+        return self._pend[0]
+
+    def lockstep_reward(self, holdout_dists=None, probe_dists=None):
+        """Reward from injected distances; returns done (same for all envs)."""
+        holdout, tot_admit, tot_evict = self._pend
+        reward, info, done = self._reward_step(
+            holdout, tot_admit, tot_evict,
+            holdout_dists=holdout_dists, probe_dists=probe_dists,
+        )
+        self._pend_result = (reward, info)
+        return done
+
+    def lockstep_load(self):
+        """Load the next image (no k-NN); returns the admissible tensor."""
+        t0 = time.perf_counter()
+        self._load_data()
+        self.perf["load"] += time.perf_counter() - t0
+        return self._admissible_dev
+
+    def lockstep_member_draw(self, sample: int) -> np.ndarray:
+        """Draw the obs redundancy subsample (same rng position as the
+        sequential path's member_redundancy call inside _observe)."""
+        return self.bank._rng.choice(
+            self.bank.active_slots(), size=sample, replace=False)
+
+    def lockstep_obs(self, novelty_d: np.ndarray, intra_nn2: np.ndarray) -> np.ndarray:
+        """Finish the step from injected distances; returns the observation
+        (the reward was already returned via lockstep_reward)."""
+        self._batch_nn = np.where(np.isfinite(novelty_d), novelty_d, 0.0)
+        t0 = time.perf_counter()
+        obs = self._observe(intra_nn2=intra_nn2)
+        self.perf["obs"] += time.perf_counter() - t0
+        return obs
 
     def _observe_terminal(self) -> np.ndarray:
         self._t -= 1

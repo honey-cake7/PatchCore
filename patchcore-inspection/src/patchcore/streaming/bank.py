@@ -100,6 +100,75 @@ def intra_batch_nn2(x, device: Optional[torch.device] = None) -> np.ndarray:
     return d.min(dim=1).values.cpu().numpy().astype(np.float32)
 
 
+def batched_bank_knn(banks, queries: torch.Tensor, k: int = 1):
+    """k-NN of per-env query batches against per-env banks in ONE fused call.
+
+    ``queries``: [N, n, D] device tensor (row i queries ``banks[i]``); all
+    banks must share capacity/dim/device. Lockstep vectorized training uses
+    this to replace N separate dispatch+sync round-trips per phase with one.
+    Returns ``(distances [N, n, k], slot_ids [N, n, k])`` as numpy — identical
+    values to per-bank :meth:`DynamicMemoryBank.knn`.
+    """
+    for b in banks:
+        b._ensure_base()
+    base = torch.stack([b._base for b in banks])              # [N, M, D]
+    inactive = torch.stack([~b._active_dev for b in banks])   # [N, M]
+    n_env, n_q = queries.shape[0], queries.shape[1]
+    capacity = banks[0].capacity
+    chunk = max(64, _KNN_CHUNK_ENTRIES // max(n_env * capacity, 1))
+    dd_chunks, ii_chunks = [], []
+    for start in range(0, n_q, chunk):
+        d = torch.cdist(queries[:, start:start + chunk], base)
+        d.masked_fill_(inactive.unsqueeze(1), float("inf"))
+        dd, ii = torch.topk(d, k, dim=2, largest=False)
+        dd_chunks.append(dd)
+        ii_chunks.append(ii)
+    dd = torch.cat(dd_chunks, dim=1).cpu().numpy()
+    ii = torch.cat(ii_chunks, dim=1).cpu().numpy().astype(np.int64)
+    return dd, ii
+
+
+def batched_member_nn2(banks):
+    """Full member NN-2 for every bank in fused calls; injects each bank's
+    per-step cache (same contract as :meth:`DynamicMemoryBank._member_nn2`)
+    and returns the per-bank active-order arrays."""
+    for b in banks:
+        b._ensure_base()
+    base = torch.stack([b._base for b in banks])              # [N, M, D]
+    inactive = torch.stack([~b._active_dev for b in banks])   # [N, M]
+    n_env = len(banks)
+    capacity = banks[0].capacity
+    device = banks[0]._device
+    chunk = max(64, _KNN_CHUNK_ENTRIES // max(n_env * capacity, 1))
+    mins = []
+    for start in range(0, capacity, chunk):
+        stop = min(start + chunk, capacity)
+        d = torch.cdist(base[:, start:stop], base)
+        d.masked_fill_(inactive.unsqueeze(1), float("inf"))
+        rows = torch.arange(stop - start, device=device)
+        d[:, rows, rows + start] = float("inf")  # self-distance
+        mins.append(d.min(dim=2).values)
+    nn2_all = torch.cat(mins, dim=1).cpu().numpy()            # [N, capacity]
+    out = []
+    for i, b in enumerate(banks):
+        nn2 = nn2_all[i][b.active_slots()].astype(np.float32)
+        b._nn2_cache = nn2
+        b._nn2_step = b._step
+        out.append(nn2)
+    return out
+
+
+def batched_intra_nn2(x: torch.Tensor) -> np.ndarray:
+    """Per-env intra-batch NN-2: ``x`` [N, n, D] device tensor -> [N, n]."""
+    n = x.shape[1]
+    if n < 2:
+        return np.zeros((x.shape[0], n), dtype=np.float32)
+    d = torch.cdist(x, x)
+    rows = torch.arange(n, device=x.device)
+    d[:, rows, rows] = float("inf")
+    return d.min(dim=2).values.cpu().numpy().astype(np.float32)
+
+
 # Per-slot metadata columns kept alongside the stored vectors. These feed both
 # the observation vector and the per-entry eviction utility features.
 @dataclass
@@ -473,9 +542,14 @@ class DynamicMemoryBank:
         hit_rate = hit_rate / (hit_rate.max() + 1e-6)
         red = self._eviction_redundancy() if m >= 2 else np.zeros(m, np.float32)
         red_n = red / (red.max() + 1e-6)
-        centroid = self._store[slots[self.insert_step[slots] >= np.median(
-            self.insert_step[slots])]].mean(axis=0, keepdims=True) if m else 0.0
-        dist_recent = np.linalg.norm(self._store[slots] - centroid, axis=1)
+        # Recent-insertion-centroid distance on the device mirror: the numpy
+        # version re-gathered the whole store (8MB at M=2000) and made two
+        # full passes over it on CPU every mutation step.
+        self._ensure_base()
+        rows = self._base[torch.from_numpy(slots).to(self._device)]
+        recent = self.insert_step[slots] >= np.median(self.insert_step[slots])
+        centroid = rows[torch.from_numpy(recent).to(self._device)].mean(dim=0)
+        dist_recent = torch.norm(rows - centroid, dim=1).cpu().numpy()
         dist_recent = dist_recent / (dist_recent.max() + 1e-6)
         feats = np.stack([age, -hit_rate, -red_n, dist_recent], axis=1).astype(
             np.float32

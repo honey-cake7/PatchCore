@@ -154,46 +154,74 @@ class ProxyReward:
         return np.where(np.isfinite(d[:, 0]), d[:, 0], 0.0)
 
     def components(
-        self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int
+        self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int,
+        holdout_dists: Optional[np.ndarray] = None,
+        probe_dists: Optional[np.ndarray] = None,
     ) -> Tuple[float, float, float, float, float, float]:
-        """Returns (C, R, churn, score_drift, C90, P)."""
+        """Returns (C, R, churn, score_drift, C90, P).
+
+        ``holdout_dists`` / ``probe_dists`` are optional precomputed NN-1
+        distances (lockstep training batches these k-NNs across envs); when
+        given, the corresponding queries are skipped. Values are identical
+        either way.
+        """
         cfg = self.cfg
         scale = cfg.coverage_scale + 1e-8
         # holdout coverage: mean + p90 tail from one k-NN call
         if len(holdout_patches) and len(bank):
-            if not isinstance(holdout_patches, torch.Tensor):
-                holdout_patches = np.ascontiguousarray(
-                    holdout_patches, dtype=np.float32)
-            dists, _ = bank.knn(holdout_patches, k=1)
-            d = dists[:, 0]
-            d = d[np.isfinite(d)]
+            if holdout_dists is None:
+                if not isinstance(holdout_patches, torch.Tensor):
+                    holdout_patches = np.ascontiguousarray(
+                        holdout_patches, dtype=np.float32)
+                dists, _ = bank.knn(holdout_patches, k=1)
+                holdout_dists = dists[:, 0]
+            d = holdout_dists[np.isfinite(holdout_dists)]
             c = float(d.mean()) / scale if len(d) else 0.0
             c90 = float(np.percentile(d, 90)) / scale if len(d) else 0.0
         else:
             c = c90 = 0.0
         delta = cfg.redundancy_delta if cfg.redundancy_delta else cfg.coverage_scale
-        r = redundancy(bank, delta, cfg.redundancy_sample)
-        churn = (n_admit + n_evict) / max(bank.capacity, 1)
-        probe_dists = self._probe_dists(bank)
-        # probe retention: the LEVEL of probe distances (label-free forgetting
-        # signal); score_drift is their step-to-step CHANGE (scale stability).
-        p = float(probe_dists.mean()) / scale if len(probe_dists) else 0.0
-        if self._prev_probe_dists is not None and len(probe_dists) == len(
-            self._prev_probe_dists
-        ):
-            score_drift = float(
-                np.abs(probe_dists - self._prev_probe_dists).mean()
-            ) / scale
+        # Zero-weighted terms skip their k-NN entirely: fitted weight sets
+        # frequently zero beta/probe/gamma, and the member NN-2 + probe queries
+        # are a large share of the per-step cost. The reward value is identical
+        # (0 * anything); only the logged component becomes 0.
+        if cfg.beta != 0:
+            r = redundancy(bank, delta, cfg.redundancy_sample)
         else:
+            r = 0.0
+        churn = (n_admit + n_evict) / max(bank.capacity, 1)
+        if cfg.probe_coef != 0 or cfg.gamma != 0:
+            if probe_dists is None:
+                probe_dists = self._probe_dists(bank)
+            else:
+                probe_dists = np.where(
+                    np.isfinite(probe_dists), probe_dists, 0.0)
+            # probe retention: the LEVEL of probe distances (label-free
+            # forgetting signal); score_drift is their step-to-step CHANGE
+            # (scale stability).
+            p = float(probe_dists.mean()) / scale if len(probe_dists) else 0.0
+            if self._prev_probe_dists is not None and len(probe_dists) == len(
+                self._prev_probe_dists
+            ):
+                score_drift = float(
+                    np.abs(probe_dists - self._prev_probe_dists).mean()
+                ) / scale
+            else:
+                score_drift = 0.0
+            self._prev_probe_dists = probe_dists
+        else:
+            p = 0.0
             score_drift = 0.0
-        self._prev_probe_dists = probe_dists
         return c, r, churn, score_drift, c90, p
 
     def compute(
-        self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int
+        self, bank, holdout_patches: np.ndarray, n_admit: int, n_evict: int,
+        holdout_dists: Optional[np.ndarray] = None,
+        probe_dists: Optional[np.ndarray] = None,
     ) -> Tuple[float, Dict[str, float]]:
         c, r, churn, score_drift, c90, p = self.components(
-            bank, holdout_patches, n_admit, n_evict
+            bank, holdout_patches, n_admit, n_evict,
+            holdout_dists=holdout_dists, probe_dists=probe_dists,
         )
         cfg = self.cfg
         churn_excess = max(0.0, churn - cfg.churn_budget)

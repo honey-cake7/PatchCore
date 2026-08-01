@@ -85,6 +85,74 @@ def test_bank_incremental_mirror_matches_bruteforce():
     assert np.allclose(d[:, 0], 0.0, atol=1e-2)  # restored members found
 
 
+def test_lockstep_collect_matches_sequential():
+    """Batched cross-env k-NN stepping must reproduce sequential env.step().
+
+    Covers both reward-config regimes (full components; beta/probe/gamma
+    zeroed, which changes which k-NNs are batched vs skipped).
+    """
+    import torch
+
+    from patchcore.streaming.env import MemoryMaintenanceEnv, RunningNorm
+    from patchcore.streaming.ppo import PPOConfig, PPOTrainer
+    from patchcore.streaming.reward import RewardConfig
+
+    class LockstepReader:
+        def __init__(self, n_images=24, patches=100, dim=16, seed=0):
+            rng = np.random.default_rng(seed)
+            self.data = rng.normal(size=(n_images, patches, dim)).astype("float32")
+
+        @property
+        def n_images(self):
+            return len(self.data)
+
+        @property
+        def dim(self):
+            return self.data.shape[2]
+
+        def image_patches(self, i):
+            return self.data[i]
+
+        def stage_of(self, i):
+            return 0
+
+        def flat_slice(self, ids):
+            return self.data[list(ids)].reshape(-1, self.data.shape[2])
+
+    for beta, probe_c, gamma in [(0.3, 0.5, 0.1), (0.0, 0.0, 0.0)]:
+        reader = LockstepReader()
+
+        def env_fns():
+            fns = []
+            for i in range(2):
+                def fn(seed=i):
+                    return MemoryMaintenanceEnv(
+                        reader, capacity=100, warmup_images=8, seed=seed,
+                        reward_cfg=RewardConfig(
+                            beta=beta, probe_coef=probe_c, gamma=gamma),
+                    )
+                fns.append(fn)
+            return fns
+
+        batches = {}
+        for lockstep in (False, True):
+            torch.manual_seed(0)
+            cfg = PPOConfig(rollout_steps=20, total_env_steps=40)
+            # Frozen norm = production regime (norm_mode=episode). An UNfrozen
+            # shared RunningNorm is order-sensitive: sequential stepping
+            # interleaves per-env updates differently than phased stepping.
+            norm = RunningNorm(OBS_DIM)
+            norm.freeze()
+            trainer = PPOTrainer(env_fns(), cfg, obs_norm=norm, lockstep=lockstep)
+            batches[lockstep] = trainer.collect()
+
+        for key in ("obs", "act", "logp", "adv", "ret"):
+            np.testing.assert_allclose(
+                batches[False][key], batches[True][key], rtol=1e-4, atol=1e-4,
+                err_msg=f"lockstep mismatch in '{key}' (beta={beta})")
+        assert abs(batches[False]["mean_reward"] - batches[True]["mean_reward"]) < 1e-5
+
+
 def test_bank_snapshot_restore():
     rng = np.random.default_rng(1)
     bank = DynamicMemoryBank(capacity=50, dim=8)

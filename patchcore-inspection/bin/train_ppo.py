@@ -154,8 +154,10 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
     # Torch sizes its CPU thread pool from the node's core count, not the
     # SLURM cgroup — on a shared node every tiny actor-critic op then forks an
     # oversubscribed thread pool and stalls (observed: ~100ms per 8x53 MLP
-    # forward). The hot path is small-op bound, so a handful of threads wins.
-    n_threads = int(os.environ.get("STREAMING_TORCH_THREADS", "4"))
+    # forward). The ops here are far too small to parallelize: threads=1
+    # removes OMP fork/join entirely and is immune to core contention
+    # (act still bounced 2s->12s between runs at threads=4 on a busy node).
+    n_threads = int(os.environ.get("STREAMING_TORCH_THREADS", "1"))
     torch.set_num_threads(n_threads)
     print(device_banner())
     print(f"[torch] cpu threads capped at {n_threads} "
@@ -194,7 +196,9 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
         cfg.best_window = max(3, round(episode_steps / cfg.rollout_steps))
     print(f"[ppo] adv_mode={adv_mode} clip_mode={clip_mode} clip_high={clip_high} "
           f"best_window={cfg.best_window}")
-    trainer = PPOTrainer(env_fns, cfg, obs_norm=obs_norm)
+    # Cache-path envs replay the same stream in lockstep -> fused cross-env
+    # k-NN batching in collect(); synthetic envs have per-seed streams.
+    trainer = PPOTrainer(env_fns, cfg, obs_norm=obs_norm, lockstep=bool(cache_dir))
     history = trainer.train()
     trainer.save(out)
     print(f"saved policy -> {out}")
