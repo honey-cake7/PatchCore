@@ -215,6 +215,10 @@ export PVTV2_B2_WEIGHTS=${PVTV2_B2_WEIGHTS:-${PROJECT_ROOT}/models/pvt_v2_b2.pth
 
 FORCE=${FORCE:-0}
 RECACHE=${RECACHE:-0}
+# ITERATE=1 = iterated reward refit: fold the previous round's trained PPO
+# traces into the reward fitting set before refitting + retraining (run a
+# normal pass first so each class has a checkpoint).
+ITERATE=${ITERATE:-0}
 
 BB_TAG=$(echo "${BACKBONE}" | tr -d '-')
 SUMMARY_CSV=results/streaming/summary_${BB_TAG}_${DRIFT}.csv
@@ -295,8 +299,20 @@ run_one_class() {
         && [ "$(cat "${RESULT_DIR}/reward_traces.cfg" 2>/dev/null)" = "${WARMUP}:${CAPACITY}" ]; then
         TRACES_ARG="--traces_in ${RESULT_DIR}/reward_traces.pkl"
     fi
+    # ITERATE=1: iterated reward refit — replay the previously trained PPO
+    # policy, add its traces to the fitting set (persisted into the pkl), and
+    # fit on baselines+PPO. Closes proxy directions the heuristic fitting set
+    # never visited (reward hacking, e.g. proxy-optimal policies whose
+    # forgetting collapses). Requires a prior round's checkpoint.
+    local PPO_ITER_ARG=""
+    if [ "${ITERATE}" = "1" ] && [ -f "${PPO_OUT}" ]; then
+        echo "[${CLASSNAME}] ITERATE=1 — adding trained-PPO traces to the reward fit"
+        PPO_ITER_ARG="--ppo_pt ${PPO_OUT}"
+    elif [ "${ITERATE}" = "1" ]; then
+        echo "[${CLASSNAME}] ITERATE=1 but no checkpoint at ${PPO_OUT} — plain fit"
+    fi
     echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (forget_weight=${FORGET_WEIGHT}) ..."
-    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} --out "${RESULT_DIR}/reward_weights.json"
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} ${PPO_ITER_ARG} --out "${RESULT_DIR}/reward_weights.json"
     echo "${WARMUP}:${CAPACITY}" > "${RESULT_DIR}/reward_traces.cfg"
    
 

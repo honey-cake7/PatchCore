@@ -198,27 +198,85 @@ def record_policy_traces(
                 env.bank, test_readers[0], n_nearest_neighbours, patch_shape,
                 imagesize,
             )
-            infos = summ["infos"]
-            traces.append({
-                "policy": name,
-                "seed": int(seed),
-                "C": np.asarray([i["C"] for i in infos], dtype=np.float64),
-                "R": np.asarray([i["R"] for i in infos], dtype=np.float64),
-                "churn": np.asarray([i["churn"] for i in infos], dtype=np.float64),
-                "score_drift": np.asarray(
-                    [i["score_drift"] for i in infos], dtype=np.float64
-                ),
-                "C90": np.asarray([i["C90"] for i in infos], dtype=np.float64),
-                "P": np.asarray([i["P"] for i in infos], dtype=np.float64),
-                "stage": np.asarray([i["stage"] for i in infos], dtype=np.int64),
-                "stage_aurocs": {
-                    int(ev["stage"]): float(ev["image_auroc"]) for ev in summ["evals"]
-                },
-                "forget_auroc": float(forget_m["image_auroc"]),
-            })
-            print(f"[trace] {name:26s} seed={seed} "
-                  f"aurocs={[round(v, 3) for _, v in sorted(traces[-1]['stage_aurocs'].items())]} "
-                  f"forget={traces[-1]['forget_auroc']:.3f}")
+            traces.append(_trace_from_summary(name, seed, summ, forget_m))
+    return traces
+
+
+def _trace_from_summary(name: str, seed: int, summ: Dict, forget_m: Dict) -> Dict:
+    infos = summ["infos"]
+    trace = {
+        "policy": name,
+        "seed": int(seed),
+        "C": np.asarray([i["C"] for i in infos], dtype=np.float64),
+        "R": np.asarray([i["R"] for i in infos], dtype=np.float64),
+        "churn": np.asarray([i["churn"] for i in infos], dtype=np.float64),
+        "score_drift": np.asarray(
+            [i["score_drift"] for i in infos], dtype=np.float64
+        ),
+        "C90": np.asarray([i["C90"] for i in infos], dtype=np.float64),
+        "P": np.asarray([i["P"] for i in infos], dtype=np.float64),
+        "stage": np.asarray([i["stage"] for i in infos], dtype=np.int64),
+        "stage_aurocs": {
+            int(ev["stage"]): float(ev["image_auroc"]) for ev in summ["evals"]
+        },
+        "forget_auroc": float(forget_m["image_auroc"]),
+    }
+    print(f"[trace] {name:26s} seed={seed} "
+          f"aurocs={[round(v, 3) for _, v in sorted(trace['stage_aurocs'].items())]} "
+          f"forget={trace['forget_auroc']:.3f}")
+    return trace
+
+
+def record_ppo_traces(
+    stream_reader,
+    test_readers: List,
+    capacity: int,
+    ppo_path: str,
+    warmup: int = 100,
+    n_nearest_neighbours: int = 1,
+    patch_shape=None,
+    imagesize=None,
+    seeds: Optional[List[int]] = None,
+    name: str = "ppo_r1",
+) -> List[Dict]:
+    """Replay a trained PPO checkpoint over the stream, recording the same
+    component traces as :func:`record_policy_traces`.
+
+    This is the data-collection half of iterated reward refitting: the reward
+    is fitted on the heuristic baselines' behavior, and a trained policy can
+    maximize the proxy in directions that fitting set never visited while its
+    AUROC drops (reward hacking). Adding the trained policy's own trace points
+    to the fit exposes those directions to the next round's weight search.
+    """
+    from patchcore.streaming import policies as P
+    from patchcore.streaming.env import ActionConfig, MemoryMaintenanceEnv
+    from patchcore.streaming.ppo import load_checkpoint
+
+    seeds = seeds if seeds is not None else [0]
+    ac, norm, meta = load_checkpoint(ppo_path, device="cpu")
+    action_mode = (meta or {}).get("action_mode", "continuous6")
+
+    def eval_fn(env, stage):
+        return evaluate_bank_on_stage(
+            env.bank, test_readers[stage], n_nearest_neighbours, patch_shape,
+            imagesize,
+        )
+
+    traces = []
+    for seed in seeds:
+        # obs_norm is frozen in v2 checkpoints, so sharing it across seeds is
+        # safe; the policy must see the normalization it trained under.
+        env = MemoryMaintenanceEnv(
+            stream_reader, capacity=capacity, warmup_images=warmup,
+            seed=seed, n_nearest_neighbours=n_nearest_neighbours,
+            obs_norm=norm, action_cfg=ActionConfig(mode=action_mode),
+        )
+        summ = P.run_policy(env, P.PPOPolicy(ac), per_stage_eval=eval_fn)
+        forget_m = evaluate_bank_on_stage(
+            env.bank, test_readers[0], n_nearest_neighbours, patch_shape,
+            imagesize,
+        )
+        traces.append(_trace_from_summary(name, seed, summ, forget_m))
     return traces
 
 

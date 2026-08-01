@@ -11,6 +11,10 @@
 #   ./submit_all_streaming.sh                # submit both
 #   ONLY=hyperkvasir ./submit_all_streaming.sh
 #   ONLY=mvtec ./submit_all_streaming.sh
+#   ITERATE=1 ONLY=mvtec ./submit_all_streaming.sh   # iterated reward refit:
+#       refit each class's reward with the previous round's trained-PPO traces
+#       added to the fitting set, then retrain + re-benchmark. Needs one
+#       normal pass first (checkpoints must exist).
 #
 # CLASSNAMES is passed via the environment (--export=ALL): sbatch's
 # --export=NAME=VALUE parsing splits on commas and would mangle a list value.
@@ -35,13 +39,14 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     # kvasir-scale defaults misbehave: WARMUP=100 eats half the stream (and
     # exceeds toothbrush's 60 images entirely), and 100k PPO steps replays a
     # ~200-step episode hundreds of times. Scale them down; all overridable.
-    # PPO_LR/PPO_STEPS: validate candidates with ./sweep_ppo_train.sh, then
-    # bake the winning values here.
+    # PPO_LR/PPO_STEPS = sweep_ppo_train.sh winner (config D, 2026-07-31):
+    # lr 1e-4 -> 1e-5 over 100k steps was best on ALL of bottle/screw/zipper;
+    # the kvasir-tuned 1e-3 hot start destabilizes tiny-stream training.
     BACKBONE=wideresnet50 \
     DATA_PATH="${DATASET_ROOT}/mvtec" \
     WARMUP="${WARMUP:-30}" \
-    PPO_STEPS="${PPO_STEPS:-30000}" \
-    PPO_LR="${PPO_LR:-1e-3}" \
+    PPO_STEPS="${PPO_STEPS:-100000}" \
+    PPO_LR="${PPO_LR:-1e-4}" \
     PPO_LR_END="${PPO_LR_END:-1e-5}" \
     CLASSNAMES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper" \
     sbatch --job-name=stream-mvtec \
