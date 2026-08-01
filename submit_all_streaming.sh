@@ -15,6 +15,15 @@
 #       refit each class's reward with the previous round's trained-PPO traces
 #       added to the fitting set, then retrain + re-benchmark. Needs one
 #       normal pass first (checkpoints must exist).
+#   CAPACITY_MODE=match CAPACITY_PCT=10 ONLY=mvtec ./submit_all_streaming.sh
+#       per-class M = CAPACITY_PCT% of stream patches = the budget a stock
+#       PatchCore coreset gets at that percentage, so the stage-0 column is
+#       directly comparable to a stock baseline at the same p. Results/summary
+#       get an _m<pct> suffix, so runs at different percentages coexist
+#       (budget-vs-accuracy curves). Traces re-record per pct (slower run).
+#       Sweep example (submit sequentially, ONE at a time):
+#         for p in 1 2.5 5 10; do CAPACITY_MODE=match CAPACITY_PCT=$p \
+#             ONLY=mvtec ./submit_all_streaming.sh; done  # wait between jobs!
 #
 # CLASSNAMES is passed via the environment (--export=ALL): sbatch's
 # --export=NAME=VALUE parsing splits on commas and would mangle a list value.
@@ -39,15 +48,15 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     # kvasir-scale defaults misbehave: WARMUP=100 eats half the stream (and
     # exceeds toothbrush's 60 images entirely), and 100k PPO steps replays a
     # ~200-step episode hundreds of times. Scale them down; all overridable.
-    # PPO_LR/PPO_STEPS = sweep_ppo_train.sh winner (config D, 2026-07-31):
-    # lr 1e-4 -> 1e-5 over 100k steps was best on ALL of bottle/screw/zipper;
-    # the kvasir-tuned 1e-3 hot start destabilizes tiny-stream training.
+    # PPO_LR 1e-5 -> 1e-6 (2026-08-02 full run): training improves monotonically
+    # on ~all classes and PPO tops its own proxy on ~12/15 — the sweep's 1e-4
+    # was still too hot for tiny streams (iter-3 best-restores on half of them).
     BACKBONE=wideresnet50 \
     DATA_PATH="${DATASET_ROOT}/mvtec" \
-    WARMUP="${WARMUP:-30}" \
-    PPO_STEPS="${PPO_STEPS:-100000}" \
-    PPO_LR="${PPO_LR:-1e-4}" \
-    PPO_LR_END="${PPO_LR_END:-1e-5}" \
+    WARMUP="${WARMUP:-15}" \
+    PPO_STEPS="${PPO_STEPS:-50000}" \
+    PPO_LR="${PPO_LR:-1e-5}" \
+    PPO_LR_END="${PPO_LR_END:-1e-6}" \
     CLASSNAMES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper" \
     sbatch --job-name=stream-mvtec \
         --output="../logs/streaming_output_%j.log" \

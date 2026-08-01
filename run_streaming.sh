@@ -187,6 +187,17 @@ IMAGESIZE=${IMAGESIZE:-224}
 
 # streaming / RL settings
 CAPACITY=${CAPACITY:-2000}                     # memory budget M
+# fixed : use CAPACITY as-is for every class.
+# match : per-class M = CAPACITY_PCT% of the class's total stream patches — the
+#         budget a stock PatchCore CAPACITY_PCT% greedy coreset gets, making
+#         the stage-0 column directly comparable to a stock baseline at that
+#         percentage. Results land in per-percentage dirs/summaries (suffix
+#         _m<pct>), so budget sweeps don't clobber each other.
+CAPACITY_MODE=${CAPACITY_MODE:-fixed}
+CAPACITY_PCT=${CAPACITY_PCT:-10}               # percent, decimals allowed (e.g. 2.5)
+[ "${CAPACITY_MODE}" = "match10" ] && { CAPACITY_MODE=match; CAPACITY_PCT=10; }
+RESULT_SUFFIX=""
+[ "${CAPACITY_MODE}" = "match" ] && RESULT_SUFFIX="_m${CAPACITY_PCT}"
 WARMUP=${WARMUP:-100}                          # warmup images for stage-0 bank + reward scales
 N_NN=${N_NN:-5}                                # k for k-NN scoring (matches train_polyp_pvt.sh)
 PPO_STEPS=${PPO_STEPS:-100000}
@@ -221,7 +232,7 @@ RECACHE=${RECACHE:-0}
 ITERATE=${ITERATE:-0}
 
 BB_TAG=$(echo "${BACKBONE}" | tr -d '-')
-SUMMARY_CSV=results/streaming/summary_${BB_TAG}_${DRIFT}.csv
+SUMMARY_CSV=results/streaming/summary_${BB_TAG}_${DRIFT}${RESULT_SUFFIX}.csv
 
 CLIP_HIGH_ARG=""
 [ -n "${CLIP_HIGH}" ] && CLIP_HIGH_ARG="--clip_high ${CLIP_HIGH}"
@@ -250,8 +261,11 @@ run_one_class() {
     local CLASSNAME=$1
     local TAG=${CLASSNAME}_${BB_TAG}_${DRIFT}
     local CACHE_DIR=cache/${TAG}
-    local RESULT_DIR=results/streaming/${TAG}
+    # results are per-percentage in match mode (cache is capacity-independent)
+    local RESULT_DIR=results/streaming/${TAG}${RESULT_SUFFIX}
     local PPO_OUT=${RESULT_DIR}/ppo_${TAG}.pt
+    # shadow the global so a match10 override cannot leak into the next class
+    local CAPACITY=${CAPACITY}
     mkdir -p "${RESULT_DIR}" "$(dirname "${CACHE_DIR}")"
 
     echo "========================================================="
@@ -288,6 +302,25 @@ run_one_class() {
             --patchsize                 "${PATCHSIZE}" \
             --gpu                       0 \
             --out_dir                   "${CACHE_DIR}" || { echo "[${CLASSNAME}] caching failed"; return 1; }
+    fi
+
+    # Budget-matched capacity: a stock PatchCore p% greedy coreset keeps p% of
+    # ALL training patches; give the streaming bank the same per-class budget
+    # so the stage-0 comparison is apples-to-apples at that percentage.
+    # Computed from the cache (total stream patches), so it must run after
+    # step 1.
+    if [ "${CAPACITY_MODE}" = "match" ]; then
+        CAPACITY=$(python - "${CACHE_DIR}" "${CAPACITY_PCT}" <<'PYEOF'
+import sys
+
+import numpy as np
+
+e = np.load(f"{sys.argv[1]}/stream/embeddings.npy", mmap_mode="r")
+pct = float(sys.argv[2])
+print(max(1, int(round(pct / 100.0 * e.shape[0] * e.shape[1]))))
+PYEOF
+        ) || { echo "[${CLASSNAME}] match capacity computation failed"; return 1; }
+        echo "[${CLASSNAME}] CAPACITY_MODE=match -> M=${CAPACITY} (${CAPACITY_PCT}% of stream patches, stock-budget-matched)"
     fi
 
     # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC).
@@ -372,17 +405,19 @@ done
 # cross-class AVERAGES per policy (over classes & seeds) printed to the log and
 # saved next to it as summary_*_mean.csv.
 CLASSNAMES="${CLASSNAMES}" BB_TAG="${BB_TAG}" DRIFT="${DRIFT}" \
+RESULT_SUFFIX="${RESULT_SUFFIX}" \
 SUMMARY_CSV="${SUMMARY_CSV}" python - <<'EOF'
 import csv, os
 from collections import defaultdict
 
 classes = os.environ["CLASSNAMES"].split()
 bb, drift = os.environ["BB_TAG"], os.environ["DRIFT"]
+suffix = os.environ.get("RESULT_SUFFIX", "")
 out = os.environ["SUMMARY_CSV"]
 
 rows = []
 for c in classes:
-    path = f"results/streaming/{c}_{bb}_{drift}/results.csv"
+    path = f"results/streaming/{c}_{bb}_{drift}{suffix}/results.csv"
     if not os.path.exists(path):
         continue
     with open(path) as f:
@@ -467,13 +502,13 @@ EOF
 echo "========================================================="
 echo " RUN SUMMARY (${BACKBONE}, ${DRIFT})"
 for cls in "${OK_CLASSES[@]}"; do
-    echo "   ${cls} : OK      results/streaming/${cls}_${BB_TAG}_${DRIFT}/"
+    echo "   ${cls} : OK      results/streaming/${cls}_${BB_TAG}_${DRIFT}${RESULT_SUFFIX}/"
 done
 for cls in "${FAILED_CLASSES[@]}"; do
     echo "   ${cls} : FAILED  (search this log for '[${cls}]')"
 done
 echo " Combined table : ${SUMMARY_CSV}"
 echo " Class averages : ${SUMMARY_CSV%.csv}_mean.csv (also printed above)"
-echo " Per class      : results/streaming/<class>_${BB_TAG}_${DRIFT}/{results.csv, ppo_*.pt, reward_weights.json}"
+echo " Per class      : results/streaming/<class>_${BB_TAG}_${DRIFT}${RESULT_SUFFIX}/{results.csv, ppo_*.pt, reward_weights.json}"
 echo "========================================================="
 [ ${#FAILED_CLASSES[@]} -eq 0 ] || exit 1
