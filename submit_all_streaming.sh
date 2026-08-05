@@ -24,6 +24,11 @@
 #       Sweep example (submit sequentially, ONE at a time):
 #         for p in 1 2.5 5 10; do CAPACITY_MODE=match CAPACITY_PCT=$p \
 #             ONLY=mvtec ./submit_all_streaming.sh; done  # wait between jobs!
+#   MVTEC_BACKBONE=segformer_mit_b3 ONLY=mvtec ./submit_all_streaming.sh
+#       run the mvtec job on a different backbone (default wideresnet50).
+#       segformer needs `transformers` installed in the patchcore env and
+#       nvidia/mit-b3 in the HF cache (./download_hf_backbones.sh, login node).
+#       New backbone = new cache tag: step 1 re-caches all 15 classes first.
 #
 # CLASSNAMES is passed via the environment (--export=ALL): sbatch's
 # --export=NAME=VALUE parsing splits on commas and would mangle a list value.
@@ -51,7 +56,7 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     # PPO_LR 1e-5 -> 1e-6 (2026-08-02 full run): training improves monotonically
     # on ~all classes and PPO tops its own proxy on ~12/15 — the sweep's 1e-4
     # was still too hot for tiny streams (iter-3 best-restores on half of them).
-    BACKBONE=wideresnet50 \
+    BACKBONE="${MVTEC_BACKBONE:-wideresnet50}" \
     DATA_PATH="${DATASET_ROOT}/mvtec" \
     WARMUP="${WARMUP:-15}" \
     PPO_STEPS="${PPO_STEPS:-50000}" \

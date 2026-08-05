@@ -163,9 +163,12 @@ DRIFT_MODE=${DRIFT_MODE:-synthetic}            # synthetic | real (metadata-orde
 SEED=${SEED:-0}
 
 # Feature-extraction config per backbone (stock configs from train_mvtec.sh /
-# train_polyp_pvt_hyperkvasir.sh):
+# train_polyp_pvt_hyperkvasir.sh / train_segformer_mvtec.sh):
 #   wideresnet50       : layer2+layer3, patchsize 3  (IM224_WR50_L2-3_PS-3)
 #   polyp-pvt/pvtv2_b2 : norm2+norm3 (stride/8+/16), patchsize 6
+#   segformer_mit_b3   : stages.1+stages.2 (stride/8+/16), patchsize 6;
+#                        needs `transformers` in the env + mit-b3 in the HF
+#                        cache (download_hf_backbones.sh on a login node)
 case "${BACKBONE}" in
     wideresnet50)
         LAYERS=(-le layer2 -le layer3)
@@ -175,8 +178,12 @@ case "${BACKBONE}" in
         LAYERS=(-le norm2 -le norm3)
         PATCHSIZE=${PATCHSIZE:-6}
         ;;
+    segformer_mit_b3)
+        LAYERS=(-le stages.1 -le stages.2)
+        PATCHSIZE=${PATCHSIZE:-6}
+        ;;
     *)
-        echo "FATAL: unknown BACKBONE='${BACKBONE}' (expected wideresnet50 | polyp-pvt | pvtv2_b2)"
+        echo "FATAL: unknown BACKBONE='${BACKBONE}' (expected wideresnet50 | polyp-pvt | pvtv2_b2 | segformer_mit_b3)"
         exit 1
         ;;
 esac
@@ -209,7 +216,15 @@ ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, cri
 CLIP_MODE=${CLIP_MODE:-gppo}                   # clip | gppo (gradient-preserving)
 CLIP_HIGH=${CLIP_HIGH:-}                       # optional decoupled upper epsilon
 REWARD_FORM=${REWARD_FORM:-level}              # level | delta (potential-based shaping)
-FORGET_WEIGHT=${FORGET_WEIGHT:-0.5}            # reward-fit target: drifted AUROC + w*forgetting
+# Reward-fit ranking target:
+#   DRIFTED_WEIGHT*mean(stage>=1 AUROC) + FORGET_WEIGHT*forgetting
+#   + STAGE0_WEIGHT*stage-0 AUROC
+# Defaults reproduce the historical target, which EXCLUDES stage 0 — set
+# STAGE0_WEIGHT (and zero the others) to fit weights for the stage-0-vs-stock
+# comparison instead. Re-targeting reuses saved traces: seconds, no re-record.
+FORGET_WEIGHT=${FORGET_WEIGHT:-0.5}
+DRIFTED_WEIGHT=${DRIFTED_WEIGHT:-1.0}
+STAGE0_WEIGHT=${STAGE0_WEIGHT:-0.0}
 MIN_RHO=${MIN_RHO:-0.7}                        # reward fit fails below this Spearman rho
 TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
@@ -344,8 +359,8 @@ PYEOF
     elif [ "${ITERATE}" = "1" ]; then
         echo "[${CLASSNAME}] ITERATE=1 but no checkpoint at ${PPO_OUT} — plain fit"
     fi
-    echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (forget_weight=${FORGET_WEIGHT}) ..."
-    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} ${PPO_ITER_ARG} --out "${RESULT_DIR}/reward_weights.json"
+    echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (target: ${DRIFTED_WEIGHT}*drifted + ${FORGET_WEIGHT}*forgetting + ${STAGE0_WEIGHT}*stage0) ..."
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --drifted_weight "${DRIFTED_WEIGHT}" --stage0_weight "${STAGE0_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} ${PPO_ITER_ARG} --out "${RESULT_DIR}/reward_weights.json"
     echo "${WARMUP}:${CAPACITY}" > "${RESULT_DIR}/reward_traces.cfg"
    
 

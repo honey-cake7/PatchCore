@@ -4,7 +4,8 @@ Runs each baseline policy over the stream once, recording per-step reward
 components and labeled per-stage AUROC, then grid-searches
 (beta, gamma, churn_coef, churn_budget) offline for the weighting whose mean
 episode reward best Spearman-ranks the policies by
-``mean(drifted-stage AUROC) + forget_weight * forgetting AUROC``.
+``drifted_weight * mean(drifted-stage AUROC) + forget_weight * forgetting
+AUROC + stage0_weight * stage-0 AUROC``.
 Writes ``reward_weights.json``, consumed by train_ppo.py /
 run_streaming_baseline.py via ``--reward_json``.
 """
@@ -55,6 +56,15 @@ def _load_readers(cache_dir, synthetic):
 @click.option("--seeds", default="0,1")
 @click.option("--forget_weight", type=float, default=0.5,
               help="Weight of the stage-0 forgetting AUROC in the ranking target")
+@click.option("--drifted_weight", type=float, default=1.0,
+              help="Weight of the mean drifted-stage (stage>=1) AUROC in the target")
+@click.option("--stage0_weight", type=float, default=0.0,
+              help="Weight of the stage-0 AUROC in the target. The default "
+                   "target excludes stage 0, so weights fitted under it do not "
+                   "optimize the stage-0-vs-stock comparison. Stage-0 AUROC is "
+                   "already in every trace: re-target with --traces_in in "
+                   "seconds, no re-recording. Stage-0 only: "
+                   "--stage0_weight 1 --drifted_weight 0 --forget_weight 0")
 @click.option("--min_rho", type=float, default=0.7,
               help="Exit non-zero if the best candidate's Spearman rho is below this")
 @click.option("--traces_out", default=None,
@@ -68,7 +78,8 @@ def _load_readers(cache_dir, synthetic):
                    "never visited). Needs --cache_dir/--synthetic for readers.")
 @click.option("--out", default="reward_weights.json")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
-         forget_weight, min_rho, traces_out, traces_in, ppo_pt, out):
+         forget_weight, drifted_weight, stage0_weight, min_rho, traces_out,
+         traces_in, ppo_pt, out):
     import pickle
 
     from patchcore.streaming.bank import device_banner
@@ -114,11 +125,16 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
             pickle.dump(traces, f)
         print(f"saved {len(traces)} traces -> {traces_out} "
               "(refit later with --traces_in)")
-    result = fit_reward_weights(traces, forget_weight=forget_weight)
+    result = fit_reward_weights(
+        traces, forget_weight=forget_weight,
+        drifted_weight=drifted_weight, stage0_weight=stage0_weight,
+    )
 
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
     print(f"\nwrote {out}")
+    print(f"target: {drifted_weight}*drifted + {forget_weight}*forgetting "
+          f"+ {stage0_weight}*stage0")
     print(f"recommended weights : {result['recommended']}")
     print(f"rho_ranking (fitted): {result['rho_ranking']:.3f}")
     print(f"rho_ranking (current weights): {result['rho_ranking_current_weights']:.3f}")

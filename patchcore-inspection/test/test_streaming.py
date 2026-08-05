@@ -349,3 +349,61 @@ def test_ppo_collect_update_runs(small_stream):
     assert batch["obs"].shape[1] == OBS_DIM
     assert np.isfinite(batch["ret"]).all()
     trainer.update(batch)  # should not raise
+
+
+# ---- reward-weight fit target --------------------------------------------
+def _fake_traces():
+    """Two traces with hand-set component means and labeled AUROCs."""
+    def tr(policy, c, stage_aurocs, forget):
+        n = 8
+        return {
+            "policy": policy, "seed": 0,
+            "C": np.full(n, c), "R": np.full(n, 0.1),
+            "churn": np.full(n, 0.02), "score_drift": np.full(n, 0.01),
+            "C90": np.full(n, 2 * c), "P": np.full(n, c),
+            "stage": np.zeros(n, dtype=np.int64),
+            "stage_aurocs": stage_aurocs, "forget_auroc": forget,
+        }
+    return [
+        tr("a", 0.5, {0: 0.90, 1: 0.80, 2: 0.70}, 0.60),
+        tr("b", 0.4, {0: 0.70, 1: 0.85, 2: 0.75}, 0.95),
+    ]
+
+
+def _targets_of(result, traces):
+    return [result["targets"][f"{t['policy']}:{t['seed']}"] for t in traces]
+
+
+def test_fit_target_defaults_match_historical_formula():
+    from patchcore.streaming.experiments import fit_reward_weights
+
+    traces = _fake_traces()
+    res = fit_reward_weights(traces)
+    expected = [np.mean([0.80, 0.70]) + 0.5 * 0.60,
+                np.mean([0.85, 0.75]) + 0.5 * 0.95]
+    assert _targets_of(res, traces) == pytest.approx(expected)
+    assert res["drifted_weight"] == 1.0 and res["stage0_weight"] == 0.0
+
+
+def test_fit_target_stage0_only():
+    from patchcore.streaming.experiments import fit_reward_weights
+
+    traces = _fake_traces()
+    res = fit_reward_weights(traces, drifted_weight=0.0, forget_weight=0.0,
+                             stage0_weight=1.0)
+    assert _targets_of(res, traces) == pytest.approx([0.90, 0.70])
+    # stage 0 ranks the traces opposite to the default target -> the fitted
+    # weights must differ; this is the whole point of the knob
+    assert res["stage0_weight"] == 1.0
+    assert not res["traces_without_stage0"]
+
+
+def test_fit_target_handles_missing_stage0():
+    from patchcore.streaming.experiments import fit_reward_weights
+
+    traces = _fake_traces()
+    del traces[0]["stage_aurocs"][0]  # toothbrush case: warmup swallowed stage 0
+    res = fit_reward_weights(traces, drifted_weight=0.0, forget_weight=0.0,
+                             stage0_weight=1.0)
+    assert _targets_of(res, traces) == pytest.approx([0.0, 0.70])
+    assert res["traces_without_stage0"] == ["a:0"]

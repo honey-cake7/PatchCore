@@ -291,25 +291,48 @@ def fit_reward_weights(
     probe_coefs=(0.0, 0.25, 0.5, 1.0, 2.0, 4.0),
     q_coefs=(0.0, 1.0, 2.0, 4.0, 8.0),
     forget_weight: float = 0.5,
+    drifted_weight: float = 1.0,
+    stage0_weight: float = 0.0,
 ) -> Dict:
     """Grid-fit reward weights so mean episode reward ranks policies like AUROC.
 
-    Target per trace: mean drifted-stage (stage>=1) image AUROC plus
-    ``forget_weight`` times the stage-0 forgetting AUROC — the two quantities
-    the learned policy is meant to maximize. Reports the Spearman rho of the
-    best candidate and of the current production ``RewardConfig`` defaults
-    (the misalignment baseline), plus the top-5 candidates so a flat optimum
-    (many near-ties) is visible.
+    Target per trace is a weighted sum of three labeled quantities:
+    ``drifted_weight`` * mean drifted-stage (stage>=1) image AUROC,
+    ``forget_weight`` * the stage-0 forgetting AUROC, and ``stage0_weight`` *
+    the stage-0 image AUROC. The defaults reproduce the original target
+    (drifted + 0.5*forgetting); ``stage0_weight`` exists because that target
+    excludes stage 0 entirely, so weights fitted under it optimize something
+    the stage-0-only comparison against stock PatchCore never measures. Stage-0
+    AUROC is already recorded in every trace, so re-targeting is a seconds-long
+    offline refit (``--traces_in``) — no re-recording.
+
+    Reports the Spearman rho of the best candidate and of the current
+    production ``RewardConfig`` defaults (the misalignment baseline), plus the
+    top-5 candidates so a flat optimum (many near-ties) is visible.
     """
     from scipy import stats
 
     from patchcore.streaming.reward import RewardConfig
 
     targets = []
+    no_stage0 = []
     mean_c, mean_r, mean_sd, mean_c90, mean_p, mean_q = [], [], [], [], [], []
     for tr in traces:
         drifted = [v for s, v in tr["stage_aurocs"].items() if s >= 1]
-        targets.append(float(np.mean(drifted)) + forget_weight * tr["forget_auroc"])
+        target = 0.0
+        if drifted:
+            target += drifted_weight * float(np.mean(drifted))
+        target += forget_weight * float(tr["forget_auroc"])
+        if stage0_weight:
+            # streams whose warmup swallows stage 0 (e.g. toothbrush: 60 images,
+            # 4 stages) have no stage-0 eval — drop the term for them rather
+            # than KeyError, but say so: their fit is not stage-0-targeted.
+            stage0 = tr["stage_aurocs"].get(0)
+            if stage0 is None:
+                no_stage0.append(f"{tr['policy']}:{tr['seed']}")
+            else:
+                target += stage0_weight * float(stage0)
+        targets.append(target)
         mean_c.append(tr["C"].mean())
         mean_r.append(tr["R"].mean())
         mean_sd.append(tr["score_drift"].mean())
@@ -321,6 +344,11 @@ def fit_reward_weights(
             float(np.mean(tr["C90"] / np.maximum(tr["C"], 1e-8)))
             if "C90" in tr else 0.0
         )
+    if no_stage0:
+        print(f"[fit] WARNING: stage0_weight={stage0_weight} but "
+              f"{len(no_stage0)}/{len(traces)} traces have no stage-0 eval "
+              f"({', '.join(no_stage0[:4])}{' ...' if len(no_stage0) > 4 else ''})"
+              " — target excludes the stage-0 term for those")
     targets = np.asarray(targets)
     mean_c = np.asarray(mean_c)
     mean_r = np.asarray(mean_r)
@@ -380,6 +408,9 @@ def fit_reward_weights(
         "top_candidates": candidates[:5],
         "current_weights": {k: getattr(cur, k) for k in weight_keys},
         "forget_weight": float(forget_weight),
+        "drifted_weight": float(drifted_weight),
+        "stage0_weight": float(stage0_weight),
+        "traces_without_stage0": no_stage0,
         "n_traces": len(traces),
         "trace_policies": [f"{t['policy']}:{t['seed']}" for t in traces],
         "targets": {f"{t['policy']}:{t['seed']}": float(v)
