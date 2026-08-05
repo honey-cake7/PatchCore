@@ -62,7 +62,7 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     PPO_STEPS="${PPO_STEPS:-50000}" \
     PPO_LR="${PPO_LR:-1e-5}" \
     PPO_LR_END="${PPO_LR_END:-1e-6}" \
-    CLASSNAMES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper" \
+    CLASSNAMES="${CLASSNAMES:-bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper}" \
     sbatch --job-name=stream-mvtec \
         --output="../logs/streaming_output_%j.log" \
         --error="../logs/streaming_error_%j.log" \

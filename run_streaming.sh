@@ -205,6 +205,12 @@ CAPACITY_PCT=${CAPACITY_PCT:-10}               # percent, decimals allowed (e.g.
 [ "${CAPACITY_MODE}" = "match10" ] && { CAPACITY_MODE=match; CAPACITY_PCT=10; }
 RESULT_SUFFIX=""
 [ "${CAPACITY_MODE}" = "match" ] && RESULT_SUFFIX="_m${CAPACITY_PCT}"
+# Extra suffix for running a VARIANT at the same capacity (e.g. a different
+# reward-fit target) without overwriting an existing run's weights,
+# checkpoints, results.csv and summary. Reward traces live in RESULT_DIR too,
+# so a fresh tag re-records them unless you copy the old pkl+cfg across first.
+RESULT_TAG=${RESULT_TAG:-}
+RESULT_SUFFIX="${RESULT_SUFFIX}${RESULT_TAG}"
 WARMUP=${WARMUP:-100}                          # warmup images for stage-0 bank + reward scales
 N_NN=${N_NN:-5}                                # k for k-NN scoring (matches train_polyp_pvt.sh)
 PPO_STEPS=${PPO_STEPS:-100000}
@@ -226,6 +232,11 @@ FORGET_WEIGHT=${FORGET_WEIGHT:-0.5}
 DRIFTED_WEIGHT=${DRIFTED_WEIGHT:-1.0}
 STAGE0_WEIGHT=${STAGE0_WEIGHT:-0.0}
 MIN_RHO=${MIN_RHO:-0.7}                        # reward fit fails below this Spearman rho
+# Permutation null: refit the same grid against N shuffled targets and log the
+# p-value, so every class's fit carries a significance stamp. The grid reaches
+# rho ~0.8 on shuffled targets with ~12 traces, so MIN_RHO=0.7 alone cannot
+# tell a real fit from noise. Costs seconds; 0 disables.
+PERMUTE=${PERMUTE:-0}
 TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
 POLICIES=${POLICIES:-static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo}
@@ -360,7 +371,7 @@ PYEOF
         echo "[${CLASSNAME}] ITERATE=1 but no checkpoint at ${PPO_OUT} — plain fit"
     fi
     echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (target: ${DRIFTED_WEIGHT}*drifted + ${FORGET_WEIGHT}*forgetting + ${STAGE0_WEIGHT}*stage0) ..."
-    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --drifted_weight "${DRIFTED_WEIGHT}" --stage0_weight "${STAGE0_WEIGHT}" --min_rho "${MIN_RHO}" ${TRACES_ARG} ${PPO_ITER_ARG} --out "${RESULT_DIR}/reward_weights.json"
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --drifted_weight "${DRIFTED_WEIGHT}" --stage0_weight "${STAGE0_WEIGHT}" --min_rho "${MIN_RHO}" --permute "${PERMUTE}" ${TRACES_ARG} ${PPO_ITER_ARG} --out "${RESULT_DIR}/reward_weights.json"
     echo "${WARMUP}:${CAPACITY}" > "${RESULT_DIR}/reward_traces.cfg"
    
 
