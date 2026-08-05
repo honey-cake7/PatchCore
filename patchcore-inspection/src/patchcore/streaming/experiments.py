@@ -342,20 +342,32 @@ def permutation_null(
                                     rows.append(-(b4 + qc * m["q"]))
     P = np.asarray(rows)
 
-    # Spearman == Pearson on ranks; drop degenerate (constant) candidates
-    ranks = np.argsort(np.argsort(P, axis=1), axis=1).astype(np.float64)
+    # Spearman == Pearson on ranks, but only with TIE-AVERAGED ranks — targets
+    # routinely tie (a class whose stage-0 AUROC saturates at 1.0 for every
+    # policy; seeds of one policy scoring identically), and ordinal ranking
+    # would silently disagree with scipy's spearmanr.
+    from scipy import stats
+
+    try:
+        ranks = np.asarray(stats.rankdata(P, axis=1), dtype=np.float64)
+    except TypeError:  # scipy < 1.10: rankdata has no axis argument
+        ranks = np.vstack([stats.rankdata(row) for row in P])
     ranks -= ranks.mean(axis=1, keepdims=True)
     norms = np.linalg.norm(ranks, axis=1)
     keep = norms > 1e-12
     ranks, norms = ranks[keep], norms[keep]
 
     def best_rho(t):
-        tr_ = np.argsort(np.argsort(t)).astype(np.float64)
+        # signed max, matching fit_reward_weights: it selects the highest rho,
+        # not the largest |rho| (a strongly anti-correlated candidate is never
+        # chosen). Using abs here would inflate both the observed value and the
+        # null, and would stop `observed` from reproducing the fitted rho.
+        tr_ = np.asarray(stats.rankdata(t), dtype=np.float64)
         tr_ -= tr_.mean()
         tn = np.linalg.norm(tr_)
         if tn < 1e-12:
             return float("nan")
-        return float(np.max(np.abs(ranks @ tr_) / (norms * tn)))
+        return float(np.max((ranks @ tr_) / (norms * tn)))
 
     observed = best_rho(np.asarray(targets, dtype=np.float64))
     null = np.asarray([best_rho(rng.permutation(targets))

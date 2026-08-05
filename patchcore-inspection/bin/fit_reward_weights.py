@@ -72,6 +72,11 @@ def _load_readers(cache_dir, synthetic):
                    "distribution of the BEST rho. The fitted rho is in-sample "
                    "(~162k candidates, ~12 points, no held-out split), so it "
                    "only means something if it clears this null. Try 200.")
+@click.option("--max_p", type=float, default=None,
+              help="With --permute: fail if the permutation p-value exceeds "
+                   "this. A null-calibrated gate — unlike --min_rho, whose "
+                   "0.7 threshold can sit BELOW the rho this grid reaches on "
+                   "shuffled targets. Try 0.05.")
 @click.option("--traces_out", default=None,
               help="Pickle recorded traces here (default: <out dir>/reward_traces.pkl)")
 @click.option("--traces_in", default=None,
@@ -83,7 +88,7 @@ def _load_readers(cache_dir, synthetic):
                    "never visited). Needs --cache_dir/--synthetic for readers.")
 @click.option("--out", default="reward_weights.json")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
-         forget_weight, drifted_weight, stage0_weight, min_rho, permute,
+         forget_weight, drifted_weight, stage0_weight, min_rho, permute, max_p,
          traces_out, traces_in, ppo_pt, out):
     import pickle
 
@@ -150,6 +155,10 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
               f"{null['null_p95']:.3f} / {null['null_max']:.3f}")
         print(f"  p-value           : {null['p_value']:.3f}  "
               f"({null['n_candidates']} candidates, {null['n_traces']} traces)")
+        if abs(null["observed_best_rho"] - result["rho_ranking"]) > 5e-3:
+            print(f"  WARNING: observed {null['observed_best_rho']:.3f} != "
+                  f"fitted {result['rho_ranking']:.3f} — the null is searching "
+                  "a different grid than the fit did; do not trust the p-value.")
         if null["p_value"] > 0.05:
             print("  WARNING: this grid reaches a comparable rho on SHUFFLED "
                   "targets — the fit is not distinguishable from noise.")
@@ -168,6 +177,17 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
               "proxy cannot rank policies like AUROC; do not retrain on it.")
         sys.exit(2)
     print(f"PASS: fitted rho >= {min_rho}")
+
+    if max_p is not None:
+        if not permute:
+            raise click.UsageError("--max_p requires --permute N")
+        p = result["permutation_null"]["p_value"]
+        if p > max_p:
+            print(f"FAIL: permutation p={p:.3f} > max_p {max_p} — this grid "
+                  "reaches the same rho on shuffled targets, so the fit "
+                  "carries no evidence of real structure; do not retrain on it.")
+            sys.exit(3)
+        print(f"PASS: permutation p={p:.3f} <= {max_p}")
 
 
 if __name__ == "__main__":
