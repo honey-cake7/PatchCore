@@ -92,8 +92,9 @@ def main(result_dirs, glob_pat):
         raise click.UsageError("pass result dirs or --glob")
 
     print(f"{'class':34s} {'n':>3s} {'rho_fit':>8s} {'logged':>8s} "
-          f"{'rho_stage0':>11s} {'rho_t_s0':>9s}")
+          f"{'rho_stage0':>11s} {'rho_t_s0':>9s} {'s0_spread':>10s}  note")
     rows = []
+    n_missing = n_constant = 0
     for d in dirs:
         pkl = os.path.join(d, "reward_traces.pkl")
         wj = os.path.join(d, "reward_weights.json")
@@ -119,16 +120,32 @@ def main(result_dirs, glob_pat):
 
         rho_fit = float(stats.spearmanr(proxy, fit_t).correlation)
         logged = float(res.get("rho_ranking", float("nan")))
+        note = ""
         if s0 is None:
+            # warmup swallowed stage 0 (toothbrush) — nothing to correlate
+            rho_s0 = rho_ts0 = spread = float("nan")
+            note = "no stage-0 eval"
+            n_missing += 1
+        elif float(np.ptp(s0)) < 1e-9:
+            # every policy scores identically at stage 0 (saturated at ~1.0):
+            # Spearman is undefined, but so is the question — there is no
+            # stage-0 ranking for any reward to get right or wrong here.
             rho_s0 = rho_ts0 = float("nan")
+            spread = 0.0
+            note = f"stage-0 constant at {s0[0]:.3f}"
+            n_constant += 1
         else:
             rho_s0 = float(stats.spearmanr(proxy, s0).correlation)
             rho_ts0 = float(stats.spearmanr(fit_t, s0).correlation)
+            spread = float(np.ptp(s0))
+            if spread < 0.02:
+                note = "near-saturated (rho is noise-dominated)"
 
         name = os.path.basename(os.path.normpath(d))
-        flag = "" if abs(rho_fit - logged) < 5e-3 else "  <- self-check MISMATCH"
+        if abs(rho_fit - logged) >= 5e-3:
+            note = "SELF-CHECK MISMATCH; " + note
         print(f"{name[:34]:34s} {len(traces):3d} {rho_fit:8.3f} {logged:8.3f} "
-              f"{rho_s0:11.3f} {rho_ts0:9.3f}{flag}")
+              f"{rho_s0:11.3f} {rho_ts0:9.3f} {spread:10.3f}  {note}")
         rows.append((rho_fit, logged, rho_s0, rho_ts0))
 
     if rows:
@@ -137,9 +154,13 @@ def main(result_dirs, glob_pat):
             print(f"{'MEAN':34s} {len(rows):3d} {np.nanmean(arr[:, 0]):8.3f} "
                   f"{np.nanmean(arr[:, 1]):8.3f} {np.nanmean(arr[:, 2]):11.3f} "
                   f"{np.nanmean(arr[:, 3]):9.3f}")
-        n_nan = int(np.isnan(arr[:, 2]).sum())
-        if n_nan:
-            print(f"({n_nan} class(es) have no stage-0 eval — nan above)")
+        if n_missing:
+            print(f"({n_missing} class(es) have no stage-0 eval — warmup "
+                  "swallowed stage 0)")
+        if n_constant:
+            print(f"({n_constant} class(es) have a CONSTANT stage-0 AUROC — "
+                  "every policy ties, so there is no stage-0 ranking to fit; "
+                  "this is saturation, not misalignment)")
 
 
 if __name__ == "__main__":

@@ -280,6 +280,98 @@ def record_ppo_traces(
     return traces
 
 
+def _component_means(traces: List[Dict]) -> Dict[str, np.ndarray]:
+    """Per-trace mean of each stored reward component (+ the derived Q)."""
+    out = {k: [] for k in ("c", "r", "sd", "c90", "p", "q")}
+    for tr in traces:
+        out["c"].append(tr["C"].mean())
+        out["r"].append(tr["R"].mean())
+        out["sd"].append(tr["score_drift"].mean())
+        out["c90"].append(tr["C90"].mean() if "C90" in tr else 0.0)
+        out["p"].append(tr["P"].mean() if "P" in tr else 0.0)
+        out["q"].append(float(np.mean(tr["C90"] / np.maximum(tr["C"], 1e-8)))
+                        if "C90" in tr else 0.0)
+    return {k: np.asarray(v) for k, v in out.items()}
+
+
+def permutation_null(
+    traces: List[Dict],
+    targets: np.ndarray,
+    n_permutations: int = 200,
+    seed: int = 0,
+    alphas=(0.0, 0.25, 1.0),
+    betas=(0.0, 0.15, 0.3, 0.6, 1.0),
+    gammas=(0.0, 0.1, 0.3),
+    churn_coefs=(0.0, 0.25, 0.5, 1.0, 2.0, 4.0),
+    churn_budgets=(0.0, 0.005, 0.01, 0.02),
+    c90_coefs=(0.0, 0.25, 0.5, 1.0, 2.0),
+    probe_coefs=(0.0, 0.25, 0.5, 1.0, 2.0, 4.0),
+    q_coefs=(0.0, 1.0, 2.0, 4.0, 8.0),
+) -> Dict:
+    """How high a fitted rho does this grid reach on *shuffled* targets?
+
+    ``fit_reward_weights`` maximizes Spearman rho over ~162k candidates against
+    ~12 trace points with no held-out split, so the reported rho is in-sample:
+    a large grid can rank noise. This refits the same grid against permuted
+    targets to get the null distribution of the *best* rho. The observed fit is
+    only evidence of real structure if it clears that null.
+
+    Grids must mirror ``fit_reward_weights``'s defaults, or the null describes
+    a different search than the one that produced the number being tested.
+    """
+    rng = np.random.default_rng(seed)
+    m = _component_means(traces)
+    excess = {b: np.asarray([np.maximum(tr["churn"] - b, 0.0).mean()
+                             for tr in traces]) for b in churn_budgets}
+
+    # every candidate's per-trace proxy, as one [n_candidates, n_traces] matrix
+    rows = []
+    for budget in churn_budgets:
+        ex = excess[budget]
+        for alpha in alphas:
+            for beta in betas:
+                for gamma in gammas:
+                    base = alpha * m["c"] + beta * m["r"] + gamma * m["sd"]
+                    for coef in churn_coefs:
+                        b2 = base + coef * ex
+                        for c90c in c90_coefs:
+                            b3 = b2 + c90c * m["c90"]
+                            for probec in probe_coefs:
+                                b4 = b3 + probec * m["p"]
+                                for qc in q_coefs:
+                                    rows.append(-(b4 + qc * m["q"]))
+    P = np.asarray(rows)
+
+    # Spearman == Pearson on ranks; drop degenerate (constant) candidates
+    ranks = np.argsort(np.argsort(P, axis=1), axis=1).astype(np.float64)
+    ranks -= ranks.mean(axis=1, keepdims=True)
+    norms = np.linalg.norm(ranks, axis=1)
+    keep = norms > 1e-12
+    ranks, norms = ranks[keep], norms[keep]
+
+    def best_rho(t):
+        tr_ = np.argsort(np.argsort(t)).astype(np.float64)
+        tr_ -= tr_.mean()
+        tn = np.linalg.norm(tr_)
+        if tn < 1e-12:
+            return float("nan")
+        return float(np.max(np.abs(ranks @ tr_) / (norms * tn)))
+
+    observed = best_rho(np.asarray(targets, dtype=np.float64))
+    null = np.asarray([best_rho(rng.permutation(targets))
+                       for _ in range(n_permutations)])
+    return {
+        "observed_best_rho": observed,
+        "null_mean": float(np.nanmean(null)),
+        "null_p95": float(np.nanpercentile(null, 95)),
+        "null_max": float(np.nanmax(null)),
+        "p_value": float(np.mean(null >= observed)),
+        "n_candidates": int(keep.sum()),
+        "n_traces": len(traces),
+        "n_permutations": int(n_permutations),
+    }
+
+
 def fit_reward_weights(
     traces: List[Dict],
     alphas=(0.0, 0.25, 1.0),

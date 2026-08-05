@@ -67,6 +67,11 @@ def _load_readers(cache_dir, synthetic):
                    "--stage0_weight 1 --drifted_weight 0 --forget_weight 0")
 @click.option("--min_rho", type=float, default=0.7,
               help="Exit non-zero if the best candidate's Spearman rho is below this")
+@click.option("--permute", type=int, default=0,
+              help="Refit the grid against N shuffled targets to get the null "
+                   "distribution of the BEST rho. The fitted rho is in-sample "
+                   "(~162k candidates, ~12 points, no held-out split), so it "
+                   "only means something if it clears this null. Try 200.")
 @click.option("--traces_out", default=None,
               help="Pickle recorded traces here (default: <out dir>/reward_traces.pkl)")
 @click.option("--traces_in", default=None,
@@ -78,8 +83,8 @@ def _load_readers(cache_dir, synthetic):
                    "never visited). Needs --cache_dir/--synthetic for readers.")
 @click.option("--out", default="reward_weights.json")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
-         forget_weight, drifted_weight, stage0_weight, min_rho, traces_out,
-         traces_in, ppo_pt, out):
+         forget_weight, drifted_weight, stage0_weight, min_rho, permute,
+         traces_out, traces_in, ppo_pt, out):
     import pickle
 
     from patchcore.streaming.bank import device_banner
@@ -129,6 +134,25 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
         traces, forget_weight=forget_weight,
         drifted_weight=drifted_weight, stage0_weight=stage0_weight,
     )
+
+    if permute:
+        import numpy as np
+
+        from patchcore.streaming.experiments import permutation_null
+
+        targets = np.asarray([result["targets"][f"{t['policy']}:{t['seed']}"]
+                              for t in traces])
+        print(f"\nrunning permutation null ({permute} shuffles) ...")
+        null = permutation_null(traces, targets, n_permutations=permute)
+        result["permutation_null"] = null
+        print(f"  observed best rho : {null['observed_best_rho']:.3f}")
+        print(f"  null mean / p95 / max: {null['null_mean']:.3f} / "
+              f"{null['null_p95']:.3f} / {null['null_max']:.3f}")
+        print(f"  p-value           : {null['p_value']:.3f}  "
+              f"({null['n_candidates']} candidates, {null['n_traces']} traces)")
+        if null["p_value"] > 0.05:
+            print("  WARNING: this grid reaches a comparable rho on SHUFFLED "
+                  "targets — the fit is not distinguishable from noise.")
 
     with open(out, "w") as f:
         json.dump(result, f, indent=2)
