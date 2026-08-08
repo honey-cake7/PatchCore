@@ -35,6 +35,9 @@
 
 DATASET_ROOT=${DATASET_ROOT:-/home/user1/aniket/Patchcore/dataset}
 ONLY=${ONLY:-all}
+# Shared cluster: always shards, never a whole GPU. Adjust the count here
+# (e.g. GRES=shard:12) rather than editing run_streaming.sh's SBATCH header.
+GRES=${GRES:-shard:6}
 
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "hyperkvasir" ]; then
     echo "Submitting HyperKvasir (polyp-pvt) ..."
@@ -44,6 +47,7 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "hyperkvasir" ]; then
     sbatch --job-name=stream-hyperkvasir \
         --output="../logs/streaming_output_%j.log" \
         --error="../logs/streaming_error_%j.log" \
+        --gres="${GRES}" \
         --export=ALL --mem=12G run_streaming.sh
 fi
 
@@ -66,6 +70,7 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     sbatch --job-name=stream-mvtec \
         --output="../logs/streaming_output_%j.log" \
         --error="../logs/streaming_error_%j.log" \
+        --gres="${GRES}" \
         --export=ALL run_streaming.sh
 fi
 

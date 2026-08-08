@@ -2,28 +2,17 @@
 #SBATCH --job-name=streaming-rl
 #SBATCH --partition=LocalQ
 #SBATCH --account=default
+# Shards, never a whole GPU — this cluster is shared. Shard allocation is
+# occasionally flaky here (job 1173: CUDA error 101 under shard:40; job 1294:
+# nvidia-smi found no devices at all), and both times the same request
+# succeeded on a later submission. Override the count without editing this
+# header via `GRES=shard:12 ./submit_all_streaming.sh` — sbatch's command-line
+# --gres wins over #SBATCH.
 #SBATCH --gres=shard:6
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=32
 #SBATCH --output=../logs/streaming_output_%j.log
 #SBATCH --error=../logs/streaming_error_%j.log
-# ──────────────────────────────────────────────────────────────────────
-# run_streaming.sh — dataset/backbone-agnostic streaming RL pipeline.
-# Generalization of run_streaming_polyp_pvt.sh: pass BACKBONE, DATA_PATH and
-# CLASSNAME; layers/patchsize are selected per backbone. Steps:
-#   1. cache patch embeddings over a drift-ordered normal stream + per-stage tests
-#      (skipped automatically when the cache already exists; RECACHE=1 to redo)
-#   2. Gate 1  — headroom  (does drift hurt a static bank?)
-#   3. Gate 2  — proxy validation (does the label-free reward track AUROC?)
-#   3.5 fit proxy-reward weights offline
-#   4. train the PPO/GPPO maintenance policy
-#   5. benchmark all policies (baselines + PPO), writing per-stage AUROC/PRO
-#
-# RL is only justified if BOTH gates pass. By default this STOPS if a gate or
-# the reward fit fails; pass FORCE=1 to run every step regardless.
-#   BACKBONE=wideresnet50 DATA_PATH=.../mvtec CLASSNAME=bottle sbatch run_streaming.sh
-#   BACKBONE=polyp-pvt DATA_PATH=.../hyperkvasir_patchcore CLASSNAME=hyperkvasir sbatch run_streaming.sh
-# ──────────────────────────────────────────────────────────────────────
 
 # Go to submission directory
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"
@@ -75,15 +64,29 @@ ALLOW_CPU=${ALLOW_CPU:-0}
 echo "CUDA_VISIBLE_DEVICES : ${CUDA_VISIBLE_DEVICES-<unset>}"
 echo "SLURM_JOB_GPUS       : ${SLURM_JOB_GPUS-<unset>}"
 echo "SLURM_STEP_GPUS      : ${SLURM_STEP_GPUS-<unset>}"
+# What SLURM actually handed us. A request can be accepted and still allocate
+# no gres (job 1294: TresPerNode=gres/shard:6 but AllocTRES had no gres), which
+# looks identical to a driver problem unless you print this.
+if command -v scontrol >/dev/null 2>&1 && [ -n "${SLURM_JOB_ID:-}" ]; then
+    echo "AllocTRES            : $(scontrol show job "${SLURM_JOB_ID}" 2>/dev/null \
+        | tr ' ' '\n' | grep -m1 '^AllocTRES=' || echo '<unknown>')"
+fi
 command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L || echo "nvidia-smi not found"
 
 cuda_probe() {
     python -c "import torch; torch.zeros(1).cuda(); print('CUDA probe OK:', torch.cuda.get_device_name(0))" 2>&1
 }
+# `nvidia-smi -L` exits 0 even when it prints "No devices found.", so testing
+# its exit status alone reports "GPUs visible to nvidia-smi" on a node that has
+# none — and sends you hunting a torch/CVD bug that isn't there. Require a real
+# "GPU <n>:" line.
+gpu_present() {
+    command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q '^GPU [0-9]'
+}
 if ! PROBE_OUT=$(cuda_probe); then
     echo "CUDA probe FAILED:"
     echo "${PROBE_OUT}"
-    if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    if gpu_present; then
         echo "*** GPUs are visible to nvidia-smi but not to torch."
         echo "*** Resetting CUDA_VISIBLE_DEVICES (was: '${CUDA_VISIBLE_DEVICES-<unset>}') -> 0 and re-probing."
         export CUDA_VISIBLE_DEVICES=0
@@ -100,7 +103,12 @@ if ! PROBE_OUT=$(cuda_probe); then
         fi
     else
         if [ "${ALLOW_CPU}" != "1" ]; then
-            echo "FATAL: no GPU on this node/allocation. Set ALLOW_CPU=1 to force a CPU run."
+            echo "FATAL: this allocation has NO GPU — nvidia-smi lists no devices."
+            echo "       Not a torch/CUDA_VISIBLE_DEVICES problem: the job did not"
+            echo "       get a device. Check 'squeue -u \$USER' for a job still"
+            echo "       holding the GPU, and 'sinfo -o \"%N %G %t\"' for node gres"
+            echo "       and state, then resubmit. ALLOW_CPU=1 forces a CPU run"
+            echo "       (unusably slow for this pipeline)."
             exit 1
         fi
         echo "ALLOW_CPU=1 set — continuing on CPU."
