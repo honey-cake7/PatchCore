@@ -44,6 +44,7 @@ echo "Starting Kvasir PatchCore training with Polyp-PVT (PVTv2-B2) backbone..."
 env PYTHONPATH=src python bin/run_patchcore.py \
   --gpu 0 \
   --seed 0 \
+  --save_segmentation_images \
   --save_patchcore_model \
   --log_group IM224_PolypPVT_norm23_P01 \
   --log_project Kvasir_Results \

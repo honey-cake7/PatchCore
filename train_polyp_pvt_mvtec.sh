@@ -44,6 +44,7 @@ dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '"${dataset}"; don
 env PYTHONPATH=src python bin/run_patchcore.py \
   --gpu 0 \
   --seed 0 \
+  --save_segmentation_images \
   --save_patchcore_model \
   --log_group IM224_PolypPVT_MVTec_norm23_P01 \
   --log_project MVTecAD_Results \
