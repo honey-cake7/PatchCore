@@ -164,6 +164,7 @@ def record_policy_traces(
     imagesize=None,
     policy_names: Optional[List[str]] = None,
     seeds: Optional[List[int]] = None,
+    stage0_only: bool = False,
 ) -> List[Dict]:
     """Drive each baseline policy over the stream, recording per-step reward
     components alongside labeled per-stage AUROC and final forgetting.
@@ -171,6 +172,15 @@ def record_policy_traces(
     One trace per (policy, seed). Because the proxy reward is linear in its
     components, any candidate weighting can later be scored on these traces
     offline (``fit_reward_weights``) — no policy re-runs per candidate.
+
+    ``stage0_only=True`` (opt-in, default off) skips the labeled evaluation
+    for drifted stages (1+) and the final stage-0 forgetting re-eval — the
+    paper reports stage-0 AUROC only. The stream itself is NOT shortened: the
+    policy still runs the full episode and still transitions through every
+    stage; only the (expensive) per-stage test-set scoring is pruned. Traces
+    produced this way have no ``forget_auroc`` key and ``stage_aurocs``
+    containing only stage 0 — ``fit_reward_weights`` raises if such traces are
+    combined with a non-zero ``forget_weight``/``drifted_weight``.
     """
     from patchcore.streaming import policies as P
     from patchcore.streaming.env import MemoryMaintenanceEnv
@@ -179,6 +189,8 @@ def record_policy_traces(
     seeds = seeds if seeds is not None else [0]
 
     def eval_fn(env, stage):
+        if stage0_only and stage != 0:
+            return {}
         return evaluate_bank_on_stage(
             env.bank, test_readers[stage], n_nearest_neighbours, patch_shape,
             imagesize,
@@ -194,15 +206,19 @@ def record_policy_traces(
             )
             policy = cls(k=8) if name in ("fifo", "random") else cls()
             summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
-            forget_m = evaluate_bank_on_stage(
-                env.bank, test_readers[0], n_nearest_neighbours, patch_shape,
-                imagesize,
-            )
+            forget_m = None
+            if not stage0_only:
+                forget_m = evaluate_bank_on_stage(
+                    env.bank, test_readers[0], n_nearest_neighbours, patch_shape,
+                    imagesize,
+                )
             traces.append(_trace_from_summary(name, seed, summ, forget_m))
     return traces
 
 
-def _trace_from_summary(name: str, seed: int, summ: Dict, forget_m: Dict) -> Dict:
+def _trace_from_summary(
+    name: str, seed: int, summ: Dict, forget_m: Optional[Dict]
+) -> Dict:
     infos = summ["infos"]
     trace = {
         "policy": name,
@@ -216,14 +232,19 @@ def _trace_from_summary(name: str, seed: int, summ: Dict, forget_m: Dict) -> Dic
         "C90": np.asarray([i["C90"] for i in infos], dtype=np.float64),
         "P": np.asarray([i["P"] for i in infos], dtype=np.float64),
         "stage": np.asarray([i["stage"] for i in infos], dtype=np.int64),
+        # entries without "image_auroc" are stage0_only skips (evaluate_bank_on_stage
+        # never ran for that stage transition) — excluded rather than KeyError'd.
         "stage_aurocs": {
-            int(ev["stage"]): float(ev["image_auroc"]) for ev in summ["evals"]
+            int(ev["stage"]): float(ev["image_auroc"])
+            for ev in summ["evals"] if "image_auroc" in ev
         },
-        "forget_auroc": float(forget_m["image_auroc"]),
     }
+    if forget_m is not None:
+        trace["forget_auroc"] = float(forget_m["image_auroc"])
+    forget_str = f"{trace['forget_auroc']:.3f}" if forget_m is not None else "skipped(stage0_only)"
     print(f"[trace] {name:26s} seed={seed} "
           f"aurocs={[round(v, 3) for _, v in sorted(trace['stage_aurocs'].items())]} "
-          f"forget={trace['forget_auroc']:.3f}")
+          f"forget={forget_str}")
     return trace
 
 
@@ -238,6 +259,7 @@ def record_ppo_traces(
     imagesize=None,
     seeds: Optional[List[int]] = None,
     name: str = "ppo_r1",
+    stage0_only: bool = False,
 ) -> List[Dict]:
     """Replay a trained PPO checkpoint over the stream, recording the same
     component traces as :func:`record_policy_traces`.
@@ -247,6 +269,9 @@ def record_ppo_traces(
     maximize the proxy in directions that fitting set never visited while its
     AUROC drops (reward hacking). Adding the trained policy's own trace points
     to the fit exposes those directions to the next round's weight search.
+
+    ``stage0_only`` — see :func:`record_policy_traces`; same opt-in pruning
+    of drifted-stage evaluation and the forgetting re-eval.
     """
     from patchcore.streaming import policies as P
     from patchcore.streaming.env import ActionConfig, MemoryMaintenanceEnv
@@ -257,6 +282,8 @@ def record_ppo_traces(
     action_mode = (meta or {}).get("action_mode", "continuous6")
 
     def eval_fn(env, stage):
+        if stage0_only and stage != 0:
+            return {}
         return evaluate_bank_on_stage(
             env.bank, test_readers[stage], n_nearest_neighbours, patch_shape,
             imagesize,
@@ -272,10 +299,12 @@ def record_ppo_traces(
             obs_norm=norm, action_cfg=ActionConfig(mode=action_mode),
         )
         summ = P.run_policy(env, P.PPOPolicy(ac), per_stage_eval=eval_fn)
-        forget_m = evaluate_bank_on_stage(
-            env.bank, test_readers[0], n_nearest_neighbours, patch_shape,
-            imagesize,
-        )
+        forget_m = None
+        if not stage0_only:
+            forget_m = evaluate_bank_on_stage(
+                env.bank, test_readers[0], n_nearest_neighbours, patch_shape,
+                imagesize,
+            )
         traces.append(_trace_from_summary(name, seed, summ, forget_m))
     return traces
 
@@ -413,10 +442,40 @@ def fit_reward_weights(
     Reports the Spearman rho of the best candidate and of the current
     production ``RewardConfig`` defaults (the misalignment baseline), plus the
     top-5 candidates so a flat optimum (many near-ties) is visible.
+
+    Traces recorded under ``stage0_only=True`` (see :func:`record_policy_traces`)
+    have no ``forget_auroc`` and no drifted-stage (stage>=1) entries in
+    ``stage_aurocs``. Combining such traces with a non-zero ``forget_weight``
+    or ``drifted_weight`` would silently target 0.0 for those terms rather
+    than the intended quantity, so both are checked up front and raise.
     """
     from scipy import stats
 
     from patchcore.streaming.reward import RewardConfig
+
+    if forget_weight:
+        missing_forget = [
+            f"{t['policy']}:{t['seed']}" for t in traces if "forget_auroc" not in t
+        ]
+        if missing_forget:
+            raise ValueError(
+                f"forget_weight={forget_weight} but {len(missing_forget)}/"
+                f"{len(traces)} traces have no forget_auroc — these look like "
+                "stage0_only traces (that mode skips the forgetting re-eval): "
+                f"{', '.join(missing_forget[:4])}"
+                f"{' ...' if len(missing_forget) > 4 else ''}. "
+                "Pass forget_weight=0 for stage0-only traces, or re-record "
+                "traces without stage0_only."
+            )
+    if drifted_weight and not any(
+        any(s >= 1 for s in tr["stage_aurocs"]) for tr in traces
+    ):
+        raise ValueError(
+            f"drifted_weight={drifted_weight} but no trace has any drifted-stage "
+            "(stage>=1) AUROC — these look like stage0_only traces (that mode "
+            "skips evaluation for stages 1+). Pass drifted_weight=0 for "
+            "stage0-only traces, or re-record traces without stage0_only."
+        )
 
     targets = []
     no_stage0 = []
@@ -426,7 +485,8 @@ def fit_reward_weights(
         target = 0.0
         if drifted:
             target += drifted_weight * float(np.mean(drifted))
-        target += forget_weight * float(tr["forget_auroc"])
+        if forget_weight:
+            target += forget_weight * float(tr["forget_auroc"])
         if stage0_weight:
             # streams whose warmup swallows stage 0 (e.g. toothbrush: 60 images,
             # 4 stages) have no stage-0 eval — drop the term for them rather
@@ -454,6 +514,22 @@ def fit_reward_weights(
               f"({', '.join(no_stage0[:4])}{' ...' if len(no_stage0) > 4 else ''})"
               " — target excludes the stage-0 term for those")
     targets = np.asarray(targets)
+    # A constant target makes every Spearman nan, every candidate gets filtered,
+    # and the "best" lookup dies with IndexError — leaving no JSON behind, which
+    # a caller that ignores the exit code will silently paper over by loading a
+    # STALE reward_weights.json from an earlier run. Fail with the cause named.
+    if len(targets) and float(np.ptp(targets)) < 1e-12:
+        raise ValueError(
+            f"ranking target is constant ({targets[0]:.4f} for all "
+            f"{len(targets)} traces) — nothing to rank. "
+            + ("Every trace lacks a stage-0 eval, so stage0_weight contributes "
+               "nothing: this class's warmup consumed stage 0 (e.g. toothbrush). "
+               "Give it a non-stage-0 target (drifted_weight/forget_weight) or "
+               "lower WARMUP so a stage-0 eval exists."
+               if no_stage0 else
+               "Check the drifted/forget/stage0 weights and the traces' "
+               "stage_aurocs.")
+        )
     mean_c = np.asarray(mean_c)
     mean_r = np.asarray(mean_r)
     mean_sd = np.asarray(mean_sd)

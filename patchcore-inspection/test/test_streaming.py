@@ -47,6 +47,35 @@ def test_bank_add_evict_capacity_and_reuse():
     assert len(bank) == 10 and set(reused).issubset(set(slots[:3]))
 
 
+def test_bank_projected_mean_matches_bruteforce_and_caches_device_proj():
+    import torch
+
+    rng = np.random.default_rng(7)
+    X = rng.normal(size=(50, 8)).astype("float32")
+    proj = rng.normal(size=(8, 3)).astype("float32")
+    bank = DynamicMemoryBank(capacity=100, dim=8)
+    bank.add(X)
+    bf = (X @ proj).mean(axis=0)
+
+    out1 = bank.projected_mean(proj)
+    assert np.allclose(out1, bf, atol=1e-4)
+    # cached device tensor is reused (same numpy proj object) and stays correct
+    out2 = bank.projected_mean(proj)
+    assert np.allclose(out2, bf, atol=1e-4)
+    cache = getattr(bank, "_proj_dev_cache", None)
+    assert cache is not None and cache[0] is proj
+
+    # a different numpy array invalidates the cache and still matches
+    proj2 = rng.normal(size=(8, 3)).astype("float32")
+    bf2 = (X @ proj2).mean(axis=0)
+    out3 = bank.projected_mean(proj2)
+    assert np.allclose(out3, bf2, atol=1e-4)
+
+    # torch-tensor input (already on device) matches too, mirroring knn()
+    out4 = bank.projected_mean(torch.from_numpy(proj))
+    assert np.allclose(out4, bf, atol=1e-4)
+
+
 def test_bank_incremental_mirror_matches_bruteforce():
     """Interleaved add/evict/restore must keep the device mirror consistent.
 
@@ -188,6 +217,45 @@ def test_cache_round_trip(tmp_path):
     assert r.flat_slice([0, 4]).shape == (6, 4)
 
 
+def test_cache_image_patches_memoized_and_evicts(tmp_path):
+    d = str(tmp_path / "c")
+    w = EmbeddingCacheWriter(d, n_images=5, patches_per_image=3, dim=4,
+                             meta={"stage_ids": [0, 0, 1, 1, 2]})
+    for i in range(5):
+        w.write(i, np.full((3, 4), i, dtype="float32"))
+    w.write_labels([0, 0, 1, 1, 0])
+    w.finalize()
+    r = EmbeddingCacheReader(d)
+
+    def unmemoized(i):
+        return np.asarray(r.embeddings[i], dtype=np.float32)
+
+    # Repeated and interleaved indices all match the un-memoized ground
+    # truth, whether served from a fresh read or a memo hit.
+    for i in [0, 1, 0, 2, 1, 0, 3, 2, 0]:
+        got = r.image_patches(i)
+        assert np.array_equal(got, unmemoized(i))
+
+    # A memo hit returns the exact cached object (no re-read), and the memo
+    # never grows past its 2-slot cap.
+    first = r.image_patches(4)
+    second = r.image_patches(4)
+    assert first is second
+    memo = r._patches_memo
+    assert len(memo) <= 2
+
+    # Eviction: touching a third distinct index drops the oldest slot, but
+    # the evicted index still reads back correctly on the next call.
+    memo.clear()
+    r.image_patches(0)
+    r.image_patches(1)
+    assert set(memo.keys()) == {0, 1}
+    r.image_patches(2)
+    assert set(memo.keys()) == {1, 2}
+    assert 0 not in memo
+    assert np.array_equal(r.image_patches(0), unmemoized(0))
+
+
 def test_cache_missing_write_raises(tmp_path):
     w = EmbeddingCacheWriter(str(tmp_path / "c"), 2, 2, 2)
     w.write(0, np.zeros((2, 2), "float32"))
@@ -319,6 +387,34 @@ def test_static_bank_separates_anomalies(small_stream):
     assert m["image_auroc"] > 0.8  # stage-0 bank detects stage-0 anomalies
 
 
+def test_record_policy_traces_stage0_only(small_stream):
+    """stage0_only=True must not shorten the episode — only prune which
+    stages get labeled evaluation and drop the forgetting re-eval."""
+    from patchcore.streaming.experiments import record_policy_traces
+
+    stream, tests = small_stream
+    # warmup < images_per_stage (40) so some stage-0 images are stepped
+    # through (not swallowed by warmup) and produce a stage-0 boundary eval.
+    full = record_policy_traces(
+        stream, tests, capacity=400, warmup=35, policy_names=["static"], seeds=[0],
+    )
+    stage0 = record_policy_traces(
+        stream, tests, capacity=400, warmup=35, policy_names=["static"], seeds=[0],
+        stage0_only=True,
+    )
+    assert len(full) == 1 and len(stage0) == 1
+    # default (flag off) behaviour: every stage evaluated + forgetting re-eval
+    assert "forget_auroc" in full[0]
+    assert set(full[0]["stage_aurocs"]) == set(range(len(tests)))
+    # stage0_only: forgetting skipped, only stage 0 evaluated
+    assert "forget_auroc" not in stage0[0]
+    assert set(stage0[0]["stage_aurocs"]) == {0}
+    assert np.isfinite(stage0[0]["stage_aurocs"][0])
+    # same number of env steps either way -> the stream is NOT truncated
+    assert len(full[0]["C"]) == len(stage0[0]["C"])
+    assert np.array_equal(full[0]["stage"], stage0[0]["stage"])
+
+
 def test_adaptive_beats_static_under_drift(small_stream):
     stream, tests = small_stream
 
@@ -407,3 +503,45 @@ def test_fit_target_handles_missing_stage0():
                              stage0_weight=1.0)
     assert _targets_of(res, traces) == pytest.approx([0.0, 0.70])
     assert res["traces_without_stage0"] == ["a:0"]
+
+
+def _fake_stage0_only_traces():
+    """Traces shaped like record_policy_traces(..., stage0_only=True) output:
+    no forget_auroc key, and stage_aurocs holds only the stage-0 entry."""
+    traces = _fake_traces()
+    for tr in traces:
+        del tr["forget_auroc"]
+        tr["stage_aurocs"] = {0: tr["stage_aurocs"][0]}
+    return traces
+
+
+def test_fit_stage0_only_traces_reject_nonzero_forget_weight():
+    from patchcore.streaming.experiments import fit_reward_weights
+
+    traces = _fake_stage0_only_traces()
+    # forget_weight defaults to 0.5 (the historical target) — stage0_only
+    # traces have no forget_auroc, so this must fail loudly rather than
+    # silently dropping the term (and quietly fitting a wrong target).
+    with pytest.raises(ValueError, match="forget_weight"):
+        fit_reward_weights(traces, drifted_weight=0.0)
+
+
+def test_fit_stage0_only_traces_reject_nonzero_drifted_weight():
+    from patchcore.streaming.experiments import fit_reward_weights
+
+    traces = _fake_stage0_only_traces()
+    # drifted_weight defaults to 1.0 — stage0_only traces have no stage>=1
+    # entries in stage_aurocs, so this must fail loudly too.
+    with pytest.raises(ValueError, match="drifted_weight"):
+        fit_reward_weights(traces, forget_weight=0.0)
+
+
+def test_fit_stage0_only_traces_ok_with_stage0_weight():
+    from patchcore.streaming.experiments import fit_reward_weights
+
+    traces = _fake_stage0_only_traces()
+    # the intended stage0_only pairing: zero out drifted/forget, target stage0
+    res = fit_reward_weights(traces, drifted_weight=0.0, forget_weight=0.0,
+                             stage0_weight=1.0)
+    assert _targets_of(res, traces) == pytest.approx([0.90, 0.70])
+    assert not res["traces_without_stage0"]

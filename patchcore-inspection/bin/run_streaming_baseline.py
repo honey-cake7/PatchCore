@@ -64,9 +64,15 @@ def _build_policy(name, ppo_path, device):
 @click.option("--seeds", default="0,1,2")
 @click.option("--reward_json", default=None,
               help="Fitted reward weights (bin/fit_reward_weights.py output)")
+@click.option(
+    "--stage0_only", is_flag=True, default=False,
+    help="Evaluate stage 0 only and skip the final stage-0 forgetting "
+         "re-eval — the paper reports stage-0 AUROC only. Episodes still run "
+         "the full stream; only the per-stage labeled scoring is pruned.",
+)
 @click.option("--out", default="streaming_results")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
-         action_mode, seeds, reward_json, out):
+         action_mode, seeds, reward_json, stage0_only, out):
     import dataclasses
 
     from patchcore.streaming.bank import device_banner
@@ -95,6 +101,8 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
         )
 
     def eval_fn(env, stage):
+        if stage0_only and stage != 0:
+            return {}
         return evaluate_bank_on_stage(
             env.bank, tests[stage], n_nn, patch_shape, imagesize
         )
@@ -116,11 +124,15 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                 mode=(ppo_meta or {}).get("action_mode"),
             )
             summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
-            # forgetting: re-evaluate stage-0 test with the final bank
-            forget_m = evaluate_bank_on_stage(
-                env.bank, tests[0], n_nn, patch_shape, imagesize
-            )
-            forget = forget_m["image_auroc"]
+            # forgetting: re-evaluate stage-0 test with the final bank (skipped
+            # entirely under stage0_only — nothing new to "forget" without
+            # drifted stages having run the bank through them)
+            forget_m, forget = None, float("nan")
+            if not stage0_only:
+                forget_m = evaluate_bank_on_stage(
+                    env.bank, tests[0], n_nn, patch_shape, imagesize
+                )
+                forget = forget_m["image_auroc"]
             for ev in summ["evals"]:
                 rows.append({
                     "policy": name, "seed": seed, "stage": ev["stage"],
@@ -128,15 +140,17 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                     "pixel_auroc": ev.get("pixel_auroc", float("nan")),
                     "pro": ev.get("pro", float("nan")),
                 })
-            rows.append({
-                "policy": name, "seed": seed, "stage": "final_forgetting",
-                "image_auroc": forget,
-                "pixel_auroc": forget_m.get("pixel_auroc", float("nan")),
-                "pro": forget_m.get("pro", float("nan")),
-            })
+            if not stage0_only:
+                rows.append({
+                    "policy": name, "seed": seed, "stage": "final_forgetting",
+                    "image_auroc": forget,
+                    "pixel_auroc": forget_m.get("pixel_auroc", float("nan")),
+                    "pro": forget_m.get("pro", float("nan")),
+                })
+            forget_str = f"{forget:.4f}" if not stage0_only else "skipped(stage0_only)"
             print(f"{name:26s} seed={seed} mean_reward={summ['mean_reward']:.4f} "
                   f"admit={summ['total_admit']} evict={summ['total_evict']} "
-                  f"stage0_forget={forget:.4f}")
+                  f"stage0_forget={forget_str}")
 
     csv_path = os.path.join(out, "results.csv")
     with open(csv_path, "w", newline="") as f:

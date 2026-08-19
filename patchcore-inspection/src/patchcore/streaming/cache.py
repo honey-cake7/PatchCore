@@ -122,8 +122,27 @@ class EmbeddingCacheReader:
         return self.embeddings.shape[2]
 
     def image_patches(self, i: int) -> np.ndarray:
-        """Patch features for image ``i`` as an in-memory array ([P, D])."""
-        return np.asarray(self.embeddings[i], dtype=np.float32)
+        """Patch features for image ``i`` as an in-memory array ([P, D]), memoized.
+
+        Vectorized lockstep envs share one reader and sit at the same
+        timestep, so each step up to 8 envs independently ask for the same
+        image; the memo makes the mmap read happen once instead of once per
+        env. Two slots cover the step/reset boundary. The array is
+        materialized (not a lazy mmap view); callers must not mutate the
+        returned array in place (index it — fancy indexing copies).
+        """
+        key = int(i)
+        memo = getattr(self, "_patches_memo", None)
+        if memo is None:
+            memo = self._patches_memo = {}
+        hit = memo.get(key)
+        if hit is not None:
+            return hit
+        arr = np.ascontiguousarray(self.embeddings[i], dtype=np.float32)
+        memo[key] = arr
+        while len(memo) > 2:  # dict preserves insertion order: drop oldest
+            memo.pop(next(iter(memo)))
+        return arr
 
     def image_patches_dev(self, i: int, device):
         """Patch features for image ``i`` as a device tensor, memoized.

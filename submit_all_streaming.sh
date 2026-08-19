@@ -38,17 +38,42 @@ ONLY=${ONLY:-all}
 # Shared cluster: always shards, never a whole GPU. Adjust the count here
 # (e.g. GRES=shard:12) rather than editing run_streaming.sh's SBATCH header.
 GRES=${GRES:-shard:6}
+# AFTER=<jobid> queues this submission behind an earlier job (afterany: it runs
+# whether or not the predecessor succeeded, so one bad class can't strand a
+# whole chain). Used by sweep_paper_runs.sh to serialize a multi-run sweep on a
+# single GPU. Each submission prints `SUBMITTED_JOBID=<id>` for the caller.
+AFTER=${AFTER:-}
+DEP_ARG=()
+[ -n "${AFTER}" ] && DEP_ARG=(--dependency="afterany:${AFTER}")
+
+submitted() { echo "SUBMITTED_JOBID=$1"; }
 
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "hyperkvasir" ]; then
     echo "Submitting HyperKvasir (polyp-pvt) ..."
-    BACKBONE=polyp-pvt \
+    submitted "$(BACKBONE=polyp-pvt \
     DATA_PATH="${DATASET_ROOT}/hyperkvasir_patchcore" \
     CLASSNAMES="hyperkvasir" \
-    sbatch --job-name=stream-hyperkvasir \
+    sbatch --parsable --job-name=stream-hyperkvasir \
         --output="../logs/streaming_output_%j.log" \
         --error="../logs/streaming_error_%j.log" \
-        --gres="${GRES}" \
-        --export=ALL --mem=12G run_streaming.sh
+        --gres="${GRES}" "${DEP_ARG[@]}" \
+        --export=ALL --mem=12G run_streaming.sh)"
+fi
+
+if [ "${ONLY}" = "kvasir" ]; then
+    echo "Submitting Kvasir (polyp-pvt) ..."
+    # Kvasir is the long-stream dataset (2401 train images); run_streaming.sh's
+    # defaults (WARMUP=100, 100k PPO steps) were tuned for it, so nothing is
+    # overridden here. CAPACITY is whatever the caller sets (the paper uses a
+    # fixed M rather than a matched percentage for this one).
+    submitted "$(BACKBONE=polyp-pvt \
+    DATA_PATH="${DATASET_ROOT}/kvasir_patchcore" \
+    CLASSNAMES="kvasir" \
+    sbatch --parsable --job-name=stream-kvasir \
+        --output="../logs/streaming_output_%j.log" \
+        --error="../logs/streaming_error_%j.log" \
+        --gres="${GRES}" "${DEP_ARG[@]}" \
+        --export=ALL --mem=12G run_streaming.sh)"
 fi
 
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
@@ -60,18 +85,18 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then
     # PPO_LR 1e-5 -> 1e-6 (2026-08-02 full run): training improves monotonically
     # on ~all classes and PPO tops its own proxy on ~12/15 — the sweep's 1e-4
     # was still too hot for tiny streams (iter-3 best-restores on half of them).
-    BACKBONE="${MVTEC_BACKBONE:-wideresnet50}" \
+    submitted "$(BACKBONE="${MVTEC_BACKBONE:-wideresnet50}" \
     DATA_PATH="${DATASET_ROOT}/mvtec" \
     WARMUP="${WARMUP:-15}" \
     PPO_STEPS="${PPO_STEPS:-50000}" \
     PPO_LR="${PPO_LR:-1e-5}" \
     PPO_LR_END="${PPO_LR_END:-1e-6}" \
     CLASSNAMES="${CLASSNAMES:-bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper}" \
-    sbatch --job-name=stream-mvtec \
+    sbatch --parsable --job-name=stream-mvtec \
         --output="../logs/streaming_output_%j.log" \
         --error="../logs/streaming_error_%j.log" \
-        --gres="${GRES}" \
-        --export=ALL run_streaming.sh
+        --gres="${GRES}" "${DEP_ARG[@]}" \
+        --export=ALL run_streaming.sh)"
 fi
 
 echo "Submitted. Watch with: squeue -u \$USER"

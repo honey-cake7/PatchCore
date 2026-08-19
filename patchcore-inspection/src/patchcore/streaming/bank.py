@@ -404,19 +404,31 @@ class DynamicMemoryBank:
             slots = np.concatenate([slots, pad_i], axis=1)
         return dists.astype(np.float32), slots.astype(np.int64)
 
-    def projected_mean(self, proj: np.ndarray) -> np.ndarray:
+    def projected_mean(self, proj) -> np.ndarray:
         """Mean of the active vectors projected through ``proj`` ([D, p] -> [p]).
 
         Runs on the cached device tensor, so it stays cheap at large M
         (the numpy equivalent ``vectors() @ proj`` copies and re-projects the
-        whole bank every step).
+        whole bank every step). ``proj`` may be a numpy array or a torch
+        tensor already on the bank's device (skips the host->device upload,
+        mirroring ``knn()``). The projection is frozen for an env's
+        lifetime, so a numpy ``proj``'s device upload is cached and reused
+        across calls (invalidated only if the array identity changes).
         """
         if self._size == 0:
             return np.zeros(proj.shape[1], dtype=np.float32)
         self._ensure_base()
-        p = torch.from_numpy(np.ascontiguousarray(proj, dtype=np.float32)).to(
-            self._device
-        )
+        if isinstance(proj, torch.Tensor):
+            p = proj.to(self._device, dtype=torch.float32)
+        else:
+            cache = getattr(self, "_proj_dev_cache", None)
+            if cache is not None and cache[0] is proj:
+                p = cache[1]
+            else:
+                p = torch.from_numpy(
+                    np.ascontiguousarray(proj, dtype=np.float32)
+                ).to(self._device)
+                self._proj_dev_cache = (proj, p)
         # mean-then-project == project-then-mean (linearity), but O(D*p) cheaper.
         # Masked sum over the full mirror: cheaper than gathering active rows.
         mask = self._active_dev.unsqueeze(1).to(self._base.dtype)

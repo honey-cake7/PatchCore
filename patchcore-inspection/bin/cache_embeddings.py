@@ -113,6 +113,14 @@ def _probe_dims(model, resize, imagesize, to_tensor, device):
 @click.option("--patchsize", type=int, default=3)
 @click.option("--gpu", type=int, default=0)
 @click.option("--out_dir", required=True)
+@click.option(
+    "--stage0_only", is_flag=True, default=False,
+    help="Cache only the stage-0 labeled test split, skipping the redundant "
+         "re-embed of the (identical) test split for stages 1-3 — the paper "
+         "reports stage-0 AUROC only. The normal stream cache is unaffected. "
+         "Recorded in every manifest.json as stage0_only=true so a run that "
+         "needs all stages does not silently reuse a stage0-only cache.",
+)
 def main(
     backbone_name,
     layers_to_extract_from,
@@ -129,6 +137,7 @@ def main(
     patchsize,
     gpu,
     out_dir,
+    stage0_only,
 ):
     logging.basicConfig(level=logging.INFO)
     device = patchcore.utils.set_torch_device([gpu] if torch.cuda.is_available() else [])
@@ -155,6 +164,7 @@ def main(
         "drift_mode": drift_mode,
         "seed": seed,
         "git_sha": _git_sha(),
+        "stage0_only": bool(stage0_only),
     }
 
     # ---- stream ----
@@ -181,7 +191,13 @@ def main(
 
     # ---- per-stage test sets ----
     manifests = builder.per_stage_test_manifests(schedule)
+    if stage0_only:
+        LOGGER.info("stage0_only=True — caching stage 0 test split only "
+                    "(skipping the identical re-embed for stages 1-%d)",
+                    schedule.n_stages - 1)
     for stage, items in manifests.items():
+        if stage0_only and stage != 0:
+            continue
         tdir = os.path.join(out_dir, "test", f"stage_{stage}")
         tw = EmbeddingCacheWriter(
             tdir, len(items), P, D,

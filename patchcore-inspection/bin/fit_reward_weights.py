@@ -86,10 +86,19 @@ def _load_readers(cache_dir, synthetic):
                    "fitting set, and persist the merged traces (iterated "
                    "refit — closes proxy directions the heuristic fitting set "
                    "never visited). Needs --cache_dir/--synthetic for readers.")
+@click.option(
+    "--stage0_only", is_flag=True, default=False,
+    help="Record traces evaluating stage 0 only, skipping drifted-stage "
+         "(1+) evaluation and the forgetting re-eval — the paper reports "
+         "stage-0 AUROC only. Traces recorded this way have no forget_auroc "
+         "and no drifted-stage entries, so pair this with "
+         "--forget_weight 0 --drifted_weight 0 (typically --stage0_weight 1) "
+         "or fit_reward_weights raises.",
+)
 @click.option("--out", default="reward_weights.json")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
          forget_weight, drifted_weight, stage0_weight, min_rho, permute, max_p,
-         traces_out, traces_in, ppo_pt, out):
+         traces_out, traces_in, ppo_pt, stage0_only, out):
     import pickle
 
     from patchcore.streaming.bank import device_banner
@@ -114,7 +123,7 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
             stream, tests, capacity, warmup=warmup, n_nearest_neighbours=n_nn,
             patch_shape=patch_shape, imagesize=imagesize,
             policy_names=[n for n in policy_names.split(",") if n],
-            seeds=seed_list,
+            seeds=seed_list, stage0_only=stage0_only,
         )
 
     if ppo_pt:
@@ -127,6 +136,7 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
             stream, tests, capacity, ppo_pt, warmup=warmup,
             n_nearest_neighbours=n_nn, patch_shape=patch_shape,
             imagesize=imagesize, seeds=seed_list, name=name,
+            stage0_only=stage0_only,
         )
 
     if not traces_in or ppo_pt:

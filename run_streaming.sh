@@ -230,15 +230,35 @@ ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, cri
 CLIP_MODE=${CLIP_MODE:-gppo}                   # clip | gppo (gradient-preserving)
 CLIP_HIGH=${CLIP_HIGH:-}                       # optional decoupled upper epsilon
 REWARD_FORM=${REWARD_FORM:-level}              # level | delta (potential-based shaping)
+# STAGE0_ONLY=1: the paper reports ONLY stage-0 image/pixel AUROC. Skips all
+# work serving drifted stages 1-3 and the forgetting metric — caching (step
+# 1: 1 test-set embed instead of 4), per-stage evaluation (steps 3.5/4/5: 1
+# labeled scoring pass per episode instead of 5). Opt-in, default off: with
+# it unset every existing result stays byte-identical. Does NOT touch episode
+# length, rng draws, or PPO training — the policy still runs the full stream.
+STAGE0_ONLY=${STAGE0_ONLY:-0}
+STAGE0_ONLY_ARG=""
+[ "${STAGE0_ONLY}" = "1" ] && STAGE0_ONLY_ARG="--stage0_only"
+
 # Reward-fit ranking target:
 #   DRIFTED_WEIGHT*mean(stage>=1 AUROC) + FORGET_WEIGHT*forgetting
 #   + STAGE0_WEIGHT*stage-0 AUROC
 # Defaults reproduce the historical target, which EXCLUDES stage 0 — set
 # STAGE0_WEIGHT (and zero the others) to fit weights for the stage-0-vs-stock
 # comparison instead. Re-targeting reuses saved traces: seconds, no re-record.
-FORGET_WEIGHT=${FORGET_WEIGHT:-0.5}
-DRIFTED_WEIGHT=${DRIFTED_WEIGHT:-1.0}
-STAGE0_WEIGHT=${STAGE0_WEIGHT:-0.0}
+# Under STAGE0_ONLY=1 the recorded traces have no forget_auroc and no
+# drifted-stage entries (fit_reward_weights raises if FORGET_WEIGHT/
+# DRIFTED_WEIGHT are non-zero against them), so the defaults flip to a
+# pure stage-0 target unless the caller explicitly overrides them.
+if [ "${STAGE0_ONLY}" = "1" ]; then
+    FORGET_WEIGHT=${FORGET_WEIGHT:-0.0}
+    DRIFTED_WEIGHT=${DRIFTED_WEIGHT:-0.0}
+    STAGE0_WEIGHT=${STAGE0_WEIGHT:-1.0}
+else
+    FORGET_WEIGHT=${FORGET_WEIGHT:-0.5}
+    DRIFTED_WEIGHT=${DRIFTED_WEIGHT:-1.0}
+    STAGE0_WEIGHT=${STAGE0_WEIGHT:-0.0}
+fi
 MIN_RHO=${MIN_RHO:-0.7}                        # reward fit fails below this Spearman rho
 # Permutation null: refit the same grid against N shuffled targets and log the
 # p-value, so every class's fit carries a significance stamp. The grid reaches
@@ -276,9 +296,22 @@ CLIP_HIGH_ARG=""
 # so a job cut off mid-caching leaves dirs without manifests. Directory
 # existence alone must not skip step 1 — an interrupted cache would wedge the
 # class until a manual RECACHE=1.
+#
+# A stage0_only cache only has a stage_0/ test dir, which already satisfies
+# the "n -ge 1" check below — so a stage0_only cache correctly reads as
+# complete on a repeat stage0_only run (no endless re-cache). The opposite
+# direction is the dangerous one: a stage0_only cache silently reused by a
+# full (STAGE0_ONLY=0) run would look "complete" too, only ever score stage
+# 0, and leave stages 1-3 permanently missing. cache_embeddings.py records
+# stage0_only in every manifest.json precisely so this is detectable — a
+# full run whose cache is flagged stage0_only=true is treated as incomplete.
 cache_complete() {
-    local dir=$1 n=0 d
+    local dir=$1 want_stage0_only=$2 n=0 d
     [ -f "${dir}/stream/manifest.json" ] || return 1
+    if [ "${want_stage0_only}" != "1" ] \
+        && grep -q '"stage0_only": true' "${dir}/stream/manifest.json" 2>/dev/null; then
+        return 1
+    fi
     for d in "${dir}"/test/stage_*/; do
         [ -d "${d}" ] || continue
         n=$((n + 1))
@@ -306,10 +339,11 @@ run_one_class() {
     echo " [${CLASSNAME}] backbone=${BACKBONE} drift=${DRIFT}/${DRIFT_MODE}"
     echo " [${CLASSNAME}] data=${DATA_PATH}/${CLASSNAME}  M=${CAPACITY}  k=${N_NN}"
     echo " [${CLASSNAME}] cache=${CACHE_DIR}  results=${RESULT_DIR}"
+    echo " [${CLASSNAME}] STAGE0_ONLY=${STAGE0_ONLY} (stage-0-only AUROC; drifted stages 1-3 + forgetting skipped)"
     echo "========================================================="
 
     # STEP 1: cache embeddings (GPU) — skipped when a COMPLETE cache exists
-    if [ "${RECACHE}" != "1" ] && cache_complete "${CACHE_DIR}"; then
+    if [ "${RECACHE}" != "1" ] && cache_complete "${CACHE_DIR}" "${STAGE0_ONLY}"; then
         echo -e "\n[${CLASSNAME} 1/5] Complete cache at ${CACHE_DIR} — skipping (RECACHE=1 to redo)."
     else
         if [ -d "${CACHE_DIR}/stream" ] && [ "${RECACHE}" != "1" ]; then
@@ -335,7 +369,8 @@ run_one_class() {
             --target_embed_dimension    "${TGT_DIM}" \
             --patchsize                 "${PATCHSIZE}" \
             --gpu                       0 \
-            --out_dir                   "${CACHE_DIR}" || { echo "[${CLASSNAME}] caching failed"; return 1; }
+            --out_dir                   "${CACHE_DIR}" \
+            ${STAGE0_ONLY_ARG} || { echo "[${CLASSNAME}] caching failed"; return 1; }
     fi
 
     # Budget-matched capacity: a stock PatchCore p% greedy coreset keeps p% of
@@ -359,11 +394,12 @@ PYEOF
 
     # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC).
     # Saved traces make refits (e.g. a new FORGET_WEIGHT) take seconds instead
-    # of replaying every baseline rollout — but traces bake in warmup/capacity,
-    # so only reuse them when those still match (sidecar check).
+    # of replaying every baseline rollout — but traces bake in warmup/capacity/
+    # stage0_only (stage0_only traces carry no forget_auroc/drifted-stage
+    # entries), so only reuse them when those still match (sidecar check).
     local TRACES_ARG=""
     if [ -f "${RESULT_DIR}/reward_traces.pkl" ] \
-        && [ "$(cat "${RESULT_DIR}/reward_traces.cfg" 2>/dev/null)" = "${WARMUP}:${CAPACITY}" ]; then
+        && [ "$(cat "${RESULT_DIR}/reward_traces.cfg" 2>/dev/null)" = "${WARMUP}:${CAPACITY}:${STAGE0_ONLY}" ]; then
         TRACES_ARG="--traces_in ${RESULT_DIR}/reward_traces.pkl"
     fi
     # ITERATE=1: iterated reward refit — replay the previously trained PPO
@@ -379,8 +415,8 @@ PYEOF
         echo "[${CLASSNAME}] ITERATE=1 but no checkpoint at ${PPO_OUT} — plain fit"
     fi
     echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (target: ${DRIFTED_WEIGHT}*drifted + ${FORGET_WEIGHT}*forgetting + ${STAGE0_WEIGHT}*stage0) ..."
-    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --drifted_weight "${DRIFTED_WEIGHT}" --stage0_weight "${STAGE0_WEIGHT}" --min_rho "${MIN_RHO}" --permute "${PERMUTE}" ${TRACES_ARG} ${PPO_ITER_ARG} --out "${RESULT_DIR}/reward_weights.json"
-    echo "${WARMUP}:${CAPACITY}" > "${RESULT_DIR}/reward_traces.cfg"
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --drifted_weight "${DRIFTED_WEIGHT}" --stage0_weight "${STAGE0_WEIGHT}" --min_rho "${MIN_RHO}" --permute "${PERMUTE}" ${TRACES_ARG} ${PPO_ITER_ARG} ${STAGE0_ONLY_ARG} --out "${RESULT_DIR}/reward_weights.json"
+    echo "${WARMUP}:${CAPACITY}:${STAGE0_ONLY}" > "${RESULT_DIR}/reward_traces.cfg"
    
 
     # Without the fitted weights train/benchmark fall back to the DEFAULT
@@ -417,6 +453,7 @@ PYEOF
         --ppo_path   "${PPO_OUT}" \
         --seeds      "${EVAL_SEEDS}" \
         ${REWARD_JSON_ARG} \
+        ${STAGE0_ONLY_ARG} \
         --out        "${RESULT_DIR}" || { echo "[${CLASSNAME}] benchmark failed"; return 1; }
 
     echo "[${CLASSNAME}] DONE -> ${RESULT_DIR}/results.csv"
