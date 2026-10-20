@@ -264,6 +264,7 @@ HIDDEN=${HIDDEN:-128}
 EPOCHS=${EPOCHS:-4}
 MINIBATCHES=${MINIBATCHES:-64}
 ADV_BASELINE=${ADV_BASELINE:-loo}
+ACTION_MODE=${ACTION_MODE:-continuous6}       # band6: admit from a novelty window (ι arm)
 FULL_MEMORY=${FULL_MEMORY:-0}
 KAPPA_ARG=""
 [ -n "${KAPPA}" ] && KAPPA_ARG="--admit_cap_abs ${KAPPA}"
@@ -477,6 +478,7 @@ PYEOF
                 --hidden           "${HIDDEN}" \
                 --epochs           "${EPOCHS}" \
                 --minibatches      "${MINIBATCHES}" \
+                --action_mode      "${ACTION_MODE}" \
                 ${IOTA_ARGS} \
                 ${PRESHIFT_ARG} \
                 --eval_baselines || { echo "[${CLASSNAME}] PPO training (seed ${ts}) failed"; return 1; }

@@ -902,3 +902,25 @@ def test_lockstep_iota_matches_sequential_and_checkpoint_meta(tmp_path):
     assert meta["admit_cap_abs"] == 4 and meta["heldout_frac"] == 0.2
     assert ac.mean_head.in_features == 32
 
+
+
+# ---- band6 action decoding: admit from a novelty window -------------------
+def test_band6_admits_typical_or_novel_window_nearest_centre_first():
+    from patchcore.streaming.env import ActionConfig
+
+    stream = make_synthetic_stream(SyntheticConfig(images_per_stage=20, patches_per_image=64))
+    env = MemoryMaintenanceEnv(stream, capacity=256, warmup_images=10,
+                               action_cfg=ActionConfig(mode="band6", admit_cap_frac=0.05))
+    env.reset()
+    nn = env.batch_novelty
+    ranked = np.argsort(nn, kind="stable")
+    cap = int(0.05 * 256)                                   # a[1] = +inf -> full cap
+    typ, _ = env.decode_action(np.array([-50., 50, 0, 0, 0, 0]))
+    nov, _ = env.decode_action(np.array([50., 50, 0, 0, 0, 0]))
+    assert len(typ) == len(nov) == cap
+    assert set(typ) == set(ranked[:cap])                    # least novel patches
+    assert set(nov) == set(ranked[-cap:])                   # most novel patches
+    assert typ[0] == ranked[0] and nov[0] == ranked[-1]     # nearest the centre first
+    mid, _ = env.decode_action(np.array([0., 50, 0, 0, 0, 0]))
+    r = np.searchsorted(np.sort(nn), nn[mid])
+    assert abs(np.median(r) - (len(nn) - 1) / 2) <= cap      # window sits mid-ranking

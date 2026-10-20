@@ -90,11 +90,15 @@ def main(cache_dir, capacity, warmup, teacher, heldout_frac, horizons, n_noise_e
                 else:
                     _, r0, d, _ = env.step_with_decision(np.empty(0, np.int64),
                                                          np.empty(0, np.int64))
+                # after a step env._t already points at the NEXT image; if that one
+                # is held out it is "seen" but has no teacher score yet (S_F[n, t]
+                # is NaN for t < n) — the reward just computed excludes it, so must we
                 seen = env.heldout_seen_ids()
+                sel = seen <= env._t - 1
                 ok = "n/a"
-                if len(seen):
-                    full = iota_fn(env.heldout_image_scores(),
-                                   teach["S_F"][seen, env._t - 1], teach["eps"])
+                if sel.any():
+                    full = iota_fn(env.heldout_image_scores()[sel],
+                                   teach["S_F"][seen[sel], env._t - 1], teach["eps"])
                     ok = "OK" if abs(full + r0) < 1e-4 else f"MISMATCH {full:+.5f} vs {-r0:+.5f}"
                 res[branch] = r0 + (0.0 if d else forward(env, P.StaticPolicy(), H - 1))
                 res[branch + "_ok"] = ok

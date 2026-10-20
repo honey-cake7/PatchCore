@@ -56,7 +56,9 @@ class ObsConfig:
 
 @dataclass
 class ActionConfig:
-    mode: str = "continuous6"      # "continuous6" | "bar_only" | "discrete4"
+    # "continuous6" | "band6" | "bar_only" | "discrete4". band6 = continuous6
+    # with a novelty WINDOW instead of a novelty floor (see decode_action).
+    mode: str = "continuous6"
     admit_cap_frac: float = 0.05   # max admissions per step, as a fraction of M
     discrete_k: int = 8            # patches added/evicted per discrete action
 
@@ -681,6 +683,8 @@ class MemoryMaintenanceEnv:
 
         if mode == "discrete4":
             return self._decode_discrete(int(np.argmax(action)))
+        if mode == "band6":
+            return self._decode_band(a)
 
         bar = (a[0] + 1.0) / 2.0                          # [0,1]
         if len(nn):
@@ -702,6 +706,35 @@ class MemoryMaintenanceEnv:
         free = self.capacity - len(self.bank)
         n_evict = max(0, n_admit - free)
         evict_slots = self._select_evictions(n_evict, a[2:6] if mode == "continuous6" else None)
+        return admit_idx, evict_slots
+
+    def _decode_band(self, a: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """band6: a[0] picks WHERE in the novelty ranking to admit from.
+
+        continuous6 can only admit from the top of the novelty ranking (a
+        floor + "most novel first"), so it cannot express "admit typical
+        patches" — and under ι on endoscopy, novelty-driven admission is worse
+        than static while random-content admission is better. Here a[0] maps
+        to a rank centre c in [typical .. novel] and the admits are the `cap`
+        patches whose novelty rank is closest to c, nearest first (so a κ cap
+        keeps the ones closest to c). a[1] = admit count as in continuous6,
+        a[2:6] = the same eviction-utility weights.
+        """
+        nn = self._batch_nn
+        cap = max(1, int((a[1] + 1.0) / 2.0 * self.action_cfg.admit_cap_frac
+                         * self.capacity))
+        if len(nn):
+            ranked = np.argsort(nn, kind="stable")        # typical -> novel
+            c = (a[0] + 1.0) / 2.0 * (len(nn) - 1)
+            take = min(cap, len(nn))
+            lo = int(np.clip(round(c - (take - 1) / 2.0), 0, len(nn) - take))
+            pos = np.arange(lo, lo + take)
+            pos = pos[np.argsort(np.abs(pos - c), kind="stable")]
+            admit_idx = ranked[pos]
+        else:
+            admit_idx = np.empty(0, dtype=np.int64)
+        free = self.capacity - len(self.bank)
+        evict_slots = self._select_evictions(max(0, len(admit_idx) - free), a[2:6])
         return admit_idx, evict_slots
 
     def _select_evictions(self, n_evict: int, weights: Optional[np.ndarray]) -> np.ndarray:

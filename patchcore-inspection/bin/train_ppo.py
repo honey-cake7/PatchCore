@@ -134,7 +134,7 @@ def _fit_obs_norm(env_fn, seed=0):
 @click.option("--capacity", type=int, default=1500)
 @click.option("--warmup", type=int, default=100)
 @click.option("--action_mode", default="continuous6",
-              type=click.Choice(["continuous6", "bar_only", "discrete4"]))
+              type=click.Choice(["continuous6", "band6", "bar_only", "discrete4"]))
 @click.option("--total_env_steps", type=int, default=200_000)
 @click.option("--seed", type=int, default=0)
 @click.option("--out", default="ppo_policy.pt")
