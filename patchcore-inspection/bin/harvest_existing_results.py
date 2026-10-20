@@ -23,6 +23,17 @@ Outputs (default results/harvest/):
     protocol.csv          train/test counts, anomaly types, warmup, eval pt  [8]
     hyperparams.json      code defaults + per-run training facts             [8]
     GAPS.md               coverage report
+
+ι-reward protocol (run tags _<budget>_iota[_k<κ>][_pre], see parse_variant),
+one CSV per report section [A]-[H], each the full-report table:
+    iota_validation.csv   Spearman of -ι vs stage-0 image AUROC          [A]
+    kappa_pareto.csv      stage-0 AUROC vs writes per admit cap κ        [B]
+    train_seed_variance.csv  PPO std across training vs eval seeds       [C]
+    anytime.csv           stage-0 AUROC and ι at every stream fraction   [D]
+    less_is_more.csv      full-memory / offline vs streaming at stage 0  [E]
+    rl_vs_myopic.csv      ppo vs myopic_iota vs kcenter per budget       [F]
+    deployment_measured.csv  deployment.csv of every run (latency, peak) [G]
+    preshift_pairs.csv    per-phase AUROC of _pre runs vs their twin     [H]
 """
 import csv
 import glob
@@ -49,6 +60,28 @@ MVTEC = {"bottle", "cable", "capsule", "carpet", "grid", "hazelnut", "leather",
 
 def dataset_of(cls):
     return "mvtec" if cls in MVTEC else cls
+
+
+# Run-tag grammar of the ι-reward protocol. A result dir is
+#   <class>_<backbone>_<drift><budget-tag><variant>
+#   budget-tag = _M<int> (fixed M) | _m<pct> (M matched to pct% of the stream)
+#   variant    = _iota[_k<κ>][_pre]      κ = admit cap in patches/image (absent = ∞)
+# Any other variant is a legacy proxy-reward run; its trailing _pre still
+# means PRESHIFT=1 (submit_reviewer_runs.sh's _M2000_pre).
+IOTA_RE = re.compile(r"^_iota(?:_k(?P<kappa>\d+))?(?P<pre>_pre)?$")
+INF = "∞"
+
+
+def parse_variant(variant):
+    """(arm, κ, preshift) of a variant string; κ is an int, "∞" or "" (legacy)."""
+    m = IOTA_RE.match(variant)
+    if m:
+        return "iota", int(m.group("kappa")) if m.group("kappa") else INF, bool(m.group("pre"))
+    return "legacy", "", variant.endswith("_pre")
+
+
+def _kappa_key(k):
+    return (k == INF, k if isinstance(k, int) else 0)
 
 
 def fnum(v):
@@ -198,16 +231,19 @@ def discover_runs(results_root, cache_root, log_facts):
             r["capacity"] = int(parts[1])
             r["stage0_only"] = parts[2] == "1" if len(parts) > 2 else False
         lf = log_facts.get(name, {})
-        r["capacity"] = r.get("capacity") or lf.get("capacity_log")
-        r["log"] = lf
-        r["job"] = lf.get("bench_job") or lf.get("job")
         mm = re.match(r"_m([\d.]+)(.*)$", r["suffix"])
-        r["budget"] = f"{mm.group(1)}% match" if mm else (
-            f"M={r['capacity']}" if r.get("capacity") else "M=?")
         # fixed-M tags carry the budget too (_M2000_rv): strip it so every
         # budget of one protocol shares a variant name
-        mf = re.match(r"_M\d+(.*)$", r["suffix"])
-        r["variant"] = (mm.group(2) if mm else mf.group(1) if mf else r["suffix"]) or "(untagged)"
+        mf = re.match(r"_M(\d+)(.*)$", r["suffix"])
+        r["capacity"] = r.get("capacity") or lf.get("capacity_log") or (int(mf.group(1)) if mf else None)
+        r["log"] = lf
+        r["job"] = lf.get("bench_job") or lf.get("job")
+        r["budget"] = f"{mm.group(1)}% match" if mm else (
+            f"M={r['capacity']}" if r.get("capacity") else "M=?")
+        r["variant"] = (mm.group(2) if mm else mf.group(2) if mf else r["suffix"]) or "(untagged)"
+        r["arm"], r["kappa"], r["preshift"] = parse_variant(r["variant"])
+        dp = os.path.join(d, "deployment.csv")
+        r["deploy_measured"] = list(csv.DictReader(open(dp))) if os.path.exists(dp) else []
         tag = name[: len(name) - len(r["suffix"])] if r["suffix"] else name
         r["cache_dir"] = os.path.join(cache_root, tag)
         r["cache"] = load_cache_facts(r["cache_dir"])
@@ -229,7 +265,10 @@ def harvest_per_seed(runs):
         n_stages = len(r["cache"].get("stage_counts") or []) or 4
         bench = r["log"].get("bench", {})
         for row in csv.DictReader(open(p)):
-            seed = int(row["seed"])
+            seed = int(row["seed"]) if row.get("seed") not in ("", None) else 0
+            # train_seed: "" for non-PPO rows and for files that predate the column
+            ts = row.get("train_seed") or ""
+            ts = int(fnum(ts)) if np.isfinite(fnum(ts)) else ""
             if row["stage"] == FORGET:
                 frac, test_set = 1.0, "stage_0"
             elif row["stage"].startswith("stage0_at_"):  # stage-0 test mid-stream
@@ -237,16 +276,24 @@ def harvest_per_seed(runs):
             else:
                 s = int(row["stage"])
                 frac, test_set = (s + 1) / n_stages, f"stage_{s}"
+            # writes/evict: results.csv columns when present (exact, per train
+            # seed); else the step-5 log line, which cannot tell train seeds apart
             b = bench.get((row["policy"], seed), {})
+            w, ev = fnum(row.get("writes")), fnum(row.get("evict"))
+            from_csv = np.isfinite(w)
             rows.append({
                 "dataset": r["dataset"], "class": r["class"], "backbone": r["backbone"],
                 "run": r["run"], "budget": r["budget"], "variant": r["variant"],
+                "arm": r["arm"], "kappa": r["kappa"], "preshift": r["preshift"],
                 "capacity": r.get("capacity"), "warmup": r.get("warmup"),
-                "policy": row["policy"], "seed": seed, "stage": row["stage"],
+                "policy": row["policy"], "seed": seed, "train_seed": ts, "stage": row["stage"],
                 "stream_frac_evaluated_at": frac, "test_set": test_set,
                 "image_auroc": fnum(row["image_auroc"]), "pixel_auroc": fnum(row["pixel_auroc"]),
-                "pro": fnum(row["pro"]), "writes_admit": b.get("admit", ""),
-                "evict": b.get("evict", ""), "job": r.get("job"),
+                "pro": fnum(row["pro"]), "iota": fnum(row.get("iota")),
+                "writes_admit": int(w) if from_csv else b.get("admit", ""),
+                "evict": (int(ev) if np.isfinite(ev) else "") if from_csv else b.get("evict", ""),
+                "writes_source": "results.csv" if from_csv else ("log" if b else ""),
+                "job": r.get("job"),
             })
     return rows
 
@@ -266,6 +313,15 @@ def summarize(rows, keys, stage_filter):
         w = [float(x["writes_admit"]) for x in g if x["writes_admit"] != ""]
         rec["writes_mean"] = rnd(float(np.mean(w)), 1) if w else ""
         out.append(rec)
+    return out
+
+
+def pooled(per_seed, keys, stage="0"):
+    """Cross-class summarize(): each (class, eval seed, train seed) is one sample."""
+    out = summarize([{**x, "seed": (x["class"], x["seed"], x["train_seed"])} for x in per_seed],
+                    keys, lambda x: x["stage"] == stage)
+    for d in out:
+        d["n_class_seed_pairs"] = d.pop("n_seeds")
     return out
 
 
@@ -380,6 +436,19 @@ def harvest_preshift(runs):
     for r in runs:
         fit = r["fit"] or {}
         uses_post = bool(fit.get("drifted_weight", 1.0)) or bool(fit.get("forget_weight", 0.5))
+        if r["preshift"]:
+            # PRESHIFT=1 (run_streaming.sh): fit + PPO training + obs-norm prefit
+            # see the pre-shift stream only; the benchmark still runs all phases
+            rows.append({
+                "run": r["run"], "class": r["class"],
+                "fit_target_uses_postshift_labels": uses_post if fit else "no fit",
+                "fit_traces_span": "pre-shift stream only" if fit else "no fit",
+                "ppo_training_stream": "pre-shift stream only (PRESHIFT=1)",
+                "obs_norm_fitted_on": "pre-shift episode",
+                "reward_scales_probe_from": "warmup images only (pre-shift)",
+                "verdict": "pre-shift-only (PRESHIFT=1, _pre tag)",
+            })
+            continue
         rows.append({
             "run": r["run"], "class": r["class"],
             "fit_target_uses_postshift_labels": uses_post if fit else "no fit",
@@ -636,14 +705,86 @@ def code_hyperparams():
 
 
 # ---------------------------------------------------------------------------
-def gaps_report(runs, per_seed, calib, overlap, stock, n_logs):
+# The ι-reward protocol the paper reports (decided with the user; GAPS.md
+# checks each item against what is on disk).
+IOTA_BUDGETS = {"mvtec": ("M=1000", "M=2000", "2.5% match", "5% match", "10% match"),
+                "kvasir": ("M=1000", "M=2000", "M=4742", "M=10000", "1% match"),
+                "hyperkvasir": ("M=1000", "M=2000", "M=4742", "M=10000", "1% match")}
+IOTA_KAPPAS = (1, 4, 16, 64, INF)  # swept at M=2000
+IOTA_POLICIES = {"static", "fifo", "reservoir", "streaming_greedy_coreset", "periodic_coreset",
+                 "kcenter", "myopic_iota", "ppo"}
+N_TRAIN_SEEDS, N_EVAL_SEEDS = 3, 5
+LEGACY_GAPS_MARK = "Sections 1-8 below: "
+
+
+def iota_coverage(per_seed, deploy_meas):
+    s0 = [x for x in per_seed if x["arm"] == "iota" and x["stage"] == "0"]
+    main = defaultdict(list)
+    for x in s0:
+        if x["kappa"] == INF and not x["preshift"]:
+            main[(x["dataset"], x["budget"])].append(x)
+    L = ["## 0. ι-reward protocol coverage", "",
+         f"Target: ι arm (_iota) at 5 budgets x 3 datasets, κ sweep {{1,4,16,64,∞}} at M=2000, "
+         f"{N_TRAIN_SEEDS} train seeds x {N_EVAL_SEEDS} eval seeds, _pre endoscopy runs at M=2000, "
+         "deployment.csv at M=2000, offline/full-memory reference rows, myopic_iota + kcenter.", ""]
+    for ds, budgets in IOTA_BUDGETS.items():
+        L.append(f"- **{ds}**: {sum((ds, b) in main for b in budgets)}/5 budgets with _iota stage-0 results")
+        for b in budgets:
+            g = main.get((ds, b))
+            if not g:
+                L.append(f"  - {b}: NEW RUN (no _iota results)")
+                continue
+            pols = {x["policy"] for x in g}
+            miss = sorted(IOTA_POLICIES - pols)
+            ppo = [x for x in g if x["policy"] == "ppo"]
+            ev = len({x["seed"] for x in ppo})
+            ts = len({x["train_seed"] for x in ppo if x["train_seed"] != ""})
+            stream = [x for x in g if x["policy"] not in NOT_STREAMING]
+            n_iota = sum(np.isfinite(x["iota"]) for x in stream)
+            ref = [_abbr(p) for p in NOT_STREAMING if p in pols]
+            L.append(f"  - {b} ({len({x['class'] for x in g})} classes): "
+                     + ("all 8 policies" if not miss else f"MISSING {', '.join(miss)}")
+                     + f"; eval seeds {ev}/{N_EVAL_SEEDS}, train seeds {ts}/{N_TRAIN_SEEDS}"
+                     + ("" if ev >= N_EVAL_SEEDS and ts >= N_TRAIN_SEEDS else " -> NEW RUN")
+                     + f"; ι logged {n_iota}/{len(stream)} rows"
+                     + f"; reference rows: {' '.join(ref) if len(ref) == 4 else (' '.join(ref) or 'none') + ' -> NEW RUN (OFFLINE=1 / --full_memory)'}")
+        extra = sorted({b for d, b in main if d == ds} - set(budgets), key=_budget_key)
+        if extra:
+            L.append(f"  - also present (outside the protocol): {', '.join(extra)}")
+    L += ["", "- κ sweep at M=2000 (PPO, non-pre):"]
+    for ds in IOTA_BUDGETS:
+        have = {x["kappa"] for x in s0 if x["dataset"] == ds and x["budget"] == "M=2000"
+                and x["policy"] == "ppo" and not x["preshift"]}
+        miss = [str(k) for k in IOTA_KAPPAS if k not in have]
+        L.append(f"  - {ds}: " + ("all κ" if not miss else f"MISSING κ={','.join(miss)} -> NEW RUN"))
+    L += ["- Pre-shift (_iota_pre at M=2000, endoscopy):"]
+    runs_ = {x["run"] for x in per_seed}
+    for ds in ("kvasir", "hyperkvasir"):
+        pre = sorted({x["run"] for x in s0 if x["dataset"] == ds and x["budget"] == "M=2000"
+                      and x["preshift"]})
+        twin = sum(r[: -len("_pre")] in runs_ for r in pre)
+        L.append(f"  - {ds}: {len(pre)} class runs, {twin} with a full-stream twin"
+                 + ("" if pre else " -> NEW RUN"))
+    L += ["- Deployment (deployment.csv in an _iota M=2000 run):"]
+    for ds in IOTA_BUDGETS:
+        d = sorted({x["policy"] for x in deploy_meas if x["dataset"] == ds and x["budget"] == "M=2000"
+                    and parse_variant(x["variant"])[0] == "iota"})
+        L.append(f"  - {ds}: " + (f"measured for {', '.join(d)}" if d else "NEW RUN (DEPLOY=1)"))
+    L.append("")
+    return L
+
+
+def gaps_report(runs, per_seed, calib, overlap, stock, n_logs, deploy_meas=()):
     L = ["# Reviewer checklist — what existing runs cover", "",
          f"Scanned {len(runs)} result dirs and {n_logs} SLURM logs. "
          "COVERED = harvested into the CSVs here; NEW RUN = no existing artifact has it.", ""]
+    L += iota_coverage(per_seed, list(deploy_meas))
+    L += [LEGACY_GAPS_MARK + "the original reviewer checklist, judged on the legacy "
+          "proxy-reward runs (ι-arm items are in section 0).", ""]
     by_ds = defaultdict(lambda: defaultdict(set))  # dataset -> M -> policies
     classes_at = defaultdict(lambda: defaultdict(set))
     for x in per_seed:
-        if x["stage"] == "0":
+        if x["stage"] == "0" and x["arm"] == "legacy":
             key = f'{x["budget"]} {x["variant"]}'
             by_ds[x["dataset"]][key].add(x["policy"])
             classes_at[x["dataset"]][key].add(x["class"])
@@ -659,15 +800,20 @@ def gaps_report(runs, per_seed, calib, overlap, stock, n_logs):
         if n_b < 5:
             L.append(f"  - NEW RUN: needs >=5 budgets, has {n_b}")
     has_writes = sum(1 for x in per_seed if x["writes_admit"] != "")
+    off = {x["run"] for x in per_seed if x["policy"].startswith("offline_")}
     L += [f"- Writes: {has_writes}/{len(per_seed)} per-seed rows have admit counts from logs"
           + ("" if has_writes == len(per_seed) else " (rest: log missing/rotated -> rerun step 5)"),
           f"- Offline PatchCore: stock results found for {sorted({s['config'] for s in stock}) or 'none'}"
           " (full train set, NOT stage-0 data, NOT matched M).",
-          "- NEW RUN: offline greedy coreset at every exact M (incl. M=2000) — never run.", ""]
+          (f"- Offline greedy coreset at exact M: rows in {len(off)} run(s) (see [E])." if off else
+           "- NEW RUN: offline greedy coreset at every exact M (incl. M=2000) — never run."), ""]
 
-    seeds = defaultdict(set)
+    seeds, tseeds = defaultdict(set), defaultdict(set)
     for x in per_seed:
         seeds[x["run"]].add(x["seed"])
+        if x["policy"] == "ppo" and x["train_seed"] != "":
+            tseeds[x["run"]].add(x["train_seed"])
+    ts_runs = [r for r, v in tseeds.items() if len(v) >= 2]
     ns = sorted({len(v) for v in seeds.values()})
     L += ["## 2. Seed variance", "",
           f"- COVERED: per-class per-seed rows in seed_variance.csv; eval seeds per run: {ns}.",
@@ -677,14 +823,19 @@ def gaps_report(runs, per_seed, calib, overlap, stock, n_logs):
           "It does NOT change stream order (fixed by the cache SEED=0), baseline policy "
           "sampling (reservoir/periodic/random use a hard-coded seed=0), or PPO weights "
           "(one policy trained with TRAIN_SEEDS=0, deterministic mean action). So ppo std = "
-          "eval-env noise only, not training variance.", ""]
+          "eval-env noise only, not training variance.",
+          (f"- COVERED for {len(ts_runs)} run(s) with >=2 PPO train seeds: train- vs eval-seed std "
+           "in train_seed_variance.csv / [C]." if ts_runs else ""), ""]
 
     full = sorted({x["run"] for x in per_seed if x["stage"] == "3"})
+    mid = sorted({x["run"] for x in per_seed if x["stage"].startswith("stage0_at_")})
+    pre_runs = sorted({r["run"] for r in runs if r["preshift"]})
     L += ["## 3. Full-stream behaviour", "",
           f"- COVERED for {len(full)} runs: AUROC at 25/50/75/100% — but each on THAT phase's "
           "drifted test set, plus stage-0 test re-scored at 100% (forgetting). See fullstream.csv.",
-          "- NEW RUN: stage-0 test at 50% and 75% (never evaluated), and every STAGE0_ONLY run "
-          "(only the 25% point exists).", ""]
+          (f"- COVERED for {len(mid)} runs: stage-0 test at 50%/75% (anytime.csv / [D])." if mid else
+           "- NEW RUN: stage-0 test at 50% and 75% (never evaluated), and every STAGE0_ONLY run "
+           "(only the 25% point exists)."), ""]
 
     L += ["## 4. Drift", "",
           "- COVERED: phase definitions (drift_protocol.csv), images per phase and per-phase "
@@ -695,7 +846,9 @@ def gaps_report(runs, per_seed, calib, overlap, stock, n_logs):
           "- **Pre-shift check FAILS** (preshift_audit.csv): PPO trains on the full stream incl. "
           "post-shift phases, the obs normaliser is fitted on a full episode, and reward fits "
           "with drifted/forget weights use post-shift labels. Needs training restricted to "
-          "phase 0 — a code change, not a rerun.", ""]
+          "phase 0 — a code change, not a rerun.",
+          (f"- PRESHIFT=1 runs on disk: {len(pre_runs)} (_pre tags; paired per phase in "
+           "preshift_pairs.csv / [H])." if pre_runs else ""), ""]
 
     n_perm = sum(1 for c in calib if c["B_permutations"] != "")
     L += ["## 5. Calibration", "",
@@ -724,8 +877,11 @@ def gaps_report(runs, per_seed, calib, overlap, stock, n_logs):
     L += ["## 7. Deployment cost", "",
           "- COVERED (analytic): bank / mirror / policy / window / probe-set sizes and backbone "
           "params in deployment_memory.csv.",
-          "- NEW RUN: measured peak GPU memory and per-image latency split into feature "
-          "extraction / NN search / maintenance step (logs only hold training-time cost).", ""]
+          (f"- COVERED (measured): deployment.csv in {len({d['run'] for d in deploy_meas})} run(s) — "
+           "feature / NN search / maintenance ms and peak GPU MiB in deployment_measured.csv / [G]."
+           if deploy_meas else
+           "- NEW RUN: measured peak GPU memory and per-image latency split into feature "
+           "extraction / NN search / maintenance step (logs only hold training-time cost)."), ""]
 
     L += ["## 8. Protocol", "",
           "- COVERED: counts, anomaly types, warmup and eval point in protocol.csv; method "
@@ -768,24 +924,44 @@ def _budget_key(b):
 
 
 def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
-                  overlap, deploy, protocol, gaps, full=True):
+                  overlap, deploy, protocol, gaps, deploy_meas=(), full=True):
     """full=False: per-class tables collapse to per-(dataset, budget) summaries
-    so the whole report fits in one paste; full=True keeps every row."""
+    and per-policy tables pivot to one row per budget, so the whole report fits
+    in one paste; full=True keeps every row."""
     S = ["=" * 78, " REVIEWER CHECKLIST — HARVESTED FROM EXISTING RUNS"
          + ("" if full else "  (short: full per-class tables in report.txt)"), "=" * 78, ""]
+    S += ["-" * 78, " ι-REWARD PROTOCOL (tags _<budget>_iota[_k<κ>][_pre])", "-" * 78]
+    S += render_sections(new_sections(ds_mean, per_seed, list(deploy_meas), full))
+    S += ["-" * 78, " ALL RUNS (legacy proxy-reward runs and ι runs alike)", "-" * 78]
 
-    # 1. memory sweep: cross-class mean ± std at stage 0, best image AUROC first per budget
-    S.append("[1] MEMORY SWEEP — stage-0, mean ± std over (class, seed)")
-    rows = sorted(ds_mean, key=lambda d: (d["dataset"], d["backbone"], _budget_key(d["budget"]), d["variant"],
-                                          -(d["image_auroc_mean"] if isinstance(d["image_auroc_mean"], float)
-                                            and np.isfinite(d["image_auroc_mean"]) else -1)))
-    S.append(box("", ["dataset", "backbone", "budget", "variant", "policy", "image AUROC", "pixel AUROC",
-                      "PRO", "writes", "n"],
-                 [[d["dataset"], d["backbone"], d["budget"], d["variant"], d["policy"],
-                   pm(d["image_auroc_mean"], d["image_auroc_std"]),
-                   pm(d["pixel_auroc_mean"], d["pixel_auroc_std"]),
-                   pm(d["pro_mean"], d["pro_std"]), d["writes_mean"], d["n_class_seed_pairs"]]
-                  for d in rows]))
+    if full:
+        # 1. memory sweep: cross-class mean ± std at stage 0, best image AUROC first per budget
+        S.append("[1] MEMORY SWEEP — stage-0, mean ± std over (class, seed)")
+        rows = sorted(ds_mean, key=lambda d: (d["dataset"], d["backbone"], _budget_key(d["budget"]), d["variant"],
+                                              -(d["image_auroc_mean"] if isinstance(d["image_auroc_mean"], float)
+                                                and np.isfinite(d["image_auroc_mean"]) else -1)))
+        S.append(box("", ["dataset", "backbone", "budget", "variant", "policy", "image AUROC", "pixel AUROC",
+                          "PRO", "writes", "n"],
+                     [[d["dataset"], d["backbone"], d["budget"], d["variant"], d["policy"],
+                       pm(d["image_auroc_mean"], d["image_auroc_std"]),
+                       pm(d["pixel_auroc_mean"], d["pixel_auroc_std"]),
+                       pm(d["pro_mean"], d["pro_std"]), d["writes_mean"], d["n_class_seed_pairs"]]
+                      for d in rows]))
+    else:
+        # one row per (dataset, budget, variant), one column per policy: the
+        # long form is ~60k chars once the ι budget x κ sweep lands
+        S.append("[1] MEMORY SWEEP — stage-0 image AUROC (writes) per streaming policy, cross-class "
+                 "mean, uncapped non-pre ι runs; ± std, pixel, PRO, κ/_pre variants in report.txt")
+        ds_iota = [d for d in ds_mean if _main_iota(d)]  # κ sweep: [B]; _pre: [H]
+        n_legacy = len({x["run"] for x in per_seed if x["arm"] == "legacy"})
+        if n_legacy:
+            S.append(f"    {n_legacy} legacy proxy-reward run dirs omitted from short [1]-[3]; in report.txt.")
+        pols = _policy_order({d["policy"] for d in ds_iota} - set(NOT_STREAMING))  # those: [E]
+        cell = lambda d: _f(d["image_auroc_mean"]) + (f" ({kw(d['writes_mean'])})"  # noqa: E731
+                                                      if d["writes_mean"] != "" else "")
+        S.append(box("", ["dataset", "backbone", "budget", "variant", "n"] + [_abbr(p) for p in pols],
+                     [[*k, max(d["n_class_seed_pairs"] for d in v.values()),
+                       *(cell(v[p]) if p in v else "" for p in pols)] for k, v in _by_group(ds_iota).items()]))
     if stock:
         g = defaultdict(list)
         for x in stock:
@@ -800,24 +976,31 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
 
     # 2. seed variance: every seed's stage-0 image/pixel AUROC per class & policy
     if not full:
-        S.append("[2] SEED VARIANCE — per-class std of stage-0 image AUROC across seeds")
+        S.append("[2] SEED VARIANCE — mean over classes of the per-class std of stage-0 image AUROC "
+                 "across seeds (eval x train), per policy; uncapped non-pre ι runs")
         g = defaultdict(list)
         for x in per_seed:
-            if x["stage"] == "0":
-                g[(x["dataset"], x["budget"], x["variant"], x["policy"], x["class"])].append(x["image_auroc"])
-        h = defaultdict(list)
-        for (ds, b, var, pol, c), v in g.items():
-            h[(ds, b, var, pol)].append((mean_std(v)[1], c, len(v)))
-        S.append(box("", ["dataset", "budget", "variant", "policy", "seeds", "mean class std",
-                          "max class std", "worst class"],
-                     [[*k, max(n for _, _, n in v), f"{np.nanmean([sd for sd, _, _ in v]):.3f}",
-                       f"{max(v)[0]:.3f}", max(v)[1]]
-                      for k, v in sorted(h.items(), key=lambda kv: (kv[0][0], _budget_key(kv[0][1]), kv[0][2], kv[0][3]))]))
+            if x["stage"] == "0" and _main_iota(x):
+                g[(x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"], x["class"])].append(
+                    x["image_auroc"])
+        h = defaultdict(lambda: defaultdict(list))
+        for (*k, pol, c), v in g.items():
+            h[tuple(k)][pol].append((mean_std(v)[1], c, len(v)))
+        pols = _policy_order({k[4] for k in g})
+        rows = []
+        for k, v in sorted(h.items(), key=lambda kv: _gkey(kv[0])):
+            worst = max(((sd, _abbr(p), c) for p, l in v.items() for sd, c, _ in l if np.isfinite(sd)),
+                        default=(float("nan"), "–", "–"))
+            rows.append([*k, max(n for l in v.values() for _, _, n in l),
+                         *(_f(float(np.nanmean([sd for sd, _, _ in v[p]]))) if p in v else "" for p in pols),
+                         f"{worst[1]}:{worst[2]} {_f(worst[0])}"])
+        S.append(box("", ["dataset", "backbone", "budget", "variant", "seeds"] + [_abbr(p) for p in pols]
+                     + ["worst policy:class"], rows))
     else:
         S += _seed_table(per_seed)
 
     return _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy,
-                        protocol, gaps, full)
+                        protocol, gaps, full, deploy_meas)
 
 
 def _seed_table(per_seed):
@@ -836,25 +1019,39 @@ def _seed_table(per_seed):
     return S
 
 
-def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, protocol, gaps, full):
+def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, protocol, gaps, full,
+                 deploy_meas=()):
     # 3. full stream: image AUROC at each quarter, cross-class mean
-    S.append("[3] FULL STREAM — image AUROC at each point of the stream (cross-class mean ± std)")
+    S.append("[3] FULL STREAM — image AUROC at each point of the stream (cross-class mean ± std)"
+             + ("" if full else "; short: uncapped ι runs, budgets pooled, phase columns only "
+                                "(s0@X in [D])"))
     S.append("    25/50/75/100% = bank at end of that quarter, scored on THAT phase's test set;")
     S.append("    s0@X = bank at X% of the stream scored on the STAGE-0 test set "
              "(s0@100% = forgetting; s0@50/75% need STAGE0_EVERY=1 runs).")
     g = defaultdict(lambda: defaultdict(list))
     for x in per_seed:
+        if not full and not _main_iota(x):
+            continue
         pct = f"{int(round(100 * x['stream_frac_evaluated_at']))}%"
         col = ("s0@100%" if x["stage"] == FORGET else
                f"s0@{pct}" if x["stage"].startswith("stage0_at_") else
                "s0@25%" if x["stage"] == "0" else pct)
+        key = ((x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"]) if full
+               else (x["dataset"], x["backbone"], x["policy"]))
         if x["stage"] == "0":
-            g[(x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"])]["25%"].append(x["image_auroc"])
-        g[(x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"])][col].append(x["image_auroc"])
-    cols = ["25%", "50%", "75%", "100%", "s0@25%", "s0@50%", "s0@75%", "s0@100%"]
-    S.append(box("", ["dataset", "backbone", "budget", "variant", "policy"] + cols,
-                 [[*k, *(pm(*mean_std(v[c])[:2]) for c in cols)]
-                  for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], kv[0][1], _budget_key(kv[0][2]), kv[0][3], kv[0][4]))]))
+            g[key]["25%"].append(x["image_auroc"])
+        g[key][col].append(x["image_auroc"])
+    if full:
+        cols = ["25%", "50%", "75%", "100%", "s0@25%", "s0@50%", "s0@75%", "s0@100%"]
+        S.append(box("", ["dataset", "backbone", "budget", "variant", "policy"] + cols,
+                     [[*k, *(pm(*mean_std(v[c])[:2]) for c in cols)]
+                      for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], kv[0][1], _budget_key(kv[0][2]), kv[0][3], kv[0][4]))]))
+    else:
+        cols, order = ["25%", "50%", "75%", "100%"], list(POLICY_ABBR)
+        S.append(box("", ["dataset", "backbone", "policy"] + cols,
+                     [[*k, *(_f(mean_std(v[c])[0]) for c in cols)]
+                      for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], kv[0][1], order.index(kv[0][2])
+                                                                    if kv[0][2] in order else len(order)))]))
 
     # 4. drift
     S.append("[4] DRIFT — phase definitions (staged_abrupt_4) and pre-shift audit")
@@ -868,25 +1065,12 @@ def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, prot
     S.append(f"    Runs whose reward-fit target uses post-shift labels: "
              f"{sum(1 for r in preshift if r['fit_target_uses_postshift_labels'] is True)}/{len(preshift)}\n")
 
-    # 5. calibration
+    # 5. calibration (proxy-reward fits only; the ι reward has no fitted weights)
     if not full:
-        S.append("[5] CALIBRATION — fits per budget (labels from the TEST split); per run in report.txt")
-        bud = {}
-        for x in per_seed:
-            bud[x["run"]] = (x["dataset"], x["budget"], x["variant"])
-        g = defaultdict(list)
-        for c in calib:
-            g[bud.get(c["run"], (c["dataset"], "?", "?")) + (c["target"],)].append(c)
-        rows = []
-        for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], _budget_key(kv[0][1]), kv[0][2])):
-            ps = [c["p_value"] for c in v if not isinstance(c["p_value"], str)]
-            fails = [c["class"] for c in v if c["pass_p<=0.05"] is False]
-            rows.append([*k, len(v), f"{np.median([c['rho_star'] for c in v]):.3f}",
-                         f"{len([p for p in ps if p <= 0.05])}/{len(ps)}" if ps else "no null run",
-                         f"{np.median([c['null_p95'] for c in v if c['null_p95'] != '']):.3f}" if ps else "–",
-                         " ".join(fails) or "–"])
-        S.append(box("", ["dataset", "budget", "variant", "target", "fits", "median ρ*",
-                          "p≤.05", "median null p95", "classes failing p≤.05"], rows))
+        ps = [c for c in calib if not isinstance(c["p_value"], str)]
+        S.append(f"[5] CALIBRATION — {len(calib)} legacy proxy-reward fits, {len(ps)} with a permutation "
+                 f"null, {sum(c['p_value'] <= 0.05 for c in ps)} at p≤.05; tables in report.txt / "
+                 "calibration.csv (the ι reward fits nothing)")
     wk = ("alpha", "beta", "gamma", "churn_coef", "churn_budget", "c90_coef", "probe_coef", "q_coef")
     if full:
         S.append("[5] CALIBRATION — reward fit per run (labels from the TEST split)")
@@ -913,7 +1097,9 @@ def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, prot
                 seen.add(key)
                 keep.append(d)
         deploy = keep
-    S.append("[7] DEPLOYMENT MEMORY — analytic fp32 MiB (latency not measured by any existing run)"
+    S.append("[7] DEPLOYMENT MEMORY — analytic fp32 MiB"
+             + (" (measured latency + peak memory: [G])" if deploy_meas else
+                " (latency not measured by any existing run)")
              + ("" if full else "; largest M per backbone shown"))
     S.append(box("", ["run", "M", "D", "backbone params", "backbone", "bank", "policy", "window",
                       "probe Z", "total", "train ms/step"],
@@ -931,9 +1117,10 @@ def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, prot
             if key not in seen:
                 seen.add(key)
                 keep.append(p_)
-        protocol = keep
+        iota_runs = {x["run"] for x in per_seed if x["arm"] == "iota"}
+        protocol = [p_ for p_ in keep if p_["run"] in iota_runs] or keep
     S.append("[8] PROTOCOL — counts, warmup and stage-0 eval point"
-             + ("" if full else " (one row per class/warmup)"))
+             + ("" if full else " (one row per class/warmup; ι runs when any exist)"))
     S.append(box("", ["run", "train", "per phase", "warmup", "eval after img", "policy steps",
                       "test normal", "test abnormal", "masks", "anomaly types"],
                  [[p["run"], p["n_train_stream"], p["images_per_phase"], p["warmup_images"],
@@ -941,8 +1128,322 @@ def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, prot
                    p["test_abnormal"], p["test_nonempty_masks"], p["anomaly_types"]] for p in protocol]))
     S.append("    Method details (E, MLP, decoding, eviction, τ κ |Z| window W B, lr, episodes): hyperparams.json\n")
 
-    S += ["=" * 78, gaps]
+    # short: only the ι-protocol coverage; the legacy checklist lives in GAPS.md
+    S += ["=" * 78, gaps if full else gaps.split(LEGACY_GAPS_MARK)[0]
+          + "Sections 1-8 (original reviewer checklist, legacy runs): GAPS.md / report.txt.\n"]
     return "\n".join(S)
+
+
+# ---------------------------------------------------------------------------
+# ι-reward protocol sections [A]-[H]. Each builder returns
+# (csv name, title, one-line explanations, header, rows); full=False is the
+# compact rendering for report_short.txt, full=True also goes to <csv>.csv.
+# ---------------------------------------------------------------------------
+POLICY_ABBR = {"static": "static", "fifo": "fifo", "reservoir": "resv", "random": "rand",
+               "streaming_greedy_coreset": "sgc", "periodic_coreset": "periodic",
+               "kcenter": "kctr", "myopic_iota": "myopic", "ppo": "ppo",
+               "offline_stage0": "off_s0", "offline_all": "off_all",
+               "full_stage0": "full_s0", "full_all": "full_all"}
+NOT_STREAMING = ("offline_stage0", "offline_all", "full_stage0", "full_all")
+
+
+def _abbr(p):
+    return POLICY_ABBR.get(p, p)
+
+
+def _policy_order(pols):
+    order = list(POLICY_ABBR)
+    return sorted(pols, key=lambda p: (order.index(p) if p in order else len(order), p))
+
+
+def _num(x):
+    return x if isinstance(x, float) and np.isfinite(x) else float("-inf")
+
+
+def _f(x, fmt=".3f"):
+    return format(x, fmt) if isinstance(x, float) and np.isfinite(x) else "–"
+
+
+def kw(w):
+    """Compact write count: 950, 2.4k, 1.31M."""
+    if w in ("", None):
+        return "–"
+    w = float(w)
+    return f"{w:.0f}" if w < 1e3 else f"{w / 1e3:.1f}k" if w < 1e6 else f"{w / 1e6:.2f}M"
+
+
+def _spearman(a, b):
+    from scipy import stats
+
+    a, b = np.asarray(a, float), np.asarray(b, float)
+    if len(a) < 3 or np.ptp(a) == 0 or np.ptp(b) == 0:
+        return float("nan")
+    return float(stats.spearmanr(a, b).correlation)
+
+
+def _gkey(k):
+    """Sort (dataset, backbone, budget, ...) keys with budgets in size order."""
+    return (k[0], k[1], _budget_key(k[2]), *(str(x) for x in k[3:]))
+
+
+def _by_group(ds_mean, keep=lambda d: True):
+    """(dataset, backbone, budget, variant) -> policy -> ds_mean row."""
+    by = defaultdict(dict)
+    for d in ds_mean:
+        if keep(d):
+            by[(d["dataset"], d["backbone"], d["budget"], d["variant"])][d["policy"]] = d
+    return dict(sorted(by.items(), key=lambda kv: _gkey(kv[0])))
+
+
+def _main_iota(d):
+    """The headline ι runs: no admit cap, not pre-shift."""
+    return d["arm"] == "iota" and d["kappa"] == INF and not d["preshift"]
+
+
+def sec_iota_validation(per_seed, full):
+    rows = [x for x in per_seed if x["arm"] == "iota" and x["stage"] == "0"
+            and np.isfinite(x["iota"]) and np.isfinite(x["image_auroc"])]
+    groups = defaultdict(list)
+    for x in rows:
+        groups[(x["dataset"], "all")].append(x)
+        groups[("ALL", "all")].append(x)
+        if full:
+            groups[(x["dataset"], x["budget"])].append(x)
+    out = []
+    for (ds, b), g in sorted(groups.items(), key=lambda kv: (kv[0][0] == "ALL", kv[0][0],
+                                                              kv[0][1] != "all", _budget_key(kv[0][1]))):
+        by_cls = defaultdict(list)
+        for x in g:
+            by_cls[x["class"]].append(x)
+        rho_c = [r for r in (_spearman([-x["iota"] for x in v], [x["image_auroc"] for x in v])
+                             for v in by_cls.values()) if np.isfinite(r)]
+        out.append([ds, b, len(g), len(by_cls), len({x["policy"] for x in g}),
+                    _f(_spearman([-x["iota"] for x in g], [x["image_auroc"] for x in g])),
+                    _f(float(np.median(rho_c))) if rho_c else "–",
+                    f"{sum(r > 0 for r in rho_c)}/{len(rho_c)}"])
+    return ("iota_validation", "[A] ι VALIDATION — does a lower ι go with a higher stage-0 image AUROC?",
+            ["Spearman ρ(-ι at the stage-0 boundary, stage-0 image AUROC) over every (class, policy, "
+             "seed) row of ι-arm runs; pure correlation, nothing fitted.",
+             "Pooled ρ mixes class difficulty; within-class ρ is the clean test "
+             "(classes ρ>0 = classes where ι ranks the banks the right way)."],
+            ["dataset", "budget", "rows", "classes", "policies", "pooled ρ", "median class ρ",
+             "classes ρ>0"], out)
+
+
+def sec_kappa(ds_mean, full):
+    by = defaultdict(dict)  # (dataset, backbone, budget) -> κ -> policy -> row
+    for d in ds_mean:
+        if d["arm"] == "iota" and not d["preshift"]:
+            by[(d["dataset"], d["backbone"], d["budget"])].setdefault(d["kappa"], {})[d["policy"]] = d
+    out = []
+    for k, kap in sorted(by.items(), key=lambda kv: _gkey(kv[0])):
+        if len(kap) < 2:  # no sweep at this budget
+            continue
+        for kv_ in sorted(kap, key=_kappa_key):
+            if (d := kap[kv_].get("ppo")):
+                out.append([*k, kv_, "ppo", pm(d["image_auroc_mean"], d["image_auroc_std"]),
+                            kw(d["writes_mean"]), d["n_class_seed_pairs"]])
+        ref = kap.get(INF, {})
+        base = [p for p in ref if p != "ppo"]
+        if not full:  # static + the best streaming baseline only
+            best = max((p for p in base if p not in NOT_STREAMING),
+                       key=lambda p: _num(ref[p]["image_auroc_mean"]), default=None)
+            base = list(dict.fromkeys(p for p in ("static", best) if p in ref))
+        for p in _policy_order(base):
+            d = ref[p]
+            out.append([*k, f"{INF} ref", p, pm(d["image_auroc_mean"], d["image_auroc_std"]),
+                        kw(d["writes_mean"]), d["n_class_seed_pairs"]])
+    return ("kappa_pareto", "[B] κ PARETO — stage-0 accuracy vs writes as the admit cap κ tightens",
+            ["PPO per κ (patches admitted per image, tags _iota_k<κ>); 'ref' rows = baselines of the "
+             "uncapped run. A good κ keeps AUROC with far fewer writes."
+             + ("" if full else " Short: static + best baseline; all in report.txt.")],
+            ["dataset", "backbone", "budget", "κ", "policy", "image AUROC", "writes", "n"], out)
+
+
+def sec_train_seeds(per_seed, full):
+    g = defaultdict(lambda: defaultdict(lambda: defaultdict(list)))
+    for x in per_seed:
+        if (x["policy"] == "ppo" and x["stage"] == "0" and x["train_seed"] != ""
+                and np.isfinite(x["image_auroc"]) and (full or _main_iota(x))):
+            g[(x["dataset"], x["backbone"], x["budget"], x["variant"])][x["class"]][x["train_seed"]].append(
+                x["image_auroc"])
+    out = []
+    for k, classes in sorted(g.items(), key=lambda kv: _gkey(kv[0])):
+        per = []
+        for c, ts in sorted(classes.items()):
+            if len(ts) < 2:
+                continue
+            means = [float(np.mean(ts[t])) for t in sorted(ts)]
+            ev = [np.std(v, ddof=1) for v in ts.values() if len(v) > 1]
+            per.append((c, len(ts), max(len(v) for v in ts.values()), float(np.std(means, ddof=1)),
+                        float(np.mean(ev)) if ev else float("nan"), means))
+        if full:
+            out += [[*k, c, nt, ne, _f(st), _f(se), " ".join(f"{m:.3f}" for m in ms)]
+                    for c, nt, ne, st, se, ms in per]
+        elif per:
+            st, se = float(np.mean([p[3] for p in per])), float(np.nanmean([p[4] for p in per]))
+            worst = max(per, key=lambda p: p[3])
+            out.append([*k, len(per), max(p[1] for p in per), max(p[2] for p in per), _f(st), _f(se),
+                        _f(st / se, ".2f") if se > 0 else "–", f"{worst[0]} {worst[3]:.3f}"])
+    head = (["dataset", "backbone", "budget", "variant", "class", "train seeds", "eval seeds",
+             "std train", "std eval", "mean per train seed"] if full else
+            ["dataset", "backbone", "budget", "variant", "classes", "train seeds", "eval seeds",
+             "std train", "std eval", "train/eval", "worst class"])
+    return ("train_seed_variance", "[C] TRAIN-SEED VARIANCE — PPO stage-0 image AUROC",
+            ["std train = std over training seeds of the eval-seed mean; std eval = std over eval "
+             "seeds with the policy fixed (mean over train seeds). Ratio >1: training is the bigger "
+             "noise source." + ("" if full else " Uncapped non-pre runs, means over classes; "
+                                                "per class and variant in report.txt.")],
+            head, out)
+
+
+def sec_anytime(per_seed, full):
+    auc = defaultdict(lambda: defaultdict(list))
+    io = defaultdict(lambda: defaultdict(dict))  # key -> pct -> sample -> ι (one per boundary)
+    for x in per_seed:
+        if x["arm"] != "iota" or (not full and (not _main_iota(x) or x["policy"] in NOT_STREAMING)):
+            continue
+        key = ((x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"]) if full
+               else (x["dataset"], x["backbone"], x["policy"]))
+        pct = int(round(100 * x["stream_frac_evaluated_at"]))
+        if x["test_set"] == "stage_0" and np.isfinite(x["image_auroc"]):
+            auc[key][pct].append(x["image_auroc"])
+        if np.isfinite(x["iota"]):  # stage s and stage0_at_s rows share one boundary ι
+            io[key][pct].setdefault((x["run"], x["seed"], x["train_seed"]), x["iota"])
+    pcts = sorted({p for v in list(auc.values()) + list(io.values()) for p in v})
+    order = list(POLICY_ABBR)
+    keys = sorted(set(auc) | set(io), key=lambda k: (
+        (k[0], k[1], _budget_key(k[2]), k[3]) if full else (k[0], k[1]),
+        order.index(k[-1]) if k[-1] in order else len(order), k[-1]))
+    cell = (lambda v: pm(*mean_std(v)[:2])) if full else (lambda v: _f(mean_std(v)[0]))
+    out = [[*k[:-1], k[-1], *(cell(auc[k][p]) for p in pcts),
+            *(_f(mean_std(list(io[k][p].values()))[0], ".3g") for p in pcts)] for k in keys]
+    head = (["dataset", "backbone", "budget", "variant"] if full else ["dataset", "backbone"]) + ["policy"]
+    return ("anytime", "[D] ANYTIME — stage-0 image AUROC and ι at each point of the stream",
+            ["s0@X = bank at X% of the stream scored on the stage-0 test set (needs "
+             "--stage0_every_boundary for 50/75%); ι@X = mean ι at that boundary. Flat s0 = no forgetting."
+             + ("" if full else " Short: uncapped ι runs, budgets pooled, streaming policies; "
+                                "per budget in report.txt.")],
+            head + [f"s0@{p}%" for p in pcts] + [f"ι@{p}%" for p in pcts], out)
+
+
+def sec_less_is_more(ds_mean, full):
+    out = []
+    for k, pols in _by_group(ds_mean).items():
+        if not any(p in pols for p in NOT_STREAMING):
+            continue
+        a = lambda p: pols[p]["image_auroc_mean"] if p in pols else float("nan")  # noqa: E731
+        cell = ((lambda p: pm(pols[p]["image_auroc_mean"], pols[p]["image_auroc_std"]) if p in pols else "–")
+                if full else (lambda p: _f(a(p))))
+        best = max((p for p in pols if p not in NOT_STREAMING), key=lambda p: _num(a(p)), default=None)
+        delta = a(best) - a("full_stage0") if best else float("nan")
+        out.append([*k, cell("static"), f"{_abbr(best)} {_f(a(best))}" if best else "–",
+                    *(cell(p) for p in NOT_STREAMING), _f(delta, "+.3f")])
+    return ("less_is_more", "[E] LESS IS MORE? — stage-0 image AUROC: small streaming bank vs keeping everything",
+            ["full_* = every stream patch kept (no coreset; stage-0 images / whole stream); offline_* = "
+             "greedy coreset at M. Δ = best streaming − full_stage0: Δ ≥ 0 means a small bank loses nothing."],
+            ["dataset", "backbone", "budget", "variant", "static", "best streaming",
+             *(_abbr(p) for p in NOT_STREAMING), "Δ best−full_s0"], out)
+
+
+def sec_rl_vs_myopic(ds_mean, full):
+    out = []
+    keep = (lambda d: d["arm"] == "iota") if full else _main_iota
+    for k, pols in _by_group(ds_mean, keep).items():
+        if not any(p in pols for p in ("myopic_iota", "kcenter", "ppo")):
+            continue
+        row = [*k, _f(pols["static"]["image_auroc_mean"]) if "static" in pols else "–"]
+        for p in ("ppo", "myopic_iota", "kcenter"):
+            d = pols.get(p)
+            row += [pm(d["image_auroc_mean"], d["image_auroc_std"]) if d else "–",
+                    kw(d["writes_mean"]) if d else "–"]
+        out.append(row)
+    return ("rl_vs_myopic", "[F] RL vs MYOPIC vs K-CENTER — stage-0 image AUROC and writes per budget",
+            ["Does the learned policy beat the label-free one-step ι lookahead (myopic) and streaming "
+             "k-center at the same budget? static = no-maintenance floor."
+             + ("" if full else " Short: uncapped, non-pre runs.")],
+            ["dataset", "backbone", "budget", "variant", "static", "ppo", "ppo writes", "myopic",
+             "myopic writes", "kcenter", "kctr writes"], out)
+
+
+def harvest_deployment_measured(runs):
+    return [{"run": r["run"], "dataset": r["dataset"], "budget": r["budget"], "variant": r["variant"],
+             **{k: row.get(k, "") for k in ("gpu", "M", "D", "policy", "feature_ms", "nn_search_ms",
+                                            "maintenance_ms", "total_ms", "peak_gpu_MiB")}}
+            for r in runs for row in r["deploy_measured"]]
+
+
+def sec_deployment(deploy_meas, full):
+    if full:
+        out = [[d["run"], d["gpu"], d["M"], d["D"], d["policy"], d["feature_ms"], d["nn_search_ms"],
+                d["maintenance_ms"], d["total_ms"], d["peak_gpu_MiB"]] for d in deploy_meas]
+        head = ["run", "gpu", "M", "D", "policy", "feature ms", "NN search ms", "maintenance ms",
+                "total ms", "peak GPU MiB"]
+    else:
+        g = defaultdict(list)
+        for d in deploy_meas:
+            g[d["run"]].append(d)
+        out = [[run, v[0]["M"], v[0]["feature_ms"], v[0]["nn_search_ms"], v[0]["peak_gpu_MiB"],
+                " ".join(f"{_abbr(d['policy'])} {d['maintenance_ms']}" for d in v)] for run, v in g.items()]
+        head = ["run", "M", "feature ms", "NN ms", "peak MiB", "maintenance ms/step per policy"]
+    return ("deployment_measured", "[G] DEPLOYMENT — measured per-image latency and peak GPU memory (deployment.csv)",
+            ["Per image: backbone features + k-NN scoring against the bank + one maintenance step of the "
+             "policy; peak = max GPU memory allocated over the whole measurement."], head, out)
+
+
+def sec_preshift(per_seed, full):
+    present = {x["run"] for x in per_seed}
+    meta, vals = {}, defaultdict(list)
+    for x in per_seed:
+        meta.setdefault(x["run"], x)
+        col = "forget" if x["stage"] == FORGET else x["stage"] if x["stage"].isdigit() else None
+        if col is not None:
+            vals[(x["run"], x["policy"], col)].append(x["image_auroc"])
+    cols = sorted({c for _, _, c in vals if c != "forget"}, key=int) + ["forget"]
+    agg = defaultdict(lambda: defaultdict(lambda: ([], [])))  # key -> col -> (pre, twin) class means
+    for run, m in sorted(meta.items()):
+        if not m["preshift"]:
+            continue
+        base = run[: -len("_pre")]
+        # submit_reviewer_runs.sh pairs legacy _M2000_pre with _M2000_rv
+        twin = next((t for t in ([base + "_rv", base] if m["arm"] == "legacy" else [base])
+                     if t in present), None)
+        if twin is None:
+            continue
+        for pol in {p for r_, p, _ in vals if r_ == run}:
+            if not full and pol != "ppo":
+                continue
+            key = (m["dataset"], m["backbone"], m["budget"], m["arm"], m["kappa"], pol)
+            for c in cols:
+                a, b = vals.get((run, pol, c)), vals.get((twin, pol, c))
+                if a and b:
+                    agg[key][c][0].append(float(np.nanmean(a)))
+                    agg[key][c][1].append(float(np.nanmean(b)))
+    order = list(POLICY_ABBR)
+    out = [[*k, len(v[cols[0]][0]) if cols[0] in v else 0,
+            *(f"{_f(float(np.mean(v[c][0])))}/{_f(float(np.mean(v[c][1])))}" if c in v else "–" for c in cols)]
+           for k, v in sorted(agg.items(), key=lambda kv: (*_gkey(kv[0][:-1]), order.index(kv[0][-1])
+                                                           if kv[0][-1] in order else len(order)))]
+    return ("preshift_pairs", "[H] PRE-SHIFT DRIFT — per-phase image AUROC, _pre run / its full-stream twin",
+            ["_pre = PPO trained on the pre-shift stream only, benchmarked on all phases (each phase on "
+             "its own test set; forget = stage-0 test with the final bank). Class-paired means."
+             + ("" if full else " Short: PPO only.")],
+            ["dataset", "backbone", "budget", "arm", "κ", "policy", "classes",
+             *(f"phase {c}" if c != "forget" else "forget" for c in cols)], out)
+
+
+def new_sections(ds_mean, per_seed, deploy_meas, full):
+    return [sec_iota_validation(per_seed, full), sec_kappa(ds_mean, full),
+            sec_train_seeds(per_seed, full), sec_anytime(per_seed, full),
+            sec_less_is_more(ds_mean, full), sec_rl_vs_myopic(ds_mean, full),
+            sec_deployment(deploy_meas, full), sec_preshift(per_seed, full)]
+
+
+def render_sections(secs):
+    S = []
+    for _, title, notes, header, rows in secs:
+        S += [title] + [f"    {n}" for n in notes] + [box("", header, rows)]
+    return S
 
 
 def main():
@@ -984,31 +1485,33 @@ def main():
 
     write_csv(os.path.join(out, "runs.csv"), [{
         "run": r["run"], "dataset": r["dataset"], "class": r["class"], "backbone": r["backbone"],
-        "drift": r["drift"], "suffix": r["suffix"], "capacity": r.get("capacity"),
+        "drift": r["drift"], "suffix": r["suffix"], "budget": r["budget"], "variant": r["variant"],
+        "arm": r["arm"], "kappa": r["kappa"], "preshift": r["preshift"], "capacity": r.get("capacity"),
         "warmup": r.get("warmup"), "stage0_only": r.get("stage0_only"), "job": r.get("job"),
         "gpu": r["log"].get("gpu"), "has_results": os.path.exists(os.path.join(r["dir"], "results.csv")),
         "has_fit": bool(r["fit"]), "checkpoint": r["ckpt"] or "",
+        "has_deployment_csv": bool(r["deploy_measured"]),
         "cache_found": bool(r["cache"])} for r in runs])
 
     per_seed = harvest_per_seed(runs)
     write_csv(os.path.join(out, "per_seed.csv"), per_seed)
-    sweep = summarize(per_seed, ["dataset", "backbone", "capacity", "class", "policy"],
+    # variant in the key: an ι run and a legacy run at the same M are different
+    # methods, not extra seeds of one; train seeds pool into the per-class mean
+    sweep = summarize(per_seed, ["dataset", "backbone", "capacity", "budget", "variant", "arm",
+                                 "kappa", "preshift", "class", "policy"],
                       lambda x: x["stage"] == "0")
     write_csv(os.path.join(out, "memory_sweep.csv"), sweep)
-    # cross-class mean: each (class, seed) pair is one sample
-    ds_mean = summarize([{**x, "seed": (x["class"], x["seed"])} for x in per_seed],
-                        ["dataset", "backbone", "budget", "variant", "policy"],
-                        lambda x: x["stage"] == "0")
-    for d in ds_mean:
-        d["n_class_seed_pairs"] = d.pop("n_seeds")
+    ds_mean = pooled(per_seed, ["dataset", "backbone", "budget", "variant", "arm", "kappa",
+                                "preshift", "policy"])
     write_csv(os.path.join(out, "memory_sweep_dataset_mean.csv"), ds_mean)
     stock = harvest_stock(pkg)
     write_csv(os.path.join(out, "stock_patchcore.csv"), stock)
     write_csv(os.path.join(out, "seed_variance.csv"), sorted(
-        ({k: x[k] for k in ("dataset", "class", "backbone", "capacity", "run", "policy",
-                            "seed", "image_auroc", "pixel_auroc", "pro", "writes_admit")}
+        ({k: x[k] for k in ("dataset", "class", "backbone", "capacity", "variant", "run", "policy",
+                            "seed", "train_seed", "image_auroc", "pixel_auroc", "pro", "iota",
+                            "writes_admit")}
          for x in per_seed if x["stage"] == "0"),
-        key=lambda d: (d["run"], d["policy"], d["seed"])))
+        key=lambda d: (d["run"], d["policy"], str(d["train_seed"]), d["seed"])))
     write_csv(os.path.join(out, "fullstream.csv"), summarize(
         per_seed, ["dataset", "class", "backbone", "budget", "variant", "capacity", "policy",
                    "stream_frac_evaluated_at", "test_set"], lambda x: True))
@@ -1020,6 +1523,9 @@ def main():
     deploy, protocol = harvest_deployment(runs, pkg), harvest_protocol(runs, a.dataset_root)
     write_csv(os.path.join(out, "deployment_memory.csv"), deploy)
     write_csv(os.path.join(out, "protocol.csv"), protocol)
+    deploy_meas = harvest_deployment_measured(runs)
+    for name, _, _, header, rows in new_sections(ds_mean, per_seed, deploy_meas, full=True):
+        write_csv(os.path.join(out, f"{name}.csv"), [dict(zip(header, r)) for r in rows], header)
 
     hp = code_hyperparams()
     hp["per_run"] = {r["run"]: {
@@ -1061,11 +1567,11 @@ def main():
                 overlap += overlap_summary(pairs, sub[0], f"{n}_test_vs_polyp_pvt_train")
         write_csv(os.path.join(out, "overlap_summary.csv"), overlap)
 
-    gaps = gaps_report(runs, per_seed, calib, overlap, stock, n_logs)
+    gaps = gaps_report(runs, per_seed, calib, overlap, stock, n_logs, deploy_meas)
     with open(os.path.join(out, "GAPS.md"), "w") as f:
         f.write(gaps)
     args = (ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
-            overlap, deploy, protocol, gaps)
+            overlap, deploy, protocol, gaps, deploy_meas)
     with open(os.path.join(out, "report.txt"), "w") as f:
         f.write(render_report(*args, full=True))
     short = render_report(*args, full=False)

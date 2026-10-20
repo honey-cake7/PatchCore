@@ -2,9 +2,21 @@
 
 State summarizes bank + stream statistics (never raw images); the action is a
 compact admission-bar + eviction-utility decision; the transition is
-deterministic given the cached stream; the reward is the label-free proxy on a
-held-out slice of the recent window. Both the learned policy and the hand-designed
-baselines drive the same transition via :meth:`step_with_decision`.
+deterministic given the cached stream. Both the learned policy and the
+hand-designed baselines drive the same transition via :meth:`step_with_decision`.
+
+Rewards (``reward_mode``):
+
+* ``"iota"`` (primary): r_t = -ι_t, the mean log normal-score inflation of a
+  whole-image held-out set H relative to a full-memory teacher table
+  (patchcore.streaming.teacher). Label-free, no fitted weights. H's images are
+  withheld from admission for every policy; S_B is tracked incrementally on
+  the k-NN device (see ``_iota_sync``).
+* ``"proxy"`` (legacy): the weighted coverage/redundancy/churn proxy on a
+  held-out slice of the recent window (reward.ProxyReward), unchanged.
+
+``admit_cap_abs`` (κ) caps writes per image for every policy — writes are an
+environment constraint, not a reward term.
 """
 import time
 from collections import deque
@@ -20,7 +32,10 @@ from patchcore.streaming.bank import (
     knn_device,
     pinned_global_seed,
 )
-from patchcore.streaming.reward import ProxyReward, RewardConfig, estimate_scales
+from patchcore.streaming.reward import (
+    ProxyReward, RewardConfig, estimate_scales, iota as iota_value,
+)
+from patchcore.streaming.teacher import image_scores_from_topk, sq_l2
 
 
 OBS_DIM = 53
@@ -44,6 +59,64 @@ class ActionConfig:
     mode: str = "continuous6"      # "continuous6" | "bar_only" | "discrete4"
     admit_cap_frac: float = 0.05   # max admissions per step, as a fraction of M
     discrete_k: int = 8            # patches added/evicted per discrete action
+
+
+# Full S_B recompute instead of the incremental update when a step's churn
+# exceeds this fraction of capacity (the eviction recompute would touch most
+# rows anyway).
+_IOTA_FULL_CHURN = 0.25
+
+
+def _bank_topk_sq(bank, q: torch.Tensor, q2: torch.Tensor, k: int):
+    """k smallest SQUARED L2 distances of device rows ``q`` to ``bank``'s
+    active entries, plus slot ids, as device tensors ([n, k] each).
+
+    Runs on the bank's own device mirror (``_base`` + active mask) so nothing
+    crosses host<->device. Missing neighbours (fewer than k active) are +inf
+    with slot -1.
+    """
+    bank._ensure_base()
+    n = len(q)
+    dev = bank.device
+    if n == 0:
+        return (torch.zeros((0, k), device=dev),
+                torch.zeros((0, k), dtype=torch.long, device=dev))
+    base = bank._base
+    b2 = (base * base).sum(dim=1)
+    inactive = ~bank._active_dev
+    kk = min(k, bank.capacity)
+    chunk = max(256, 64_000_000 // max(bank.capacity, 1))
+    dd, ii = [], []
+    for s in range(0, n, chunk):
+        d = sq_l2(q[s:s + chunk], base, q2[s:s + chunk], b2)
+        d.masked_fill_(inactive.unsqueeze(0), float("inf"))
+        v, i = torch.topk(d, kk, dim=1, largest=False)
+        dd.append(v)
+        ii.append(i)
+    dd, ii = torch.cat(dd), torch.cat(ii)
+    if kk < k:
+        dd = torch.cat([dd, torch.full((n, k - kk), float("inf"), device=dev)], 1)
+        ii = torch.cat([ii, torch.full((n, k - kk), -1, dtype=torch.long, device=dev)], 1)
+    ii = ii.masked_fill(~torch.isfinite(dd), -1)
+    return dd, ii
+
+
+def _shared_heldout_pool(reader, ids: np.ndarray, device):
+    """Device tensor of the held-out images' patches ([|H|*P, D]) + norms.
+
+    Memoized on the reader: lockstep envs share the reader AND the same H
+    (shared heldout_seed), so the pool is gathered/uploaded once per episode
+    for the whole group instead of once per env.
+    """
+    key = (tuple(int(i) for i in ids), str(device))
+    memo = getattr(reader, "_heldout_pool_memo", None)
+    if memo is not None and memo[0] == key:
+        return memo[1], memo[2]
+    pool = torch.from_numpy(np.ascontiguousarray(
+        reader.flat_slice(ids), dtype=np.float32)).to(device)
+    pool2 = (pool * pool).sum(dim=1)
+    reader._heldout_pool_memo = (key, pool, pool2)
+    return pool, pool2
 
 
 class RunningNorm:
@@ -104,6 +177,11 @@ class MemoryMaintenanceEnv:
         n_nearest_neighbours: int = 1,
         obs_norm: Optional["RunningNorm"] = None,
         episode_stop: Optional[int] = None,
+        reward_mode: str = "proxy",
+        teacher: Optional[dict] = None,
+        heldout_frac: float = 0.0,
+        heldout_seed: int = 0,
+        admit_cap_abs: Optional[int] = None,
     ) -> None:
         self.reader = reader
         self.capacity = int(capacity)
@@ -119,6 +197,39 @@ class MemoryMaintenanceEnv:
         # slice; None = the whole stream. Pre-shift-only training sets it to
         # the end of stage 0 so the policy never sees post-shift images.
         self.episode_stop = episode_stop
+        if reward_mode not in ("proxy", "iota"):
+            raise ValueError(f"unknown reward_mode {reward_mode!r}")
+        if reward_mode == "iota":
+            if teacher is None:
+                raise ValueError("reward_mode='iota' needs a teacher (load_teacher)")
+            if heldout_frac <= 0:
+                raise ValueError("reward_mode='iota' needs heldout_frac > 0")
+        if teacher is not None and int(teacher["n_images"]) != reader.n_images:
+            raise ValueError(
+                f"teacher built for {teacher['n_images']} images, stream has "
+                f"{reader.n_images} — rebuild it for this cache")
+        self.reward_mode = reward_mode
+        self.teacher = teacher
+        self.heldout_frac = float(heldout_frac)
+        # Shared by every env of a lockstep group (NOT the env seed), so the
+        # group sees the same H each episode and the GRPO per-timestep group
+        # baseline compares like with like.
+        self.heldout_seed = int(heldout_seed)
+        self.admit_cap_abs = None if admit_cap_abs is None else int(admit_cap_abs)
+        # ι scorer k: the teacher's k (S_B and S_F must use the same scorer);
+        # without a teacher (myopic baseline) the env's own n_nn.
+        self._iota_k = int(teacher["k"]) if teacher is not None else int(self.n_nn)
+        self._episode_idx = -1
+        self._ho_ids = np.empty(0, dtype=np.int64)
+        self._ho_mask: Optional[np.ndarray] = None
+        self._ho_pool: Optional[torch.Tensor] = None
+        self._ho_pool2: Optional[torch.Tensor] = None
+        self._ho_ppi = 0                 # patches per held-out image
+        self._ho_topd: Optional[torch.Tensor] = None
+        self._ho_topi: Optional[torch.Tensor] = None
+        self._ho_nimg = 0                # held-out images tracked (a prefix of H)
+        self._ho_full = False            # force a full S_B recompute at next sync
+        self._ho_bank_step = -1
 
         # Frozen random projection for the observation's distributional summary.
         self._proj = self.rng.normal(
@@ -156,7 +267,10 @@ class MemoryMaintenanceEnv:
         # (decode = action decoding incl. eviction features; reward = proxy
         # k-NNs; load = memmap read + device gathers + novelty k-NN; obs =
         # observation features). Cheap enough to keep always-on.
-        self.perf = {"decode": 0.0, "reward": 0.0, "load": 0.0, "obs": 0.0}
+        # iota = held-out S_B tracking + ι (incremental sync, new-image
+        # queries, lookups).
+        self.perf = {"decode": 0.0, "reward": 0.0, "load": 0.0, "obs": 0.0,
+                     "iota": 0.0}
 
     # ---- initialization --------------------------------------------------
     def _warmup_features(self) -> np.ndarray:
@@ -259,8 +373,161 @@ class MemoryMaintenanceEnv:
             else episode_slice.stop
         self._start, self._stop = int(start), int(min(stop, self.reader.n_images))
         self._t = self._start
+        self._reset_heldout()
         self._load_current()
         return self._observe()
+
+    # ---- whole-image held-out set (ι reward) -----------------------------
+    def _reset_heldout(self) -> None:
+        """Sample this episode's held-out set H and reset the S_B tracker.
+
+        Own rng (heldout_seed, episode index): never touches self.rng, so
+        proxy-mode trajectories are unchanged when heldout_frac == 0.
+        """
+        self._episode_idx += 1
+        self._ho_nimg = 0
+        self._ho_full = False
+        self._ho_bank_step = self.bank.step
+        if self.heldout_frac <= 0:
+            return
+        lo = max(self._start, self.warmup_images)
+        cand = np.arange(lo, self._stop, dtype=np.int64)
+        n_h = max(1, int(round(self.heldout_frac * len(cand)))) if len(cand) else 0
+        rng = np.random.default_rng([self.heldout_seed, self._episode_idx])
+        self._ho_ids = np.sort(rng.choice(cand, size=n_h, replace=False)) \
+            if n_h else np.empty(0, dtype=np.int64)
+        self._ho_mask = np.zeros(self.reader.n_images, dtype=bool)
+        self._ho_mask[self._ho_ids] = True
+        if n_h:
+            self._ho_pool, self._ho_pool2 = _shared_heldout_pool(
+                self.reader, self._ho_ids, self.bank.device)
+            self._ho_ppi = len(self._ho_pool) // n_h
+        else:
+            self._ho_pool = self._ho_pool2 = None
+        if self.reward_mode == "iota" and n_h:
+            rows = len(self._ho_pool)
+            if self._ho_topd is None or len(self._ho_topd) != rows:
+                k, dev = self._iota_k, self.bank.device
+                self._ho_topd = torch.empty((rows, k), device=dev)
+                self._ho_topi = torch.empty((rows, k), dtype=torch.long, device=dev)
+
+    @property
+    def heldout_ids(self) -> np.ndarray:
+        """This episode's held-out image ids (sorted)."""
+        return self._ho_ids
+
+    def heldout_seen_ids(self) -> np.ndarray:
+        """Held-out images already reached (n <= current image index)."""
+        return self._ho_ids[self._ho_ids <= self._t]
+
+    def _is_heldout(self, t: int) -> bool:
+        return self._ho_mask is not None and t < len(self._ho_mask) \
+            and bool(self._ho_mask[t])
+
+    def heldout_image_scores(self, bank=None) -> np.ndarray:
+        """S_B per seen held-out image, full recompute against ``bank``
+        (default env.bank) with the ι scorer. Does not touch env state, so
+        lookahead policies can score trial banks."""
+        bank = self.bank if bank is None else bank
+        n_seen = len(self.heldout_seen_ids())
+        if n_seen == 0:
+            return np.zeros(0, dtype=np.float32)
+        rows = n_seen * self._ho_ppi
+        d, _ = _bank_topk_sq(bank, self._ho_pool[:rows], self._ho_pool2[:rows],
+                             self._iota_k)
+        return image_scores_from_topk(d, n_seen).cpu().numpy()
+
+    def heldout_pool_seen(self):
+        """Read-only view of the seen held-out patch pool for exact lookahead
+        scorers: ``(patches [R, D], sq_norms [R], n_seen, k)`` device tensors
+        + ints, with R = n_seen * P rows grouped per image in
+        ``heldout_seen_ids()`` order, and k the ι scorer's neighbour count.
+        ``heldout_image_scores(bank)`` == image_scores_from_topk(top-k of
+        these rows vs bank, n_seen). Callers must not mutate the tensors
+        (they are the env's — and the reader-memoized — pool)."""
+        n_seen = len(self.heldout_seen_ids())
+        rows = n_seen * self._ho_ppi
+        if n_seen == 0:
+            dev = self.bank.device
+            return (torch.zeros((0, self.dim), device=dev),
+                    torch.zeros(0, device=dev), 0, self._iota_k)
+        return (self._ho_pool[:rows], self._ho_pool2[:rows], n_seen,
+                self._iota_k)
+
+    def _iota_sync(self, evict_slots: np.ndarray, added_slots: np.ndarray,
+                   bank_step_before: int) -> None:
+        """Bring the tracked held-out top-k up to date after this step's
+        evict + add.
+
+        Admissions are merged in by querying only the NEW entries
+        (O(new x |H rows|)); rows whose top-k held an evicted slot are
+        recomputed against the whole bank. A replace_bank(), heavy churn, or
+        any bank mutation the env did not make itself (detected via the bank's
+        mutation clock) falls back to a full recompute.
+        """
+        if self.reward_mode != "iota" or self._ho_nimg == 0:
+            self._ho_full = False
+            self._ho_bank_step = self.bank.step
+            return
+        t0 = time.perf_counter()
+        bank, k = self.bank, self._iota_k
+        rows = self._ho_nimg * self._ho_ppi
+        pool, pool2 = self._ho_pool[:rows], self._ho_pool2[:rows]
+        topd, topi = self._ho_topd[:rows], self._ho_topi[:rows]
+        churn = len(evict_slots) + len(added_slots)
+        if (self._ho_full or bank_step_before != self._ho_bank_step
+                or churn > _IOTA_FULL_CHURN * bank.capacity):
+            d, i = _bank_topk_sq(bank, pool, pool2, k)
+            topd.copy_(d)
+            topi.copy_(i)
+        elif churn:
+            dev = bank.device
+            affected = None
+            if len(evict_slots):
+                # BEFORE the merge: added entries may reuse evicted slot ids.
+                ev = torch.from_numpy(np.asarray(evict_slots, np.int64)).to(dev)
+                affected = torch.isin(topi, ev).any(dim=1)
+            if len(added_slots):
+                bank._ensure_base()
+                add = torch.from_numpy(np.asarray(added_slots, np.int64)).to(dev)
+                d_new = sq_l2(pool, bank._base[add], pool2)
+                cand_d = torch.cat([topd, d_new], dim=1)
+                cand_i = torch.cat([topi, add.unsqueeze(0).expand(rows, -1)], dim=1)
+                v, j = torch.topk(cand_d, k, dim=1, largest=False)
+                topd.copy_(v)
+                topi.copy_(torch.gather(cand_i, 1, j))
+            if affected is not None:
+                idx = torch.nonzero(affected).squeeze(1)
+                if len(idx):
+                    d, i = _bank_topk_sq(bank, pool[idx], pool2[idx], k)
+                    topd[idx] = d
+                    topi[idx] = i
+        self._ho_full = False
+        self._ho_bank_step = bank.step
+        self.perf["iota"] += time.perf_counter() - t0
+
+    def _iota_now(self) -> float:
+        """ι at the current image index (before _t advances); also starts
+        tracking image _t if it is held-out (full query, current bank)."""
+        t0 = time.perf_counter()
+        if self._is_heldout(self._t):
+            p = self._ho_ppi
+            r0, r1 = self._ho_nimg * p, (self._ho_nimg + 1) * p
+            d, i = _bank_topk_sq(self.bank, self._ho_pool[r0:r1],
+                                 self._ho_pool2[r0:r1], self._iota_k)
+            self._ho_topd[r0:r1] = d
+            self._ho_topi[r0:r1] = i
+            self._ho_nimg += 1
+        n_seen = self._ho_nimg
+        if n_seen == 0:
+            self.perf["iota"] += time.perf_counter() - t0
+            return float("nan")
+        s_b = image_scores_from_topk(
+            self._ho_topd[:n_seen * self._ho_ppi], n_seen).cpu().numpy()
+        s_f = self.teacher["S_F"][self._ho_ids[:n_seen], self._t]
+        val = iota_value(s_b, s_f, self.teacher["eps"])
+        self.perf["iota"] += time.perf_counter() - t0
+        return val
 
     # ---- per-step data ---------------------------------------------------
     def _load_current(self) -> None:
@@ -276,6 +543,12 @@ class MemoryMaintenanceEnv:
         n_hold = max(1, int(len(patches) * self.reward_cfg.holdout_patch_frac))
         perm = self.rng.permutation(len(patches))
         self._admissible = patches[perm[n_hold:]]
+        heldout = self._is_heldout(self._t)
+        if heldout:
+            # Whole held-out image: the step happens but nothing is
+            # admissible (same rng draw as a normal step, so trajectories
+            # stay aligned).
+            self._admissible = self._admissible[:0]
         # Device copy of the image, uploaded once per step (and shared across
         # lockstep envs when the reader memoizes it); holdout/admissible are
         # on-device gathers, so the novelty, reward-window and intra-batch
@@ -290,6 +563,8 @@ class MemoryMaintenanceEnv:
         pidx = torch.from_numpy(perm).to(dev)
         self._holdout_dev = patches_t[pidx[:n_hold]]
         self._admissible_dev = patches_t[pidx[n_hold:]]
+        if heldout:
+            self._admissible_dev = self._admissible_dev[:0]
 
     @property
     def current_batch(self) -> np.ndarray:
@@ -489,14 +764,30 @@ class MemoryMaintenanceEnv:
         """
         admit_idx = np.asarray(admit_idx, dtype=np.int64)
         evict_slots = np.asarray(evict_slots, dtype=np.int64)
+        if len(self._admissible) == 0:
+            admit_idx = admit_idx[:0]
+        cap = self.admit_cap_abs
+        if cap is not None and len(admit_idx) > cap:
+            # κ write cap (all policies): keep the first κ admits in the
+            # policy's order, and drop the evictions that only made room for
+            # the dropped admits. Evictions beyond what the policy's own
+            # admits needed (voluntary, e.g. k-center thinning) are kept;
+            # with none, this is exactly max(0, n_admit_kept - free).
+            free0 = self.capacity - len(self.bank)
+            voluntary = max(0, len(evict_slots) - max(0, len(admit_idx) - free0))
+            admit_idx = admit_idx[:cap]
+            evict_slots = evict_slots[:voluntary + max(0, len(admit_idx) - free0)]
+        bank_step_before = self.bank.step
         # enforce budget: never let admissions exceed free capacity after evictions
         self.bank.evict(evict_slots)
         free = self.capacity - len(self.bank)
         if len(admit_idx) > free:
             admit_idx = admit_idx[:free]
         n_admit = len(admit_idx)
+        added = np.empty(0, dtype=np.int64)
         if n_admit:
-            self.bank.add(self._admissible[admit_idx], stage=self.stage)
+            added = self.bank.add(self._admissible[admit_idx], stage=self.stage)
+        self._iota_sync(evict_slots, added, bank_step_before)
 
         # fold in any churn from a preceding replace_bank() this step
         pend_admit, pend_evict = self._pending_churn
@@ -517,11 +808,20 @@ class MemoryMaintenanceEnv:
                      holdout_dists=None, probe_dists=None):
         """Reward + step bookkeeping; optional injected batched distances."""
         t0 = time.perf_counter()
-        reward, comps = self._proxy.compute(
-            self.bank, holdout, tot_admit, tot_evict,
-            holdout_dists=holdout_dists, probe_dists=probe_dists,
-        )
+        if self.reward_mode == "iota":
+            reward, comps = self._window_comps(holdout, tot_admit, tot_evict,
+                                               holdout_dists)
+        else:
+            reward, comps = self._proxy.compute(
+                self.bank, holdout, tot_admit, tot_evict,
+                holdout_dists=holdout_dists, probe_dists=probe_dists,
+            )
         self.perf["reward"] += time.perf_counter() - t0
+        iota_t = float("nan")
+        if self.reward_mode == "iota":
+            iota_t = self._iota_now()
+            reward = 0.0 if not np.isfinite(iota_t) else -iota_t
+            comps["reward"] = reward
         scale = self.reward_cfg.coverage_scale
         self._win_cov_cache = (comps["C"] * scale, comps["C90"] * scale)
 
@@ -537,8 +837,32 @@ class MemoryMaintenanceEnv:
             "stage": self.stage if not done else self.reader.stage_of(self._t - 1),
             "n_admit": tot_admit, "n_evict": tot_evict,
             "occupancy": self.bank.occupancy, **comps,
+            "iota": iota_t, "writes": tot_admit,
         }
         return reward, info, done
+
+    def _window_comps(self, holdout, tot_admit, tot_evict, holdout_dists=None):
+        """iota mode: the recent-window coverage the OBSERVATION needs (one
+        NN-1 query, batched by the lockstep path), logged under the proxy's
+        component keys so trace consumers keep working; the proxy's
+        redundancy/probe terms are not computed. Returns (0.0, comps); the
+        caller sets the ι reward."""
+        scale = self.reward_cfg.coverage_scale + 1e-8
+        c = c90 = 0.0
+        if len(holdout) and len(self.bank):
+            if holdout_dists is None:
+                holdout_dists = self.bank.knn(holdout, k=1)[0][:, 0]
+            d = holdout_dists[np.isfinite(holdout_dists)]
+            if len(d):
+                c = float(d.mean()) / scale
+                c90 = float(np.percentile(d, 90)) / scale
+        churn = (tot_admit + tot_evict) / max(self.bank.capacity, 1)
+        return 0.0, {
+            "C": c, "R": 0.0, "U": churn, "churn": churn, "churn_excess": 0.0,
+            "score_drift": 0.0, "C90": c90, "P": 0.0,
+            "Q": c90 / c if c > 1e-8 else 0.0, "potential_cost": 0.0,
+            "reward": 0.0,
+        }
 
     # ---- lockstep (batched k-NN) protocol --------------------------------
     # Vectorized training envs replay the same stream in lockstep, so their
@@ -609,3 +933,6 @@ class MemoryMaintenanceEnv:
             n_added = len(vectors)
         prev_add, prev_evict = self._pending_churn
         self._pending_churn = (prev_add + n_added, prev_evict + n_evicted)
+        # Exempt from the κ write cap (it is the baseline's whole mechanism);
+        # its writes still count via the pending churn. S_B: full recompute.
+        self._ho_full = True

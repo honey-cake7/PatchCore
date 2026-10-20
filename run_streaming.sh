@@ -249,6 +249,25 @@ STAGE0_ONLY_ARG=""
 #   OFFLINE=1        step 6: offline greedy coreset at exactly M (stage-0 pool
 #                    and whole-stream pool), appended to results.csv
 #   DEPLOY=1         step 7: latency + peak GPU memory -> deployment.csv
+# ι reward (label-free normal-score inflation vs a full-memory teacher) — the
+# paper's reward. REWARD_MODE=proxy keeps the old calibrated pipeline (steps
+# 3.5-4 exactly as before) for reproducing historical runs only.
+#   HELDOUT_FRAC  whole images per episode withheld from admission to score ι
+#   KAPPA         write cap: admitted patches per image (empty = unlimited)
+#   HIDDEN/EPOCHS/MINIBATCHES  PPO net width and update schedule
+#   FULL_MEMORY=1 step 6 also scores the uncompressed stage-0 / whole-stream
+#                 banks (the teacher itself; M-independent, so one budget is enough)
+REWARD_MODE=${REWARD_MODE:-proxy}
+HELDOUT_FRAC=${HELDOUT_FRAC:-0.05}
+KAPPA=${KAPPA:-}
+HIDDEN=${HIDDEN:-128}
+EPOCHS=${EPOCHS:-4}
+MINIBATCHES=${MINIBATCHES:-64}
+ADV_BASELINE=${ADV_BASELINE:-loo}
+FULL_MEMORY=${FULL_MEMORY:-0}
+KAPPA_ARG=""
+[ -n "${KAPPA}" ] && KAPPA_ARG="--admit_cap_abs ${KAPPA}"
+
 CALIB_SPLIT=${CALIB_SPLIT:-0}
 PRESHIFT=${PRESHIFT:-0}
 STAGE0_EVERY=${STAGE0_EVERY:-0}
@@ -290,6 +309,9 @@ PERMUTE=${PERMUTE:-0}
 TRAIN_SEEDS=${TRAIN_SEEDS:-0}                  # PPO training seed(s)
 EVAL_SEEDS=${EVAL_SEEDS:-0,1,2}               # benchmark eval seeds (disjoint from train ideally)
 POLICIES=${POLICIES:-static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo}
+# myopic_iota needs the held-out set, so it only joins the default list under ι
+[ "${REWARD_MODE}" = "iota" ] && [ "${POLICIES}" = "static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo" ] \
+    && POLICIES="static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,kcenter,myopic_iota,ppo"
 
 # Class list: space-separated; classes run SEQUENTIALLY in this one job.
 # Per-class artifacts land in results/streaming/<class>_<backbone>_<drift>/ and
@@ -414,6 +436,53 @@ PYEOF
         echo "[${CLASSNAME}] CAPACITY_MODE=match -> M=${CAPACITY} (${CAPACITY_PCT}% of stream patches, stock-budget-matched)"
     fi
 
+    local REWARD_JSON_ARG="" PPO_PATHS="${PPO_OUT}" IOTA_ARGS=""
+    if [ "${REWARD_MODE}" = "iota" ]; then
+        # STEP 2: teacher table S_F[n, t] (full-memory image scores, near-
+        # duplicate clusters excluded). Label-free and M-independent: built once
+        # per cache and shared by every budget/κ/seed run.
+        local TEACHER=${CACHE_DIR}/teacher_k${N_NN}.npz
+        if [ -f "${TEACHER}" ] && [ "${RECACHE}" != "1" ]; then
+            echo -e "\n[${CLASSNAME} 2/7] Teacher table exists (${TEACHER}) — reusing."
+        else
+            echo -e "\n[${CLASSNAME} 2/7] Building full-memory teacher table ..."
+            python -u bin/build_teacher.py \
+                --cache_dir  "${CACHE_DIR}" \
+                --n_nn       "${N_NN}" \
+                --data_path  "${DATA_PATH}" \
+                --classname  "${CLASSNAME}" \
+                --out        "${TEACHER}" || { echo "[${CLASSNAME}] teacher build failed"; return 1; }
+        fi
+        IOTA_ARGS="--reward_mode iota --teacher ${TEACHER} --heldout_frac ${HELDOUT_FRAC} ${KAPPA_ARG}"
+
+        # STEP 4: one PPO policy per training seed (no reward fit — ι has no weights)
+        PPO_PATHS=""
+        local ts
+        for ts in ${TRAIN_SEEDS//,/ }; do
+            local CKPT=${RESULT_DIR}/ppo_${TAG}_s${ts}.pt
+            echo -e "\n[${CLASSNAME} 4/7] Training PPO (ι reward) seed ${ts} ..."
+            python -u bin/train_ppo.py \
+                --cache_dir        "${CACHE_DIR}" \
+                --capacity         "${CAPACITY}" \
+                --warmup           "${WARMUP}" \
+                --total_env_steps  "${PPO_STEPS}" \
+                --seed             "${ts}" \
+                --out              "${CKPT}" \
+                --adv_mode         "${ADV_MODE}" \
+                --adv_baseline     "${ADV_BASELINE}" \
+                --clip_mode        "${CLIP_MODE}" \
+                ${CLIP_HIGH_ARG} \
+                --lr               "${PPO_LR}" \
+                --lr_end           "${PPO_LR_END}" \
+                --hidden           "${HIDDEN}" \
+                --epochs           "${EPOCHS}" \
+                --minibatches      "${MINIBATCHES}" \
+                ${IOTA_ARGS} \
+                ${PRESHIFT_ARG} \
+                --eval_baselines || { echo "[${CLASSNAME}] PPO training (seed ${ts}) failed"; return 1; }
+            PPO_PATHS="${PPO_PATHS:+${PPO_PATHS},}${ts}:${CKPT}"
+        done
+    else
     # STEP 3.5: fit proxy-reward weights offline (ranking validation vs AUROC).
     # Saved traces make refits (e.g. a new FORGET_WEIGHT) take seconds instead
     # of replaying every baseline rollout — but traces bake in warmup/capacity/
@@ -448,7 +517,6 @@ PYEOF
 
     # Without the fitted weights train/benchmark fall back to the DEFAULT
     # reward config (q_coef=0 — the misaligned reward).
-    local REWARD_JSON_ARG=""
     [ -f "${RESULT_DIR}/reward_weights.json" ] && REWARD_JSON_ARG="--reward_json ${RESULT_DIR}/reward_weights.json"
 
     # STEP 4: train PPO
@@ -469,6 +537,7 @@ PYEOF
         ${REWARD_JSON_ARG} \
         ${PRESHIFT_ARG} \
         --eval_baselines || { echo "[${CLASSNAME}] PPO training failed"; return 1; }
+    fi
 
     # STEP 5: benchmark all policies
     echo -e "\n[${CLASSNAME} 5/5] Benchmarking policies ..."
@@ -478,8 +547,9 @@ PYEOF
         --warmup     "${WARMUP}" \
         --n_nn       "${N_NN}" \
         --policies   "${POLICIES}" \
-        --ppo_path   "${PPO_OUT}" \
+        --ppo_path   "${PPO_PATHS}" \
         --seeds      "${EVAL_SEEDS}" \
+        ${IOTA_ARGS} \
         ${REWARD_JSON_ARG} \
         ${STAGE0_ONLY_ARG} \
         ${CALIB_ARG} \
@@ -499,6 +569,17 @@ PYEOF
             ${CALIB_ARG} \
             --out         "${RESULT_DIR}" || { echo "[${CLASSNAME}] offline coreset failed"; return 1; }
     fi
+    if [ "${FULL_MEMORY}" = "1" ]; then
+        echo -e "\n[${CLASSNAME} 6/7] Full-memory banks (uncompressed stage-0 / whole stream) ..."
+        python -u bin/run_offline_coreset.py \
+            --cache_dir   "${CACHE_DIR}" \
+            --capacity    "${CAPACITY}" \
+            --n_nn        "${N_NN}" \
+            --seeds       "${EVAL_SEEDS}" \
+            --full_memory \
+            ${CALIB_ARG} \
+            --out         "${RESULT_DIR}" || { echo "[${CLASSNAME}] full-memory eval failed"; return 1; }
+    fi
 
     # STEP 7: deployment cost (latency per image + peak GPU memory)
     if [ "${DEPLOY}" = "1" ]; then
@@ -517,7 +598,8 @@ PYEOF
             --capacity                  "${CAPACITY}" \
             --warmup                    "${WARMUP}" \
             --n_nn                      "${N_NN}" \
-            --ppo_path                  "${PPO_OUT}" \
+            --ppo_path                  "${PPO_PATHS##*:}" \
+            ${IOTA_ARGS} \
             ${REWARD_JSON_ARG} \
             --out                       "${RESULT_DIR}" || { echo "[${CLASSNAME}] deployment measurement failed"; return 1; }
     fi

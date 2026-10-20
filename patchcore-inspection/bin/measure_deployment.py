@@ -57,14 +57,18 @@ def _timed(fn, n, warm=5):
 @click.option("--n_nn", type=int, default=5)
 @click.option("--ppo_path", default=None)
 @click.option("--reward_json", default=None)
-@click.option("--policies", default="static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,ppo")
+@click.option("--policies", default="static,fifo,reservoir,streaming_greedy_coreset,periodic_coreset,kcenter,myopic_iota,ppo")
+@click.option("--reward_mode", default="proxy", type=click.Choice(["proxy", "iota"]))
+@click.option("--teacher", default=None)
+@click.option("--heldout_frac", type=float, default=0.0)
+@click.option("--admit_cap_abs", type=int, default=None)
 @click.option("--n_images", type=int, default=50)
 @click.option("--n_steps", type=int, default=100)
 @click.option("--out", required=True)
 def main(backbone_name, layers_to_extract_from, data_path, classname, resize,
          imagesize, pretrain_embed_dimension, target_embed_dimension, patchsize,
          cache_dir, capacity, warmup, n_nn, ppo_path, reward_json, policies,
-         n_images, n_steps, out):
+         reward_mode, teacher, heldout_frac, admit_cap_abs, n_images, n_steps, out):
     from cache_embeddings import _base_transforms, _embed_image, _to_tensor, build_patchcore
 
     from patchcore.streaming import policies as P
@@ -92,9 +96,21 @@ def main(backbone_name, layers_to_extract_from, data_path, classname, resize,
     # ---- bank (warmup coreset at M) + NN search ----
     stream = EmbeddingCacheReader(os.path.join(cache_dir, "stream"))
     reward_cfg = load_reward_weights(reward_json) if reward_json else RewardConfig()
+    # ι mode: the maintenance timing includes the per-step ι tracker, i.e. what
+    # training pays; a deployed policy needs neither teacher nor reward, so this
+    # is an upper bound. myopic_iota needs the held-out set (heldout_frac > 0).
+    extra = {}
+    if heldout_frac:
+        extra.update(heldout_frac=heldout_frac, heldout_seed=0)
+    if admit_cap_abs is not None:
+        extra["admit_cap_abs"] = admit_cap_abs
+    if reward_mode == "iota":
+        from patchcore.streaming.teacher import load_teacher
+
+        extra.update(reward_mode="iota", teacher=load_teacher(teacher))
     env0 = MemoryMaintenanceEnv(stream, capacity=capacity, warmup_images=warmup,
                                 n_nearest_neighbours=n_nn,
-                                reward_cfg=dataclasses.replace(reward_cfg))
+                                reward_cfg=dataclasses.replace(reward_cfg), **extra)
     env0.reset()
     test = EmbeddingCacheReader(os.path.join(cache_dir, "test", "stage_0"))
     q = [np.ascontiguousarray(test.embeddings[i], dtype=np.float32)
@@ -115,12 +131,15 @@ def main(backbone_name, layers_to_extract_from, data_path, classname, resize,
             ac, norm, meta = load_checkpoint(ppo_path, device="cpu")
             pol, mode = P.PPOPolicy(ac), (meta or {}).get("action_mode")
         else:
+            if name == "myopic_iota" and not heldout_frac:
+                print("[skip] myopic_iota needs --heldout_frac > 0")
+                continue
             cls = P.BASELINES[name]
             pol = cls(k=8) if name in ("fifo", "random") else cls()
         env = MemoryMaintenanceEnv(stream, capacity=capacity, warmup_images=warmup,
                                    n_nearest_neighbours=n_nn, obs_norm=norm,
                                    action_cfg=ActionConfig(mode=mode or "continuous6"),
-                                   reward_cfg=dataclasses.replace(reward_cfg))
+                                   reward_cfg=dataclasses.replace(reward_cfg), **extra)
         env.import_init_state(env0.export_init_state())
         env.reset()
         steps = min(n_steps, stream.n_images - warmup - 1)

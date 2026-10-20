@@ -76,6 +76,13 @@ class PPOConfig:
     #         Valid here because all envs replay the same cached stream in
     #         lockstep, so the group mean is a matched baseline.
     adv_mode: str = "gae"
+    # grpo baseline at each timestep: "mean" = group mean including the env
+    # itself (original), "loo" = leave-one-out mean of the other envs. Note
+    # loo advantages are exactly N/(N-1) x mean advantages, so after update()'s
+    # per-batch advantage normalization the two give identical updates; kept
+    # selectable because the spec names it and it documents intent.
+    adv_baseline: str = "mean"
+    hidden: int = 128                    # actor/critic MLP width
     # "clip": standard PPO hard clip (zero gradient once the ratio leaves the
     #         trust region).
     # "gppo": gradient-preserving clip — same forward loss, but the gradient of
@@ -112,7 +119,7 @@ class PPOTrainer:
         for env in self.envs:
             env._norm = self.obs_norm
         self.device = torch.device(self.cfg.device)
-        self.ac = ActorCritic().to(self.device)
+        self.ac = ActorCritic(hidden=self.cfg.hidden).to(self.device)
         self.opt = torch.optim.Adam(self.ac.parameters(), lr=self.cfg.lr)
         self._obs = np.stack([e.reset() for e in self.envs])
         self._ret_rms_std = 1.0  # running return std for reward scaling
@@ -142,6 +149,11 @@ class PPOTrainer:
 
         envs = self.envs
         cfg0 = envs[0].reward_cfg
+        # ι mode: each env computes ι itself (incremental S_B, inside
+        # lockstep_reward). Only the window NN-1 the observation needs is
+        # batched here; the proxy's probe and member-NN-2 terms are skipped.
+        iota_mode = envs[0].reward_mode == "iota"
+        need_r = cfg0.beta != 0 and not iota_mode
         bknn = 0.0
 
         holds = [env.lockstep_begin(action[i]) for i, env in enumerate(envs)]
@@ -150,7 +162,8 @@ class PPOTrainer:
         t0 = time.perf_counter()
         wd, _ = batched_bank_knn(banks, torch.stack(holds), k=1)
         probe_rows = None
-        if len(envs[0]._proxy.probe) and (cfg0.probe_coef != 0 or cfg0.gamma != 0):
+        if (not iota_mode and len(envs[0]._proxy.probe)
+                and (cfg0.probe_coef != 0 or cfg0.gamma != 0)):
             if (self._probe_stack is None
                     or self._probe_stack.shape[0] != self.n_env):
                 # Per-env probes (identical objects when envs share init
@@ -161,7 +174,7 @@ class PPOTrainer:
                 ])
             pd, _ = batched_bank_knn(banks, self._probe_stack, k=1)
             probe_rows = pd[:, :, 0]
-        if cfg0.beta != 0:
+        if need_r:
             batched_member_nn2(banks)  # injects each bank's per-step cache
         bknn += time.perf_counter() - t0
 
@@ -184,9 +197,12 @@ class PPOTrainer:
         adm = [env.lockstep_load() for env in envs]
         t0 = time.perf_counter()
         aq = torch.stack(adm)
-        nd, _ = batched_bank_knn(banks, aq, k=1)
+        if aq.shape[1]:
+            nd, _ = batched_bank_knn(banks, aq, k=1)
+        else:  # held-out image: empty admissible batch for every env (shared H)
+            nd = np.zeros((len(envs), 0, 1), dtype=np.float32)
         intra = batched_intra_nn2(aq)
-        if cfg0.beta == 0:
+        if not need_r:
             # The observation's redundancy features need member NN-2 that the
             # (skipped) reward term no longer provides. Mirror the sequential
             # member_redundancy(sample=1024) branch exactly, rng included.
@@ -278,7 +294,11 @@ class PPOTrainer:
             for t in reversed(range(T)):
                 running = rew_scaled[t] + cfg.gamma * running * (1.0 - done_buf[t])
                 G[t] = running
-            adv = G - G.mean(axis=1, keepdims=True)
+            if cfg.adv_baseline == "loo" and N > 1:
+                base = (G.sum(axis=1, keepdims=True) - G) / (N - 1)
+            else:
+                base = G.mean(axis=1, keepdims=True)
+            adv = G - base
             ret = G
         else:
             adv = np.zeros((T, N), np.float32)
@@ -409,6 +429,10 @@ class PPOTrainer:
                 "act_dim": ACTION_DIM,
                 "action_mode": env0.action_cfg.mode,
                 "reward_cfg": dataclasses.asdict(env0.reward_cfg),
+                "reward_mode": env0.reward_mode,
+                "heldout_frac": env0.heldout_frac,
+                "admit_cap_abs": env0.admit_cap_abs,
+                "hidden": self.cfg.hidden,
             },
             path,
         )
@@ -434,11 +458,16 @@ def load_checkpoint(path: str, device: str = "cpu") -> Tuple[ActorCritic, Option
     # defaults weights_only=True which rejects them.
     obj = torch.load(path, map_location=device, weights_only=False)
     if isinstance(obj, dict) and obj.get("format_version", 0) >= 2:
-        ac = ActorCritic(obj.get("obs_dim", OBS_DIM), obj.get("act_dim", ACTION_DIM))
+        ac = ActorCritic(obj.get("obs_dim", OBS_DIM), obj.get("act_dim", ACTION_DIM),
+                         hidden=obj.get("hidden", 128))
         ac.load_state_dict(obj["ac"])
         ac.to(torch.device(device))
         norm = RunningNorm.from_state_dict(obj["obs_norm"]) if obj.get("obs_norm") else None
-        meta = {k: obj[k] for k in ("action_mode", "reward_cfg") if k in obj}
+        # reward_mode / heldout_frac / admit_cap_abs / hidden only exist in
+        # checkpoints written after the ι rebuild; absent keys = legacy proxy.
+        meta = {k: obj[k] for k in ("action_mode", "reward_cfg", "reward_mode",
+                                    "heldout_frac", "admit_cap_abs", "hidden")
+                if k in obj}
         return ac, norm, meta
     print("[ppo] WARNING: legacy checkpoint (no obs normalizer saved) — "
           "eval will re-fit observation normalization from its own stream.")

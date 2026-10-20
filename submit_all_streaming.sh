@@ -30,6 +30,8 @@
 #       nvidia/mit-b3 in the HF cache (./download_hf_backbones.sh, login node).
 #       New backbone = new cache tag: step 1 re-caches all 15 classes first.
 #
+#   ENDO_BACKBONE=pvtv2_b2 ONLY=kvasir ./submit_all_streaming.sh
+#       endoscopy jobs on another backbone (default polyp-pvt); new cache tag.
 #   MEM=48G ONLY=kvasir ./submit_all_streaming.sh
 #       host RAM for the endoscopy jobs (default 12G); OFFLINE=1's whole-stream
 #       coreset pool is ~8-11 GB on Kvasir/HyperKvasir, so raise it there.
@@ -54,7 +56,7 @@ submitted() { echo "SUBMITTED_JOBID=$1"; }
 
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "hyperkvasir" ]; then
     echo "Submitting HyperKvasir (polyp-pvt) ..."
-    submitted "$(BACKBONE=polyp-pvt \
+    submitted "$(BACKBONE="${ENDO_BACKBONE:-polyp-pvt}" \
     DATA_PATH="${DATASET_ROOT}/hyperkvasir_patchcore" \
     CLASSNAMES="hyperkvasir" \
     sbatch --parsable --job-name=stream-hyperkvasir \
@@ -70,7 +72,7 @@ if [ "${ONLY}" = "kvasir" ]; then
     # defaults (WARMUP=100, 100k PPO steps) were tuned for it, so nothing is
     # overridden here. CAPACITY is whatever the caller sets (the paper uses a
     # fixed M rather than a matched percentage for this one).
-    submitted "$(BACKBONE=polyp-pvt \
+    submitted "$(BACKBONE="${ENDO_BACKBONE:-polyp-pvt}" \
     DATA_PATH="${DATASET_ROOT}/kvasir_patchcore" \
     CLASSNAMES="kvasir" \
     sbatch --parsable --job-name=stream-kvasir \

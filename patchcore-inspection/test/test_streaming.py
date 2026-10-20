@@ -565,3 +565,340 @@ def test_calibration_split_disjoint_stratified_and_preshift_stops_at_stage1():
     summ = P.run_policy(env, P.FIFOPolicy(k=8))
     assert len(summ["infos"]) == stop - 10                # ends at the first stage-1 image
     assert all(i["stage"] == 0 for i in summ["infos"])
+
+
+# ==== Agent B block: kcenter / myopic_iota / benchmark CSV / full memory ====
+def _load_bin(name):
+    """Import a bin/ script as a module (bin/ is not a package)."""
+    import importlib.util
+    import os
+
+    path = os.path.join(os.path.dirname(__file__), "..", "bin", f"{name}.py")
+    spec = importlib.util.spec_from_file_location(f"_bin_{name}", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_greedy_net_matches_sequential_rule():
+    import torch
+
+    rng = np.random.default_rng(0)
+    x = torch.from_numpy(rng.normal(size=(300, 4)).astype("float32"))
+    for r in (0.3, 1.0, 2.5):
+        keep = P.greedy_net(x, r).numpy()
+        d = torch.cdist(x, x).numpy()
+        ref = []
+        for i in range(len(x)):  # the sequential definition of a greedy r-net
+            if all(d[i, j] > r for j in ref):
+                ref.append(i)
+        want = np.zeros(len(x), dtype=bool)
+        want[ref] = True
+        assert np.array_equal(keep, want), r
+
+
+def test_kcenter_respects_capacity_and_keeps_r_net(small_stream):
+    stream, _ = small_stream
+    env = MemoryMaintenanceEnv(stream, capacity=150, warmup_images=40, seed=0)
+    pol = P.BASELINES["kcenter"]()
+    env.reset()
+    done, doublings, r0 = False, 0, None
+    while not done:
+        r_before = pol.r
+        _, _, done, _ = pol.step(env)
+        r0 = r0 if r0 is not None else r_before
+        assert len(env.bank) <= env.capacity
+    assert pol.r > r0  # the stream drifted -> at least one doubling happened
+    v = env.bank.vectors()
+    dd = np.sqrt(((v[:, None] - v[None]) ** 2).sum(-1))
+    np.fill_diagonal(dd, np.inf)
+    assert dd.min() > pol.r - 1e-4  # bank stays r-separated
+
+
+def test_trial_mutation_restores_bank_exactly():
+    import torch
+
+    rng = np.random.default_rng(5)
+    bank = DynamicMemoryBank(capacity=50, dim=8)
+    bank.add(rng.normal(size=(45, 8)).astype("float32"))
+    bank.evict(np.array([3, 7]))           # holes below the tail free slots
+    q = rng.normal(size=(20, 8)).astype("float32")
+    d0, s0 = bank.knn(q, k=3)
+    snap = bank.snapshot()
+    new = rng.normal(size=(9, 8)).astype("float32")
+    with P.trial_mutation(bank, np.array([1, 2, 10, 11]), new) as b:
+        assert len(b) == 43 - 4 + 9
+        d1, _ = b.knn(q, k=3)
+        ref = b.vectors()
+        bf = np.sort(np.sqrt(((q[:, None] - ref[None]) ** 2).sum(-1)), axis=1)[:, :3]
+        assert np.allclose(d1, bf, atol=1e-3)  # trial state is live on device
+    for a in ("store", "active", "insert_step", "insert_stage", "hit_count",
+              "last_hit_step"):
+        got = bank._store if a == "store" else getattr(bank, "_active" if a == "active" else a)
+        assert np.array_equal(got, getattr(snap, a)), a
+    assert len(bank) == snap.size and bank.step == snap.step
+    assert torch.equal(bank._active_dev.cpu(), torch.from_numpy(snap.active))
+    assert torch.allclose(bank._base.cpu()[snap.active],
+                          torch.from_numpy(snap.store[snap.active]))
+    d2, s2 = bank.knn(q, k=3)
+    assert np.array_equal(s2, s0) and np.allclose(d2, d0)
+
+
+def test_full_memory_chunked_eval_matches_unchunked(small_stream):
+    from patchcore.streaming.evaluate import _torch_patch_scores
+
+    off = _load_bin("run_offline_coreset")
+    rng = np.random.default_rng(1)
+    bank = rng.normal(size=(1000, 16)).astype("float32")
+    q = rng.normal(size=(301, 16)).astype("float32")
+    ref = _torch_patch_scores(DynamicMemoryBank.from_vectors(bank, 1000), q, 3)
+    got = off.chunked_patch_scores(bank, q, 3, bank_chunk=97, query_chunk=50)
+    assert np.allclose(got, ref, rtol=1e-4, atol=1e-4)
+    # tiny final bank chunk (< k rows) must still merge exactly
+    got = off.chunked_patch_scores(bank[:202], q, 3, bank_chunk=100, query_chunk=64)
+    ref = _torch_patch_scores(DynamicMemoryBank.from_vectors(bank[:202], 202), q, 3)
+    assert np.allclose(got, ref, rtol=1e-4, atol=1e-4)
+
+    stream, tests = small_stream
+    feats = stream.flat_slice(range(40))
+    m_full = off.evaluate_full_memory(feats, tests[0], 1, None, None,
+                                      bank_chunk=33, query_chunk=17)
+    m_ref = evaluate_bank_on_stage(
+        DynamicMemoryBank.from_vectors(feats, len(feats)), tests[0], 1)
+    assert m_full["image_auroc"] == pytest.approx(m_ref["image_auroc"], abs=1e-6)
+
+
+def test_ppo_path_parsing():
+    rsb = _load_bin("run_streaming_baseline")
+    assert rsb._parse_ppo_paths("ppo_policy.pt") == [("", "ppo_policy.pt")]
+    assert rsb._parse_ppo_paths("0:a/p0.pt, 1:b/p1.pt") == [("0", "a/p0.pt"),
+                                                           ("1", "b/p1.pt")]
+    assert rsb._parse_ppo_paths("C:dir/x.pt") == [("", "C:dir/x.pt")]
+
+
+def test_streaming_baseline_csv_superset(tmp_path):
+    import csv
+
+    from click.testing import CliRunner
+
+    rsb = _load_bin("run_streaming_baseline")
+    res = CliRunner().invoke(rsb.main, [
+        "--synthetic", "--capacity", "300", "--policies", "static,kcenter",
+        "--seeds", "0", "--stage0_every_boundary", "--out", str(tmp_path)])
+    assert res.exit_code == 0, res.output
+    with open(tmp_path / "results.csv") as f:
+        rows = list(csv.DictReader(f))
+    assert list(rows[0]) == ["policy", "seed", "train_seed", "stage", "image_auroc",
+                             "pixel_auroc", "pro", "writes", "evict", "iota"]
+    kc = [r for r in rows if r["policy"] == "kcenter"]
+    assert {r["stage"] for r in kc} >= {"0", "3", "stage0_at_1", "final_forgetting"}
+    assert len({r["writes"] for r in kc}) == 1 and int(kc[0]["writes"]) > 0
+    assert all(r["train_seed"] == "" for r in rows)
+    # myopic_iota without a held-out set is refused up front
+    res = CliRunner().invoke(rsb.main, [
+        "--synthetic", "--policies", "myopic_iota", "--out", str(tmp_path)])
+    assert res.exit_code != 0 and "heldout_frac" in res.output
+
+
+def test_myopic_iota_lookahead(small_stream):
+    import inspect
+
+    if "heldout_frac" not in inspect.signature(MemoryMaintenanceEnv).parameters:
+        pytest.skip("MemoryMaintenanceEnv has no heldout_frac yet (Agent A's "
+                    "ι env not integrated) — run after integration")
+    stream, _ = small_stream
+
+    def make():
+        return MemoryMaintenanceEnv(stream, capacity=150, warmup_images=40,
+                                    seed=0, heldout_frac=0.2, heldout_seed=0)
+
+    env = make()
+    pol = P.BASELINES["myopic_iota"]()
+    env.reset()
+    assert len(env.heldout_ids) > 0
+    done = False
+    while not done:
+        snap = env.bank.snapshot()
+        admit, evict = pol.decide(env)
+        # the trials must leave the live bank untouched
+        assert np.array_equal(env.bank._active, snap.active)
+        assert np.array_equal(env.bank._store[snap.active], snap.store[snap.active])
+        assert env.bank.step == snap.step
+        _, _, done, _ = env.step_with_decision(admit, evict)
+        assert len(env.bank) <= env.capacity
+    myopic = np.mean(np.log(env.heldout_image_scores()))
+
+    env_s = make()
+    P.run_policy(env_s, P.StaticPolicy())
+    assert np.array_equal(env_s.heldout_ids, env.heldout_ids)  # same H
+    static = np.mean(np.log(env_s.heldout_image_scores()))
+    assert myopic < static  # lookahead lowers held-out normal scores
+
+
+def test_myopic_iota_fast_path_matches_trial_banks(small_stream):
+    import inspect
+
+    if "heldout_frac" not in inspect.signature(MemoryMaintenanceEnv).parameters:
+        pytest.skip("MemoryMaintenanceEnv has no heldout_frac yet")
+    stream, _ = small_stream
+    # k=3 and a full 120-slot bank: the m=16/64 candidates evict > k slots
+    env = MemoryMaintenanceEnv(stream, capacity=120, warmup_images=40, seed=0,
+                               n_nearest_neighbours=3, heldout_frac=0.2,
+                               heldout_seed=0)
+    fast, slow = P.MyopicIotaPolicy(), P.MyopicIotaPolicy(exact_trials=True)
+    env.reset()
+    done, max_evict, compared = False, 0, 0
+    while not done:
+        if len(env.heldout_seen_ids()):
+            cands, order = fast.candidates(env)
+            got = fast._merged_scores(env, cands, order)
+            for (admit, ev), g in zip(cands, got):
+                with P.trial_mutation(env.bank, ev, env.current_batch[admit]):
+                    ref = env.heldout_image_scores(env.bank)
+                np.testing.assert_allclose(g, ref, rtol=1e-5, atol=1e-6)
+                max_evict = max(max_evict, len(ev))
+            compared += 1
+        a_f, e_f = fast.decide(env)
+        a_s, e_s = slow.decide(env)
+        assert np.array_equal(a_f, a_s) and np.array_equal(e_f, e_s)
+        _, _, done, _ = env.step_with_decision(a_f, e_f)
+    assert compared > 5 and max_evict > 3  # exercised evictions > k
+
+
+# ==== Agent A: ι reward (teacher table, held-out set, κ cap, S_B tracker) ====
+def _iota_stream():
+    # warmup 40 x 8 patches > the 256-patch probe, so the bank is non-empty
+    cfg = SyntheticConfig(images_per_stage=25, dim=16, patches_per_image=8)
+    return make_synthetic_stream(cfg)
+
+
+def test_teacher_matches_bruteforce_with_clusters():
+    from patchcore.streaming.synthetic import ArrayReader
+    from patchcore.streaming.teacher import build_teacher
+
+    rng = np.random.default_rng(0)
+    E = rng.normal(size=(12, 5, 3)).astype("float32")
+    cl = np.array([0, 1, 1, 2, 3, 4, 5, 6, 6, 7, 8, 9])
+    T = build_teacher(ArrayReader(E, np.zeros(12)), 3, clusters=cl, block=5,
+                      verbose=False)
+    S = np.full((12, 12), np.nan)
+    for n in range(12):
+        for t in range(n, 12):
+            F = [E[m] for m in range(t + 1) if cl[m] != cl[n]]
+            if not F:
+                continue
+            d = ((E[n][:, None] - np.concatenate(F)[None]) ** 2).sum(-1)
+            d.sort(axis=1)
+            S[n, t] = d[:, :3].mean(axis=1).max()
+    assert np.array_equal(np.isnan(S), np.isnan(T["S_F"]))
+    assert np.nanmax(np.abs(S - T["S_F"])) < 1e-4
+    assert T["eps"] == pytest.approx(0.01 * np.nanmedian(S[:, -1]), rel=1e-5)
+
+
+def test_iota_nonnegative_heldout_withheld_and_kappa():
+    """Singleton clusters => every bank is a subset of the teacher set, so
+    ι >= 0 (float noise aside); held-out images admit nothing; κ caps writes.
+    Also exercises every baseline on empty admissible batches."""
+    from patchcore.streaming.teacher import build_teacher
+
+    stream = _iota_stream()
+    teacher = build_teacher(stream, 3, verbose=False)
+    pols = [P.StaticPolicy(), P.FIFOPolicy(k=8), P.RandomPolicy(k=8),
+            P.ReservoirPolicy(), P.StreamingGreedyCoresetPolicy(),
+            P.PeriodicCoresetPolicy(period=7)]
+    for pol in pols:
+        env = MemoryMaintenanceEnv(
+            stream, capacity=60, warmup_images=40, seed=0, reward_mode="iota",
+            teacher=teacher, heldout_frac=0.1, heldout_seed=3, admit_cap_abs=4)
+        summ = P.run_policy(env, pol)
+        H = set(env.heldout_ids.tolist())
+        assert len(H) == 6
+        iotas = np.array([i["iota"] for i in summ["infos"]])
+        seen = np.isfinite(iotas)
+        assert seen.any() and (iotas[seen] >= -1e-4).all(), pol.name
+        assert np.allclose(summ["rewards"], np.where(seen, -np.nan_to_num(iotas), 0.0))
+        for t, info in zip(range(40, stream.n_images), summ["infos"]):
+            if t in H:
+                assert info["n_admit"] == 0 or pol.name == "periodic_coreset"
+            if pol.name != "periodic_coreset":   # replace_bank is κ-exempt
+                assert info["writes"] <= 4
+    # default PPO decode on a held-out step: empty admissible -> no-op admits
+    env = MemoryMaintenanceEnv(stream, capacity=60, warmup_images=40,
+                               reward_mode="iota", teacher=teacher, heldout_frac=0.1)
+    env.reset()
+    while env._t not in set(env.heldout_ids.tolist()):
+        env.step(np.zeros(6))
+    assert len(env.current_batch) == 0
+    admit, evict = env.decode_action(np.ones(6))
+    assert len(admit) == 0 and len(evict) == 0
+
+
+def test_iota_incremental_sb_matches_full_recompute():
+    from patchcore.streaming.teacher import build_teacher, image_scores_from_topk
+
+    stream = _iota_stream()
+    env = MemoryMaintenanceEnv(
+        stream, capacity=50, warmup_images=40, seed=1, reward_mode="iota",
+        teacher=build_teacher(stream, 3, verbose=False), heldout_frac=0.4)
+    env.reset()
+    rng = np.random.default_rng(0)
+    checked = 0
+    for step in range(60):
+        A = len(env.current_batch)
+        admit = rng.choice(A, size=rng.integers(0, A + 1), replace=False) if A \
+            else np.empty(0, np.int64)
+        slots = env.bank.active_slots()
+        # mostly small evictions (incremental path), sometimes > 25% churn
+        n_ev = rng.integers(0, 4) if step % 9 else rng.integers(15, 30)
+        evict = rng.choice(slots, size=min(n_ev, len(slots)), replace=False)
+        if step == 25:
+            env.replace_bank(env.bank.vectors()[rng.permutation(len(env.bank))[:30]])
+        _, _, done, _ = env.step_with_decision(admit, evict)
+        n = env._ho_nimg
+        if n:
+            inc = image_scores_from_topk(env._ho_topd[:n * env._ho_ppi], n).cpu().numpy()
+            full = env.heldout_image_scores()[:n]
+            np.testing.assert_allclose(inc, full, rtol=1e-5, atol=1e-6)
+            checked += 1
+        if done:
+            break
+    assert checked > 20
+
+
+def test_lockstep_iota_matches_sequential_and_checkpoint_meta(tmp_path):
+    import torch
+
+    from patchcore.streaming.env import RunningNorm
+    from patchcore.streaming.ppo import PPOConfig, PPOTrainer, load_checkpoint
+    from patchcore.streaming.teacher import build_teacher
+
+    stream = _iota_stream()
+    teacher = build_teacher(stream, 3, verbose=False)
+
+    def env_fns():
+        return [lambda s=i: MemoryMaintenanceEnv(
+            stream, capacity=60, warmup_images=40, seed=s, reward_mode="iota",
+            teacher=teacher, heldout_frac=0.2, heldout_seed=0, admit_cap_abs=4)
+            for i in range(3)]
+
+    batches = {}
+    for lockstep in (False, True):
+        torch.manual_seed(0)
+        cfg = PPOConfig(rollout_steps=40, total_env_steps=120, adv_mode="grpo",
+                        adv_baseline="loo", hidden=32, epochs=1, minibatches=4)
+        norm = RunningNorm(OBS_DIM)
+        norm.freeze()
+        trainer = PPOTrainer(env_fns(), cfg, obs_norm=norm, lockstep=lockstep)
+        batches[lockstep] = trainer.collect()
+    for key in ("obs", "act", "logp", "adv", "ret"):
+        np.testing.assert_allclose(batches[False][key], batches[True][key],
+                                   rtol=1e-4, atol=1e-4, err_msg=key)
+    assert batches[True]["perf"]["iota"] > 0
+    trainer.update(batches[True])
+    path = str(tmp_path / "p.pt")
+    trainer.save(path)
+    ac, _, meta = load_checkpoint(path)
+    assert meta["reward_mode"] == "iota" and meta["hidden"] == 32
+    assert meta["admit_cap_abs"] == 4 and meta["heldout_frac"] == 0.2
+    assert ac.mean_head.in_features == 32
+

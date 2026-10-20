@@ -1,7 +1,9 @@
 """Train the self-contained PPO maintenance policy.
 
-Trains on drift trajectories/seeds and evaluates the learned policy's proxy
-return against the hand-designed baselines. With ``--synthetic`` it runs fully
+Trains on drift trajectories/seeds and evaluates the learned policy's return
+against the hand-designed baselines. ``--reward_mode iota`` (primary) trains
+on the label-free normal-score-inflation reward against a teacher table built
+by bin/build_teacher.py; ``proxy`` is the legacy weighted proxy. With ``--synthetic`` it runs fully
 data-free on the drifting-Gaussian fixture (the local smoke test); with
 ``--cache_dir`` it trains on a real cached embedding stream.
 """
@@ -19,21 +21,32 @@ from patchcore.streaming.env import ActionConfig, MemoryMaintenanceEnv
 from patchcore.streaming.reward import RewardConfig, load_reward_weights
 
 
-def _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, base_seed, reward_cfg):
+# Synthetic streams have no teacher file; the in-process teacher uses the
+# k that run_streaming.sh evaluates with (--n_nn 5).
+_SYNTH_TEACHER_K = 5
+
+
+def _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, base_seed, reward_cfg,
+                            env_kw):
     from patchcore.streaming.synthetic import SyntheticConfig, make_synthetic_stream
+    from patchcore.streaming.teacher import build_teacher
 
     fns = []
     for i in range(n_env):
         seed = base_seed + i
         cfg = SyntheticConfig(seed=seed)
         stream = make_synthetic_stream(cfg)
+        kw = dict(env_kw)
+        if kw.get("reward_mode") == "iota":
+            # per-seed streams differ, so each needs its own teacher
+            kw["teacher"] = build_teacher(stream, _SYNTH_TEACHER_K, verbose=False)
 
-        def fn(stream=stream, seed=seed):
+        def fn(stream=stream, seed=seed, kw=kw):
             return MemoryMaintenanceEnv(
                 stream, capacity=capacity, warmup_images=warmup, seed=seed,
                 action_cfg=ActionConfig(mode=action_mode),
                 # each env gets its own copy: reset() writes warmup scales into it
-                reward_cfg=dataclasses.replace(reward_cfg),
+                reward_cfg=dataclasses.replace(reward_cfg), **kw,
             )
 
         fns.append(fn)
@@ -41,7 +54,7 @@ def _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, base_seed, rew
 
 
 def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_seed, reward_cfg,
-                        preshift=False):
+                        env_kw, preshift=False):
     from patchcore.streaming.cache import EmbeddingCacheReader, stage0_end
 
     reader = EmbeddingCacheReader(os.path.join(cache_dir, "stream"))
@@ -58,7 +71,7 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
     proto = MemoryMaintenanceEnv(
         reader, capacity=capacity, warmup_images=warmup, seed=base_seed,
         action_cfg=ActionConfig(mode=action_mode),
-        reward_cfg=dataclasses.replace(reward_cfg), episode_stop=stop,
+        reward_cfg=dataclasses.replace(reward_cfg), episode_stop=stop, **env_kw,
     )
     proto.reset()
     init_state = proto.export_init_state()
@@ -70,6 +83,7 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
                 reader, capacity=capacity, warmup_images=warmup, seed=seed,
                 action_cfg=ActionConfig(mode=action_mode),
                 reward_cfg=dataclasses.replace(reward_cfg), episode_stop=stop,
+                **env_kw,
             )
             env.import_init_state(init_state)
             return env
@@ -150,11 +164,29 @@ def _fit_obs_norm(env_fn, seed=0):
 @click.option("--preshift", is_flag=True, default=False,
               help="Train (and fit obs normalization) on the pre-shift stream "
                    "only: episodes end at the first stage-1 image")
+@click.option("--reward_mode", default="proxy", type=click.Choice(["proxy", "iota"]),
+              help="iota = label-free normal-score inflation vs a full-memory "
+                   "teacher (primary); proxy = legacy weighted proxy")
+@click.option("--teacher", "teacher_path", default=None,
+              help="Teacher table (bin/build_teacher.py output); required for "
+                   "--reward_mode iota with --cache_dir")
+@click.option("--heldout_frac", type=float, default=None,
+              help="Whole-image held-out fraction withheld from admission "
+                   "(default 0.05 for iota, 0 for proxy)")
+@click.option("--admit_cap_abs", type=int, default=None,
+              help="kappa: max patches admitted per image, every policy (default unlimited)")
+@click.option("--adv_baseline", default=None, type=click.Choice(["mean", "loo"]),
+              help="grpo baseline: group mean incl. self or leave-one-out "
+                   "(default loo for iota, mean for proxy)")
+@click.option("--hidden", type=int, default=128, help="Actor/critic MLP width")
+@click.option("--epochs", type=int, default=4, help="PPO epochs per iteration")
+@click.option("--minibatches", type=int, default=64, help="PPO minibatches per epoch")
 def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
          total_env_steps, seed, out, device, eval_baselines, reward_json,
          beta, gamma, churn_coef, churn_budget, reward_form, norm_mode,
          reward_scale, adv_mode, clip_mode, clip_high, ent_coef, ent_coef_end,
-         lr, lr_end, preshift):
+         lr, lr_end, preshift, reward_mode, teacher_path, heldout_frac,
+         admit_cap_abs, adv_baseline, hidden, epochs, minibatches):
     import torch
 
     from patchcore.streaming.bank import device_banner
@@ -175,13 +207,30 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
     reward_cfg.reward_form = reward_form
     if reward_form == "delta":
         print("[reward] potential-based delta shaping enabled")
+    if heldout_frac is None:
+        heldout_frac = 0.05 if reward_mode == "iota" else 0.0
+    if adv_baseline is None:
+        adv_baseline = "loo" if reward_mode == "iota" else "mean"
+    # heldout_seed = --seed for every env: the lockstep group shares H.
+    env_kw = dict(reward_mode=reward_mode, heldout_frac=heldout_frac,
+                  heldout_seed=seed, admit_cap_abs=admit_cap_abs)
+    if reward_mode == "iota" and not synthetic:
+        if not teacher_path:
+            raise click.UsageError("--reward_mode iota needs --teacher (bin/build_teacher.py)")
+        from patchcore.streaming.teacher import load_teacher
+
+        env_kw["teacher"] = load_teacher(teacher_path)  # loaded once, shared
+        print(f"[reward] iota: teacher {teacher_path} (k={env_kw['teacher']['k']}, "
+              f"eps={env_kw['teacher']['eps']:.4g})")
+    print(f"[env] reward_mode={reward_mode} heldout_frac={heldout_frac} "
+          f"admit_cap_abs={admit_cap_abs}")
     if synthetic:
         env_fns = _make_synthetic_env_fns(
-            n_env, capacity, warmup, action_mode, seed, reward_cfg)
+            n_env, capacity, warmup, action_mode, seed, reward_cfg, env_kw)
     elif cache_dir:
         env_fns = _make_cache_env_fns(
             n_env, cache_dir, capacity, warmup, action_mode, seed, reward_cfg,
-            preshift=preshift)
+            env_kw, preshift=preshift)
     else:
         raise click.UsageError("pass --cache_dir or --synthetic")
 
@@ -192,6 +241,8 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
         reward_scale=reward_scale, adv_mode=adv_mode,
         clip_mode=clip_mode, clip_high=clip_high,
         ent_coef=ent_coef, ent_coef_end=ent_coef_end, lr=lr, lr_end=lr_end,
+        adv_baseline=adv_baseline, hidden=hidden, epochs=epochs,
+        minibatches=minibatches,
     )
     if cache_dir:
         # The best-checkpoint score is a rolling mean over one full stream
@@ -208,8 +259,9 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
                 f"no training steps: warmup {warmup} >= episode end "
                 f"{episode_steps + warmup}" + (" (pre-shift)" if preshift else ""))
         cfg.best_window = max(3, round(episode_steps / cfg.rollout_steps))
-    print(f"[ppo] adv_mode={adv_mode} clip_mode={clip_mode} clip_high={clip_high} "
-          f"best_window={cfg.best_window}")
+    print(f"[ppo] adv_mode={adv_mode} adv_baseline={adv_baseline} clip_mode={clip_mode} "
+          f"clip_high={clip_high} best_window={cfg.best_window} hidden={hidden} "
+          f"epochs={epochs} minibatches={minibatches}")
     # Cache-path envs replay the same stream in lockstep -> fused cross-env
     # k-NN batching in collect(); synthetic envs have per-seed streams.
     trainer = PPOTrainer(env_fns, cfg, obs_norm=obs_norm, lockstep=bool(cache_dir))
@@ -222,11 +274,12 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
 
 
 def _compare_to_baselines(trainer, env_fn):
-    """Report mean proxy return of PPO vs each baseline on a held-out env."""
+    """Report mean return of PPO vs each baseline on a fresh env (same reward
+    mode / held-out set / kappa as training, via env_fn)."""
     from patchcore.streaming import policies as P
     from patchcore.streaming.policies import PPOPolicy, run_policy
 
-    print("\n=== proxy return (higher is better) ===")
+    print(f"\n=== {trainer.envs[0].reward_mode} return (higher is better) ===")
     ppo_env = env_fn()
     ppo_env._norm = trainer.obs_norm  # eval under the training normalization
     ppo_ret = np.mean(run_policy(ppo_env, PPOPolicy(trainer.ac))["rewards"])

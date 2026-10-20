@@ -277,3 +277,21 @@ def estimate_scales(bank, sample_patches: np.ndarray) -> Tuple[float, float]:
     else:
         cov_scale = delta  # sample is essentially a subset of the bank
     return max(cov_scale, 1e-6), delta
+
+
+def iota(s_b: np.ndarray, s_f: np.ndarray, eps: float) -> float:
+    """Normal-score inflation of the bank vs the full-memory teacher.
+
+        ι = mean_n log( max(S_B(n), eps) / max(S_F(n), eps) )
+
+    over the held-out normal images seen so far (r_t = -ι_t). Label-free and
+    weight-free: the teacher (patchcore.streaming.teacher) fixes the scale,
+    so there is nothing to fit. ``eps`` (0.01 x median teacher score, stored
+    in the teacher file) only guards the log against near-zero scores.
+    Returns NaN when no held-out image has been seen.
+    """
+    s_b = np.asarray(s_b, dtype=np.float64)
+    if len(s_b) == 0:
+        return float("nan")
+    s_f = np.asarray(s_f, dtype=np.float64)
+    return float(np.mean(np.log(np.maximum(s_b, eps) / np.maximum(s_f, eps))))
