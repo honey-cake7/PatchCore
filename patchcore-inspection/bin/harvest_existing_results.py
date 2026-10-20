@@ -84,10 +84,10 @@ def rnd(x, n=4):
 # PPO iteration counts were recorded. Later jobs override earlier ones per
 # result dir, matching how results.csv itself is overwritten.
 # ---------------------------------------------------------------------------
-BANNER_RES = re.compile(r"^ \[(\S+)\] cache=(\S+)\s+results=(\S+)")
-BANNER_DATA = re.compile(r"^ \[(\S+)\] data=(\S+)\s+M=(\d+)\s+k=(\d+)")
+BANNER_RES = re.compile(r"^ (?:\[(\S+)\] )?cache=(\S+)\s+results=(\S+)")
+BANNER_DATA = re.compile(r"^ (?:\[(\S+)\] )?data=(\S+)\s+M=(\d+)\s+k=(\d+)")
 MATCH_M = re.compile(r"^\[(\S+)\] CAPACITY_MODE=match -> M=(\d+)")
-STEP = re.compile(r"^\[(\S+) (\d(?:\.\d)?)/5\]")
+STEP = re.compile(r"^\[(?:(\S+) )?(\d(?:\.\d)?)/5\]")
 BENCH = re.compile(r"^(\S+)\s+seed=(\d+) mean_reward=(\S+) admit=(\d+) evict=(\d+)")
 PPO_ITER = re.compile(r"^\[ppo\] iter (\d+)/(\d+) mean_reward=(\S+) collect=([\d.]+)s .*update=([\d.]+)s")
 PPO_BEST = re.compile(r"^\[ppo\] restored best policy from iter (\d+)")
@@ -728,8 +728,11 @@ def _budget_key(b):
 
 
 def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
-                  overlap, deploy, protocol, gaps):
-    S = ["=" * 78, " REVIEWER CHECKLIST — HARVESTED FROM EXISTING RUNS", "=" * 78, ""]
+                  overlap, deploy, protocol, gaps, full=True):
+    """full=False: per-class tables collapse to per-(dataset, budget) summaries
+    so the whole report fits in one paste; full=True keeps every row."""
+    S = ["=" * 78, " REVIEWER CHECKLIST — HARVESTED FROM EXISTING RUNS"
+         + ("" if full else "  (short: full per-class tables in report.txt)"), "=" * 78, ""]
 
     # 1. memory sweep: cross-class mean ± std at stage 0, best image AUROC first per budget
     S.append("[1] MEMORY SWEEP — stage-0, mean ± std over (class, seed)")
@@ -756,7 +759,29 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
                       for (c, pct), v in sorted(g.items())]))
 
     # 2. seed variance: every seed's stage-0 image/pixel AUROC per class & policy
-    S.append("[2] SEED VARIANCE — stage-0 per class, per seed (image AUROC / pixel AUROC)")
+    if not full:
+        S.append("[2] SEED VARIANCE — per-class std of stage-0 image AUROC across seeds")
+        g = defaultdict(list)
+        for x in per_seed:
+            if x["stage"] == "0":
+                g[(x["dataset"], x["budget"], x["variant"], x["policy"], x["class"])].append(x["image_auroc"])
+        h = defaultdict(list)
+        for (ds, b, var, pol, c), v in g.items():
+            h[(ds, b, var, pol)].append((mean_std(v)[1], c, len(v)))
+        S.append(box("", ["dataset", "budget", "variant", "policy", "seeds", "mean class std",
+                          "max class std", "worst class"],
+                     [[*k, max(n for _, _, n in v), f"{np.nanmean([sd for sd, _, _ in v]):.3f}",
+                       f"{max(v)[0]:.3f}", max(v)[1]]
+                      for k, v in sorted(h.items(), key=lambda kv: (kv[0][0], _budget_key(kv[0][1]), kv[0][2], kv[0][3]))]))
+    else:
+        S += _seed_table(per_seed)
+
+    return _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy,
+                        protocol, gaps, full)
+
+
+def _seed_table(per_seed):
+    S = ["[2] SEED VARIANCE — stage-0 per class, per seed (image AUROC / pixel AUROC)"]
     g = defaultdict(list)
     for x in per_seed:
         if x["stage"] == "0":
@@ -768,7 +793,10 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
                    " ".join(f"{x['pixel_auroc']:.3f}" for x in sorted(v, key=lambda x: x["seed"])),
                    pm(*mean_std([x["pixel_auroc"] for x in v])[:2])]
                   for (ds, b, var, c, M, p), v in sorted(g.items(), key=lambda kv: (kv[0][0], _budget_key(kv[0][1]), kv[0][2], kv[0][3], kv[0][5]))]))
+    return S
 
+
+def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, protocol, gaps, full):
     # 3. full stream: image AUROC at each quarter, cross-class mean
     S.append("[3] FULL STREAM — image AUROC at each point of the stream (cross-class mean ± std)")
     S.append("    25/50/75/100% = bank at end of that quarter, scored on THAT phase's test set;")
@@ -795,14 +823,33 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
              f"{sum(1 for r in preshift if r['fit_target_uses_postshift_labels'] is True)}/{len(preshift)}\n")
 
     # 5. calibration
-    S.append("[5] CALIBRATION — reward fit per run (labels from the TEST split)")
+    if not full:
+        S.append("[5] CALIBRATION — fits per budget (labels from the TEST split); per run in report.txt")
+        bud = {}
+        for x in per_seed:
+            bud[x["run"]] = (x["dataset"], x["budget"], x["variant"])
+        g = defaultdict(list)
+        for c in calib:
+            g[bud.get(c["run"], (c["dataset"], "?", "?")) + (c["target"],)].append(c)
+        rows = []
+        for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], _budget_key(kv[0][1]), kv[0][2])):
+            ps = [c["p_value"] for c in v if not isinstance(c["p_value"], str)]
+            fails = [c["class"] for c in v if c["pass_p<=0.05"] is False]
+            rows.append([*k, len(v), f"{np.median([c['rho_star'] for c in v]):.3f}",
+                         f"{len([p for p in ps if p <= 0.05])}/{len(ps)}" if ps else "no null run",
+                         f"{np.median([c['null_p95'] for c in v if c['null_p95'] != '']):.3f}" if ps else "–",
+                         " ".join(fails) or "–"])
+        S.append(box("", ["dataset", "budget", "variant", "target", "fits", "median ρ*",
+                          "p≤.05", "median null p95", "classes failing p≤.05"], rows))
     wk = ("alpha", "beta", "gamma", "churn_coef", "churn_budget", "c90_coef", "probe_coef", "q_coef")
-    S.append(box("", ["run", "target", "J", "ρ*", "p", "B", "null p95", "p≤.05", "w* (α β γ churn budget c90 probe q)"],
-                 [[c["run"], c["target"], c["J_n_traces"], c["rho_star"],
-                   c["p_value"] if not isinstance(c["p_value"], str) else "–", c["B_permutations"],
-                   c["null_p95"], c["pass_p<=0.05"], " ".join(str(c.get(f"w_{k}", "")) for k in wk)]
-                  for c in sorted(calib, key=lambda c: c["run"])]))
-    S.append("    Reference trajectories per run: calibration.csv, column reference_trajectories.\n")
+    if full:
+        S.append(box("", ["run", "target", "J", "ρ*", "p", "B", "null p95", "p≤.05",
+                          "w* (α β γ churn budget c90 probe q)"],
+                     [[c["run"], c["target"], c["J_n_traces"], c["rho_star"],
+                       c["p_value"] if not isinstance(c["p_value"], str) else "–", c["B_permutations"],
+                       c["null_p95"], c["pass_p<=0.05"], " ".join(str(c.get(f"w_{k}", "")) for k in wk)]
+                      for c in sorted(calib, key=lambda c: c["run"])]))
+    S.append("    J, reference trajectories and w* per run: calibration.csv / report.txt.\n")
 
     # 6 / 8. overlap
     S.append("[6/8] DUPLICATE IMAGES — A image -> its match in B (dHash = near-duplicate candidate)")
@@ -811,7 +858,16 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
                    o["filename_dupes"], o["dhash_candidates"], o["any_match"]] for o in overlap]))
 
     # 7. deployment
-    S.append("[7] DEPLOYMENT MEMORY — analytic fp32 MiB (latency not measured by any existing run)")
+    if not full:
+        seen, keep = set(), []
+        for d in sorted(deploy, key=lambda d: -int(d["M"])):
+            key = (d["backbone"], d["D"])
+            if key not in seen:  # largest M per backbone = worst case
+                seen.add(key)
+                keep.append(d)
+        deploy = keep
+    S.append("[7] DEPLOYMENT MEMORY — analytic fp32 MiB (latency not measured by any existing run)"
+             + ("" if full else "; largest M per backbone shown"))
     S.append(box("", ["run", "M", "D", "backbone params", "backbone", "bank", "policy", "window",
                       "probe Z", "total", "train ms/step"],
                  [[d["run"], d["M"], d["D"], d["backbone_params"], d["backbone_MiB_fp32"], d["bank_MiB"],
@@ -821,7 +877,16 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
                    d.get("train_ms_per_env_step", "")] for d in deploy]))
 
     # 8. protocol
-    S.append("[8] PROTOCOL — counts, warmup and stage-0 eval point")
+    if not full:
+        seen, keep = set(), []
+        for p_ in protocol:
+            key = (p_["class"], p_["backbone"], p_["warmup_images"])
+            if key not in seen:
+                seen.add(key)
+                keep.append(p_)
+        protocol = keep
+    S.append("[8] PROTOCOL — counts, warmup and stage-0 eval point"
+             + ("" if full else " (one row per class/warmup)"))
     S.append(box("", ["run", "train", "per phase", "warmup", "eval after img", "policy steps",
                       "test normal", "test abnormal", "masks", "anomaly types"],
                  [[p["run"], p["n_train_stream"], p["images_per_phase"], p["warmup_images"],
@@ -949,12 +1014,16 @@ def main():
     gaps = gaps_report(runs, per_seed, calib, overlap, stock, n_logs)
     with open(os.path.join(out, "GAPS.md"), "w") as f:
         f.write(gaps)
-    report = render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
-                           overlap, deploy, protocol, gaps)
+    args = (ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
+            overlap, deploy, protocol, gaps)
     with open(os.path.join(out, "report.txt"), "w") as f:
-        f.write(report)
-    print("\n" + report)
-    print(f"\nreport -> {os.path.join(out, 'report.txt')}   (CSVs alongside)")
+        f.write(render_report(*args, full=True))
+    short = render_report(*args, full=False)
+    with open(os.path.join(out, "report_short.txt"), "w") as f:
+        f.write(short)
+    print("\n" + short)
+    print(f"\nshort report -> {os.path.join(out, 'report_short.txt')} ({len(short)} chars)")
+    print(f"full report  -> {os.path.join(out, 'report.txt')}   (CSVs alongside)")
 
 
 if __name__ == "__main__":
