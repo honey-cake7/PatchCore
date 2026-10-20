@@ -289,13 +289,47 @@ def harvest_stock(pkg):
     return rows
 
 
-def harvest_calibration(runs):
+def backfill_null(r, n_perm):
+    """Permutation null for a fit recorded with PERMUTE=0, from its saved traces.
+
+    Uses only the traces the fit actually used (keys of fit["targets"]): a later
+    ITERATE round may have appended ppo_rN traces to the pkl. Returns ({}, why)
+    when it cannot reproduce the fit, so a mismatched null is never reported.
+    """
+    import pickle
+
+    from patchcore.streaming.experiments import permutation_null
+
+    pkl = os.path.join(r["dir"], "reward_traces.pkl")
+    targets = (r["fit"] or {}).get("targets") or {}
+    if not os.path.exists(pkl) or not targets:
+        return {}, "no reward_traces.pkl / targets"
+    traces = [t for t in pickle.load(open(pkl, "rb")) if f"{t['policy']}:{t['seed']}" in targets]
+    if len(traces) != len(targets):
+        return {}, f"pkl has {len(traces)}/{len(targets)} of the fit's traces"
+    null = permutation_null(traces, np.asarray([targets[f"{t['policy']}:{t['seed']}"] for t in traces]),
+                            n_permutations=n_perm)
+    if abs(null["observed_best_rho"] - r["fit"]["rho_ranking"]) > 5e-3:
+        return {}, (f"null observed {null['observed_best_rho']:.3f} != fitted "
+                    f"{r['fit']['rho_ranking']:.3f} (fit used a different grid)")
+    return null, "backfilled from reward_traces.pkl"
+
+
+def harvest_calibration(runs, backfill_perm=200):
     rows = []
     for r in runs:
         fit = r["fit"]
         if not fit:
             continue
         pn = fit.get("permutation_null") or {}
+        source = "fit JSON" if pn else ""
+        if not pn and backfill_perm:
+            try:
+                pn, source = backfill_null(r, backfill_perm)
+            except Exception as e:  # never let one bad pkl stop the harvest
+                pn, source = {}, f"backfill failed: {e}"
+            print(f"  [calib] {r['run']}: {source}"
+                  + (f" -> p={pn['p_value']:.3f}" if pn else ""))
         rec = {"run": r["run"], "dataset": r["dataset"], "class": r["class"],
                "backbone": r["backbone"], "capacity": r.get("capacity"),
                "target": f"{fit.get('drifted_weight', 1.0)}*drifted+"
@@ -312,6 +346,7 @@ def harvest_calibration(runs):
                "n_candidates": pn.get("n_candidates", ""),
                "pass_p<=0.05": (pn["p_value"] <= 0.05) if pn else "",
                "pass_rho>=0.7": fit.get("rho_ranking", 0) >= 0.7,
+               "null_source": source or "not run (PERMUTE=0)",
                "traces_without_stage0": len(fit.get("traces_without_stage0", [])),
                "label_source": "cached TEST split (test/stage_*) — same images as reported metrics"}
         for k, v in fit.get("recommended", {}).items():
@@ -843,6 +878,7 @@ def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, prot
                           "p≤.05", "median null p95", "classes failing p≤.05"], rows))
     wk = ("alpha", "beta", "gamma", "churn_coef", "churn_budget", "c90_coef", "probe_coef", "q_coef")
     if full:
+        S.append("[5] CALIBRATION — reward fit per run (labels from the TEST split)")
         S.append(box("", ["run", "target", "J", "ρ*", "p", "B", "null p95", "p≤.05",
                           "w* (α β γ churn budget c90 probe q)"],
                      [[c["run"], c["target"], c["J_n_traces"], c["rho_star"],
@@ -912,6 +948,9 @@ def main():
     ap.add_argument("--polyp_pvt_train_dir", default=None,
                     help="Polyp-PVT TrainDataset/image dir for the test-set overlap count")
     ap.add_argument("--skip_overlap", action="store_true")
+    ap.add_argument("--backfill_permute", type=int, default=200,
+                    help="permutation-null shuffles for fits recorded without one "
+                         "(from their reward_traces.pkl; 0 = off)")
     ap.add_argument("--out", default=None, help="default: <pkg>/results/harvest")
     a = ap.parse_args()
 
@@ -965,7 +1004,7 @@ def main():
     drift_rows, preshift = harvest_drift_protocol(), harvest_preshift(runs)
     write_csv(os.path.join(out, "drift_protocol.csv"), drift_rows)
     write_csv(os.path.join(out, "preshift_audit.csv"), preshift)
-    calib = harvest_calibration(runs)
+    calib = harvest_calibration(runs, a.backfill_permute)
     write_csv(os.path.join(out, "calibration.csv"), calib)
     deploy, protocol = harvest_deployment(runs, pkg), harvest_protocol(runs, a.dataset_root)
     write_csv(os.path.join(out, "deployment_memory.csv"), deploy)
