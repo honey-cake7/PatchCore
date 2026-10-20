@@ -124,15 +124,14 @@ def evaluate_bank_on_stage(
 
     if segmentations is not None and reader.masks is not None:
         masks = np.asarray(reader.masks)
-        out["pixel_auroc"] = float(
-            patchcore.metrics.compute_pixelwise_retrieval_metrics(
-                list(segmentations), list(masks)
-            )["auroc"]
-        )
+        # exact fast equivalents of compute_pixelwise_retrieval_metrics["auroc"]
+        # and compute_pro (see metrics.py) — evaluation dominated benchmark time
+        out["pixel_auroc"] = patchcore.metrics.pixel_auroc(
+            segmentations, list(masks), device=device)
         anom = [i for i in range(len(masks)) if masks[i].sum() > 0]
         if anom:
             out["pro"] = float(
-                patchcore.metrics.compute_pro(
+                patchcore.metrics.compute_pro_fast(
                     [segmentations[i] for i in anom], [masks[i] for i in anom]
                 )["pro"]
             )

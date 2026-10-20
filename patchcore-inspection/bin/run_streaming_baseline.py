@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import sys
+import time
 
 import click
 import numpy as np
@@ -204,15 +205,26 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
     s0_mid = []  # (stage, metrics): stage-0 test re-scored mid-stream
     tracker = None  # _LastInfo of the running policy (ι at each boundary)
 
+    # wall-clock split per run: labeled scoring vs the policy's own episode,
+    # printed with each run so slow benchmarks show where the time goes
+    timing = {"eval": 0.0, "n_eval": 0}
+
+    def timed_eval(*args):
+        t0 = time.perf_counter()
+        m = evaluate_bank_on_stage(*args)
+        timing["eval"] += time.perf_counter() - t0
+        timing["n_eval"] += 1
+        return m
+
     def eval_fn(env, stage):
         iota = float(tracker.info.get("iota", float("nan")))
         if stage0_only and stage != 0:
             return {"iota": iota}
         # the last stage's boundary IS the final bank = the forgetting row
         if stage0_every_boundary and 0 < stage < len(tests) - 1:
-            s0_mid.append((stage, {"iota": iota, **evaluate_bank_on_stage(
+            s0_mid.append((stage, {"iota": iota, **timed_eval(
                 env.bank, tests[0], n_nn, patch_shape, imagesize)}))
-        return {"iota": iota, **evaluate_bank_on_stage(
+        return {"iota": iota, **timed_eval(
             env.bank, tests[stage], n_nn, patch_shape, imagesize
         )}
 
@@ -250,6 +262,8 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                     mode=(ppo_meta or {}).get("action_mode"), meta=ppo_meta,
                 )
                 s0_mid.clear()
+                timing.update(eval=0.0, n_eval=0)
+                t_run = time.perf_counter()
                 tracker = _LastInfo(policy)
                 summ = P.run_policy(env, tracker, per_stage_eval=eval_fn)
                 # forgetting: re-evaluate stage-0 test with the final bank (skipped
@@ -257,7 +271,7 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                 # drifted stages having run the bank through them)
                 forget_m, forget = None, float("nan")
                 if not stage0_only:
-                    forget_m = evaluate_bank_on_stage(
+                    forget_m = timed_eval(
                         env.bank, tests[0], n_nn, patch_shape, imagesize
                     )
                     forget_m["iota"] = float(tracker.info.get("iota", float("nan")))
@@ -274,7 +288,9 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                 ts = f" train_seed={train_seed}" if train_seed != "" else ""
                 print(f"{name:26s} seed={seed}{ts} mean_reward={summ['mean_reward']:.4f} "
                       f"admit={summ['total_admit']} evict={summ['total_evict']} "
-                      f"stage0_forget={forget_str}")
+                      f"stage0_forget={forget_str} "
+                      f"[time: episode {time.perf_counter() - t_run - timing['eval']:.0f}s, "
+                      f"scoring {timing['eval']:.0f}s over {timing['n_eval']} evals]")
 
     csv_path = os.path.join(out, "results.csv")
     with open(csv_path, "w", newline="") as f:
