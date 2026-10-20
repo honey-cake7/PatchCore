@@ -95,8 +95,9 @@ PPO_CFG = re.compile(r"^\[ppo\] adv_mode=(\S+) clip_mode=(\S+) clip_high=(\S+) b
 GPU = re.compile(r"^CUDA probe OK: (.+)")
 
 
-def parse_logs(log_dir):
-    files = glob.glob(os.path.join(log_dir, "streaming_output_*.log"))
+def parse_logs(log_dirs):
+    files = sorted({os.path.realpath(f) for d in log_dirs
+                    for f in glob.glob(os.path.join(d, "streaming_output_*.log"))})
     job_of = lambda p: int(re.findall(r"(\d+)", os.path.basename(p))[-1])  # noqa: E731
     runs = {}  # result-dir basename -> facts from its most recent job
     for path in sorted(files, key=job_of):
@@ -200,6 +201,10 @@ def discover_runs(results_root, cache_root, log_facts):
         r["capacity"] = r.get("capacity") or lf.get("capacity_log")
         r["log"] = lf
         r["job"] = lf.get("bench_job") or lf.get("job")
+        mm = re.match(r"_m([\d.]+)(.*)$", r["suffix"])
+        r["budget"] = f"{mm.group(1)}% match" if mm else (
+            f"M={r['capacity']}" if r.get("capacity") else "M=?")
+        r["variant"] = (mm.group(2) if mm else r["suffix"]) or "(untagged)"
         tag = name[: len(name) - len(r["suffix"])] if r["suffix"] else name
         r["cache_dir"] = os.path.join(cache_root, tag)
         r["cache"] = load_cache_facts(r["cache_dir"])
@@ -230,7 +235,8 @@ def harvest_per_seed(runs):
             b = bench.get((row["policy"], seed), {})
             rows.append({
                 "dataset": r["dataset"], "class": r["class"], "backbone": r["backbone"],
-                "run": r["run"], "capacity": r.get("capacity"), "warmup": r.get("warmup"),
+                "run": r["run"], "budget": r["budget"], "variant": r["variant"],
+                "capacity": r.get("capacity"), "warmup": r.get("warmup"),
                 "policy": row["policy"], "seed": seed, "stage": row["stage"],
                 "stream_frac_evaluated_at": frac, "test_set": test_set,
                 "image_auroc": fnum(row["image_auroc"]), "pixel_auroc": fnum(row["pixel_auroc"]),
@@ -265,7 +271,7 @@ def harvest_stock(pkg):
         if "/streaming/" in p:
             continue
         cfg = os.path.basename(os.path.dirname(p))
-        pm = re.search(r"_P(\d+)_", cfg)
+        pm = re.search(r"_P(\d+)(?:_|$)", cfg)
         pct = {"01": 10.0, "001": 1.0, "0001": 0.1}.get(pm.group(1)) if pm else None
         try:
             reader = csv.DictReader(open(p))
@@ -598,18 +604,20 @@ def gaps_report(runs, per_seed, calib, overlap, stock, n_logs):
     classes_at = defaultdict(lambda: defaultdict(set))
     for x in per_seed:
         if x["stage"] == "0":
-            by_ds[x["dataset"]][x["capacity"]].add(x["policy"])
-            classes_at[x["dataset"]][x["capacity"]].add(x["class"])
+            key = f'{x["budget"]} {x["variant"]}'
+            by_ds[x["dataset"]][key].add(x["policy"])
+            classes_at[x["dataset"]][key].add(x["class"])
     wanted = {"static", "fifo", "reservoir", "streaming_greedy_coreset", "periodic_coreset", "ppo"}
     L += ["## 1. Memory sweep", ""]
     for ds, budgets in sorted(by_ds.items()):
         L.append(f"- **{ds}**: {len(budgets)} budget(s) with stage-0 results")
-        for M, pols in sorted(budgets.items(), key=lambda kv: (kv[0] is None, kv[0] or 0)):
+        for M, pols in sorted(budgets.items(), key=lambda kv: _budget_key(kv[0])):
             miss = sorted(wanted - pols)
-            L.append(f"  - M={M} ({len(classes_at[ds][M])} classes): "
+            L.append(f"  - {M} ({len(classes_at[ds][M])} classes): "
                      + ("all 6 methods" if not miss else f"MISSING {', '.join(miss)}"))
-        if len(budgets) < 5:
-            L.append(f"  - NEW RUN: needs >=5 budgets, has {len(budgets)}")
+        n_b = len({k.split(" ")[0] + (" match" if "match" in k else "") for k in budgets})
+        if n_b < 5:
+            L.append(f"  - NEW RUN: needs >=5 budgets, has {n_b}")
     has_writes = sum(1 for x in per_seed if x["writes_admit"] != "")
     L += [f"- Writes: {has_writes}/{len(per_seed)} per-seed rows have admit counts from logs"
           + ("" if has_writes == len(per_seed) else " (rest: log missing/rotated -> rerun step 5)"),
@@ -710,8 +718,13 @@ def pm(mean, std):
     return f"{mean:.3f}±{std:.3f}" if isinstance(std, float) and np.isfinite(std) else f"{mean:.3f}"
 
 
-def _cap_key(v):
-    return (v is None, v or 0)
+def _budget_key(b):
+    """'2.5% match' < '10% match' < 'M=400' < 'M=2000' < 'M=?'."""
+    m = re.match(r"([\d.]+)% match", b or "")
+    if m:
+        return (0, float(m.group(1)))
+    m = re.match(r"M=(\d+)", b or "")
+    return (1, int(m.group(1))) if m else (2, 0)
 
 
 def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
@@ -720,12 +733,12 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
 
     # 1. memory sweep: cross-class mean ± std at stage 0, best image AUROC first per budget
     S.append("[1] MEMORY SWEEP — stage-0, mean ± std over (class, seed)")
-    rows = sorted(ds_mean, key=lambda d: (d["dataset"], d["backbone"], _cap_key(d["capacity"]),
+    rows = sorted(ds_mean, key=lambda d: (d["dataset"], d["backbone"], _budget_key(d["budget"]), d["variant"],
                                           -(d["image_auroc_mean"] if isinstance(d["image_auroc_mean"], float)
                                             and np.isfinite(d["image_auroc_mean"]) else -1)))
-    S.append(box("", ["dataset", "backbone", "M", "policy", "image AUROC", "pixel AUROC",
+    S.append(box("", ["dataset", "backbone", "budget", "variant", "policy", "image AUROC", "pixel AUROC",
                       "PRO", "writes", "n"],
-                 [[d["dataset"], d["backbone"], d["capacity"], d["policy"],
+                 [[d["dataset"], d["backbone"], d["budget"], d["variant"], d["policy"],
                    pm(d["image_auroc_mean"], d["image_auroc_std"]),
                    pm(d["pixel_auroc_mean"], d["pixel_auroc_std"]),
                    pm(d["pro_mean"], d["pro_std"]), d["writes_mean"], d["n_class_seed_pairs"]]
@@ -733,9 +746,10 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
     if stock:
         g = defaultdict(list)
         for x in stock:
-            g[(x["config"], x["coreset_pct"])].append(x)
+            g[(os.path.relpath(x["source"], os.path.dirname(os.path.dirname(os.path.dirname(x["source"])))),
+               x["coreset_pct"])].append(x)
         S.append(box("Offline stock PatchCore (full train set, all classes in file)",
-                     ["config", "coreset %", "classes", "image AUROC", "pixel AUROC", "PRO"],
+                     ["results.csv", "coreset %", "classes", "image AUROC", "pixel AUROC", "PRO"],
                      [[c, pct, len(v), pm(*mean_std([x["image_auroc"] for x in v])[:2]),
                        pm(*mean_std([x["pixel_auroc"] for x in v])[:2]),
                        pm(*mean_std([x["pro"] for x in v])[:2])]
@@ -746,14 +760,14 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
     g = defaultdict(list)
     for x in per_seed:
         if x["stage"] == "0":
-            g[(x["dataset"], x["capacity"], x["class"], x["policy"])].append(x)
-    S.append(box("", ["dataset", "M", "class", "policy", "image per seed", "image", "pixel per seed", "pixel"],
-                 [[ds, M, c, p,
+            g[(x["dataset"], x["budget"], x["variant"], x["class"], x["capacity"], x["policy"])].append(x)
+    S.append(box("", ["dataset", "budget", "variant", "class", "M", "policy", "image per seed", "image", "pixel per seed", "pixel"],
+                 [[ds, b, var, c, M, p,
                    " ".join(f"{x['image_auroc']:.3f}" for x in sorted(v, key=lambda x: x["seed"])),
                    pm(*mean_std([x["image_auroc"] for x in v])[:2]),
                    " ".join(f"{x['pixel_auroc']:.3f}" for x in sorted(v, key=lambda x: x["seed"])),
                    pm(*mean_std([x["pixel_auroc"] for x in v])[:2])]
-                  for (ds, M, c, p), v in sorted(g.items(), key=lambda kv: (kv[0][0], _cap_key(kv[0][1]), kv[0][2], kv[0][3]))]))
+                  for (ds, b, var, c, M, p), v in sorted(g.items(), key=lambda kv: (kv[0][0], _budget_key(kv[0][1]), kv[0][2], kv[0][3], kv[0][5]))]))
 
     # 3. full stream: image AUROC at each quarter, cross-class mean
     S.append("[3] FULL STREAM — image AUROC at each point of the stream (cross-class mean ± std)")
@@ -762,11 +776,11 @@ def render_report(ds_mean, sweep, stock, per_seed, drift_rows, preshift, calib,
     g = defaultdict(lambda: defaultdict(list))
     for x in per_seed:
         col = "forget@100%" if x["stage"] == FORGET else f"{int(round(100 * x['stream_frac_evaluated_at']))}%"
-        g[(x["dataset"], x["backbone"], x["capacity"], x["policy"])][col].append(x["image_auroc"])
+        g[(x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"])][col].append(x["image_auroc"])
     cols = ["25%", "50%", "75%", "100%", "forget@100%"]
-    S.append(box("", ["dataset", "backbone", "M", "policy"] + cols,
+    S.append(box("", ["dataset", "backbone", "budget", "variant", "policy"] + cols,
                  [[*k, *(pm(*mean_std(v[c])[:2]) for c in cols)]
-                  for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], kv[0][1], _cap_key(kv[0][2]), kv[0][3]))]))
+                  for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], kv[0][1], _budget_key(kv[0][2]), kv[0][3], kv[0][4]))]))
 
     # 4. drift
     S.append("[4] DRIFT — phase definitions (staged_abrupt_4) and pre-shift audit")
@@ -825,7 +839,9 @@ def main():
     pkg_default = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--pkg_dir", default=pkg_default)
-    ap.add_argument("--log_dir", default=None, help="default: <pkg>/../logs")
+    ap.add_argument("--log_dir", action="append", default=None,
+                    help="repeatable; default: every existing one of <pkg>/../../logs, "
+                         "<pkg>/../logs, <pkg>/logs")
     ap.add_argument("--dataset_root", default=os.environ.get(
         "DATASET_ROOT", "/home/user1/aniket/Patchcore/dataset"))
     ap.add_argument("--polyp_pvt_train_dir", default=None,
@@ -837,10 +853,14 @@ def main():
     pkg = a.pkg_dir
     out = a.out or os.path.join(pkg, "results", "harvest")
     os.makedirs(out, exist_ok=True)
-    log_dir = a.log_dir or os.path.join(pkg, "..", "logs")
-
-    print(f"[logs] parsing {log_dir}")
-    log_facts, n_logs = parse_logs(log_dir)
+    # run_streaming.sh logs to ../logs relative to the sbatch SUBMIT dir (the
+    # repo root for submit_all_streaming.sh), i.e. one level above the repo
+    log_dirs = a.log_dir or [d for d in (os.path.join(pkg, "..", "..", "logs"),
+                                         os.path.join(pkg, "..", "logs"),
+                                         os.path.join(pkg, "logs")) if os.path.isdir(d)]
+    print(f"[logs] parsing {[os.path.realpath(d) for d in log_dirs] or 'NO log dir found'}")
+    log_facts, n_logs = parse_logs(log_dirs)
+    print(f"[logs] {n_logs} streaming_output_*.log files")
     runs = discover_runs(os.path.join(pkg, "results", "streaming"),
                          os.path.join(pkg, "cache"), log_facts)
     print(f"[runs] {len(runs)} result dirs")
@@ -862,7 +882,8 @@ def main():
     write_csv(os.path.join(out, "memory_sweep.csv"), sweep)
     # cross-class mean: each (class, seed) pair is one sample
     ds_mean = summarize([{**x, "seed": (x["class"], x["seed"])} for x in per_seed],
-                        ["dataset", "backbone", "capacity", "policy"], lambda x: x["stage"] == "0")
+                        ["dataset", "backbone", "budget", "variant", "policy"],
+                        lambda x: x["stage"] == "0")
     for d in ds_mean:
         d["n_class_seed_pairs"] = d.pop("n_seeds")
     write_csv(os.path.join(out, "memory_sweep_dataset_mean.csv"), ds_mean)
@@ -874,7 +895,7 @@ def main():
          for x in per_seed if x["stage"] == "0"),
         key=lambda d: (d["run"], d["policy"], d["seed"])))
     write_csv(os.path.join(out, "fullstream.csv"), summarize(
-        per_seed, ["dataset", "class", "backbone", "capacity", "policy",
+        per_seed, ["dataset", "class", "backbone", "budget", "variant", "capacity", "policy",
                    "stream_frac_evaluated_at", "test_set"], lambda x: True))
     drift_rows, preshift = harvest_drift_protocol(), harvest_preshift(runs)
     write_csv(os.path.join(out, "drift_protocol.csv"), drift_rows)
