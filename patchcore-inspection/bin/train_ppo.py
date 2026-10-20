@@ -40,10 +40,16 @@ def _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, base_seed, rew
     return fns
 
 
-def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_seed, reward_cfg):
-    from patchcore.streaming.cache import EmbeddingCacheReader
+def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_seed, reward_cfg,
+                        preshift=False):
+    from patchcore.streaming.cache import EmbeddingCacheReader, stage0_end
 
     reader = EmbeddingCacheReader(os.path.join(cache_dir, "stream"))
+    # Pre-shift-only: every training episode (and the obs-norm prefit, which
+    # builds its env from these fns) ends before the first stage-1 image.
+    stop = stage0_end(reader) if preshift else None
+    if preshift:
+        print(f"[preshift] training episodes end at image {stop} (first stage-1 image)")
 
     # Every env replays the same stream, so the expensive warmup coreset (and
     # probe/projection/reward scales) is computed once on a prototype and
@@ -52,7 +58,7 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
     proto = MemoryMaintenanceEnv(
         reader, capacity=capacity, warmup_images=warmup, seed=base_seed,
         action_cfg=ActionConfig(mode=action_mode),
-        reward_cfg=dataclasses.replace(reward_cfg),
+        reward_cfg=dataclasses.replace(reward_cfg), episode_stop=stop,
     )
     proto.reset()
     init_state = proto.export_init_state()
@@ -63,7 +69,7 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
             env = MemoryMaintenanceEnv(
                 reader, capacity=capacity, warmup_images=warmup, seed=seed,
                 action_cfg=ActionConfig(mode=action_mode),
-                reward_cfg=dataclasses.replace(reward_cfg),
+                reward_cfg=dataclasses.replace(reward_cfg), episode_stop=stop,
             )
             env.import_init_state(init_state)
             return env
@@ -141,11 +147,14 @@ def _fit_obs_norm(env_fn, seed=0):
 @click.option("--ent_coef_end", type=float, default=None, help="Linear entropy anneal target")
 @click.option("--lr", type=float, default=3e-4)
 @click.option("--lr_end", type=float, default=None, help="Linear LR anneal target")
+@click.option("--preshift", is_flag=True, default=False,
+              help="Train (and fit obs normalization) on the pre-shift stream "
+                   "only: episodes end at the first stage-1 image")
 def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
          total_env_steps, seed, out, device, eval_baselines, reward_json,
          beta, gamma, churn_coef, churn_budget, reward_form, norm_mode,
          reward_scale, adv_mode, clip_mode, clip_high, ent_coef, ent_coef_end,
-         lr, lr_end):
+         lr, lr_end, preshift):
     import torch
 
     from patchcore.streaming.bank import device_banner
@@ -171,7 +180,8 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
             n_env, capacity, warmup, action_mode, seed, reward_cfg)
     elif cache_dir:
         env_fns = _make_cache_env_fns(
-            n_env, cache_dir, capacity, warmup, action_mode, seed, reward_cfg)
+            n_env, cache_dir, capacity, warmup, action_mode, seed, reward_cfg,
+            preshift=preshift)
     else:
         raise click.UsageError("pass --cache_dir or --synthetic")
 
@@ -189,10 +199,14 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
         # selection inherits stream-phase bias (default 9 fits only kvasir).
         # Floor of 3: streams shorter than a rollout (small MVTec classes)
         # would otherwise select on a single noisy iteration.
-        from patchcore.streaming.cache import EmbeddingCacheReader
+        from patchcore.streaming.cache import EmbeddingCacheReader, stage0_end
 
-        episode_steps = EmbeddingCacheReader(
-            os.path.join(cache_dir, "stream")).n_images - warmup
+        sr = EmbeddingCacheReader(os.path.join(cache_dir, "stream"))
+        episode_steps = (stage0_end(sr) if preshift else sr.n_images) - warmup
+        if episode_steps <= 0:
+            raise click.UsageError(
+                f"no training steps: warmup {warmup} >= episode end "
+                f"{episode_steps + warmup}" + (" (pre-shift)" if preshift else ""))
         cfg.best_window = max(3, round(episode_steps / cfg.rollout_steps))
     print(f"[ppo] adv_mode={adv_mode} clip_mode={clip_mode} clip_high={clip_high} "
           f"best_window={cfg.best_window}")

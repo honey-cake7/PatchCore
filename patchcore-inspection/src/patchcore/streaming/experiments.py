@@ -165,6 +165,7 @@ def record_policy_traces(
     policy_names: Optional[List[str]] = None,
     seeds: Optional[List[int]] = None,
     stage0_only: bool = False,
+    episode_stop: Optional[int] = None,
 ) -> List[Dict]:
     """Drive each baseline policy over the stream, recording per-step reward
     components alongside labeled per-stage AUROC and final forgetting.
@@ -203,6 +204,7 @@ def record_policy_traces(
             env = MemoryMaintenanceEnv(
                 stream_reader, capacity=capacity, warmup_images=warmup,
                 seed=seed, n_nearest_neighbours=n_nearest_neighbours,
+                episode_stop=episode_stop,
             )
             policy = cls(k=8) if name in ("fifo", "random") else cls()
             summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
@@ -260,6 +262,7 @@ def record_ppo_traces(
     seeds: Optional[List[int]] = None,
     name: str = "ppo_r1",
     stage0_only: bool = False,
+    episode_stop: Optional[int] = None,
 ) -> List[Dict]:
     """Replay a trained PPO checkpoint over the stream, recording the same
     component traces as :func:`record_policy_traces`.
@@ -297,6 +300,7 @@ def record_ppo_traces(
             stream_reader, capacity=capacity, warmup_images=warmup,
             seed=seed, n_nearest_neighbours=n_nearest_neighbours,
             obs_norm=norm, action_cfg=ActionConfig(mode=action_mode),
+            episode_stop=episode_stop,
         )
         summ = P.run_policy(env, P.PPOPolicy(ac), per_stage_eval=eval_fn)
         forget_m = None

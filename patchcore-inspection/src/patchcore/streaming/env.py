@@ -103,6 +103,7 @@ class MemoryMaintenanceEnv:
         warmup_images: int = 100,
         n_nearest_neighbours: int = 1,
         obs_norm: Optional["RunningNorm"] = None,
+        episode_stop: Optional[int] = None,
     ) -> None:
         self.reader = reader
         self.capacity = int(capacity)
@@ -114,6 +115,10 @@ class MemoryMaintenanceEnv:
         self.init_bank_mode = init_bank
         self.warmup_images = warmup_images
         self.n_nn = n_nearest_neighbours
+        # Default episode end (exclusive image index) when reset() gets no
+        # slice; None = the whole stream. Pre-shift-only training sets it to
+        # the end of stage 0 so the policy never sees post-shift images.
+        self.episode_stop = episode_stop
 
         # Frozen random projection for the observation's distributional summary.
         self._proj = self.rng.normal(
@@ -250,7 +255,8 @@ class MemoryMaintenanceEnv:
         self._win_cov_cache = None
 
         start = self.warmup_images if episode_slice is None else episode_slice.start
-        stop = self.reader.n_images if episode_slice is None else episode_slice.stop
+        stop = (self.episode_stop or self.reader.n_images) if episode_slice is None \
+            else episode_slice.stop
         self._start, self._stop = int(start), int(min(stop, self.reader.n_images))
         self._t = self._start
         self._load_current()

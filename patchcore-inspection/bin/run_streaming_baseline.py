@@ -70,9 +70,18 @@ def _build_policy(name, ppo_path, device):
          "re-eval — the paper reports stage-0 AUROC only. Episodes still run "
          "the full stream; only the per-stage labeled scoring is pruned.",
 )
+@click.option("--calib_split", type=float, default=0.0,
+              help="Report on the test images NOT in the calibration subset "
+                   "(same value as fit_reward_weights.py --calib_split). "
+                   "0 = legacy: report on the full test set.")
+@click.option("--stage0_every_boundary", is_flag=True, default=False,
+              help="Also re-score the stage-0 test set at every intermediate "
+                   "stage boundary (rows 'stage0_at_<s>': 50%/75% of the stream "
+                   "for 4 stages; 100% is the final_forgetting row).")
 @click.option("--out", default="streaming_results")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
-         action_mode, seeds, reward_json, stage0_only, out):
+         action_mode, seeds, reward_json, stage0_only, calib_split,
+         stage0_every_boundary, out):
     import dataclasses
 
     from patchcore.streaming.bank import device_banner
@@ -80,6 +89,12 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
 
     print(device_banner())
     stream, tests, patch_shape, imagesize = _load_readers(cache_dir, synthetic)
+    if calib_split:
+        from patchcore.streaming.cache import split_test_readers
+
+        tests = split_test_readers(tests, calib_split, "eval")
+        print(f"[calib] reporting on {tests[0].n_images} held-out test images "
+              f"(calibration subset {calib_split:.0%} excluded)")
     seeds = [int(s) for s in seeds.split(",")]
     names = [n for n in policy_names.split(",") if n]
     os.makedirs(out, exist_ok=True)
@@ -100,9 +115,15 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
             reward_cfg=dataclasses.replace(reward_cfg),
         )
 
+    s0_mid = []  # (stage, metrics): stage-0 test re-scored mid-stream
+
     def eval_fn(env, stage):
         if stage0_only and stage != 0:
             return {}
+        # the last stage's boundary IS the final bank = the forgetting row
+        if stage0_every_boundary and 0 < stage < len(tests) - 1:
+            s0_mid.append((stage, evaluate_bank_on_stage(
+                env.bank, tests[0], n_nn, patch_shape, imagesize)))
         return evaluate_bank_on_stage(
             env.bank, tests[stage], n_nn, patch_shape, imagesize
         )
@@ -123,6 +144,7 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                 seed, obs_norm=ppo_norm,
                 mode=(ppo_meta or {}).get("action_mode"),
             )
+            s0_mid.clear()
             summ = P.run_policy(env, policy, per_stage_eval=eval_fn)
             # forgetting: re-evaluate stage-0 test with the final bank (skipped
             # entirely under stage0_only — nothing new to "forget" without
@@ -139,6 +161,13 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
                     "image_auroc": ev.get("image_auroc", float("nan")),
                     "pixel_auroc": ev.get("pixel_auroc", float("nan")),
                     "pro": ev.get("pro", float("nan")),
+                })
+            for st, m in s0_mid:
+                rows.append({
+                    "policy": name, "seed": seed, "stage": f"stage0_at_{st}",
+                    "image_auroc": m.get("image_auroc", float("nan")),
+                    "pixel_auroc": m.get("pixel_auroc", float("nan")),
+                    "pro": m.get("pro", float("nan")),
                 })
             if not stage0_only:
                 rows.append({
@@ -176,7 +205,7 @@ def _print_summary(rows, names):
 
 def _print_metric_table(rows, names, key, title):
     print(f"\n=== mean {title} per policy per stage (over seeds) ===")
-    stages = sorted({r["stage"] for r in rows if r["stage"] != "final_forgetting"},
+    stages = sorted({r["stage"] for r in rows if str(r["stage"]).isdigit()},
                     key=lambda x: int(x))
     header = "policy".ljust(26) + "".join(f"stage{ s}".rjust(10) for s in stages) + "forget".rjust(10)
     print(header)

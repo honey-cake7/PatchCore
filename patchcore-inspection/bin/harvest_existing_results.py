@@ -204,7 +204,10 @@ def discover_runs(results_root, cache_root, log_facts):
         mm = re.match(r"_m([\d.]+)(.*)$", r["suffix"])
         r["budget"] = f"{mm.group(1)}% match" if mm else (
             f"M={r['capacity']}" if r.get("capacity") else "M=?")
-        r["variant"] = (mm.group(2) if mm else r["suffix"]) or "(untagged)"
+        # fixed-M tags carry the budget too (_M2000_rv): strip it so every
+        # budget of one protocol shares a variant name
+        mf = re.match(r"_M\d+(.*)$", r["suffix"])
+        r["variant"] = (mm.group(2) if mm else mf.group(1) if mf else r["suffix"]) or "(untagged)"
         tag = name[: len(name) - len(r["suffix"])] if r["suffix"] else name
         r["cache_dir"] = os.path.join(cache_root, tag)
         r["cache"] = load_cache_facts(r["cache_dir"])
@@ -229,6 +232,8 @@ def harvest_per_seed(runs):
             seed = int(row["seed"])
             if row["stage"] == FORGET:
                 frac, test_set = 1.0, "stage_0"
+            elif row["stage"].startswith("stage0_at_"):  # stage-0 test mid-stream
+                frac, test_set = (int(row["stage"].rsplit("_", 1)[1]) + 1) / n_stages, "stage_0"
             else:
                 s = int(row["stage"])
                 frac, test_set = (s + 1) / n_stages, f"stage_{s}"
@@ -835,12 +840,18 @@ def _render_rest(S, per_seed, drift_rows, preshift, calib, overlap, deploy, prot
     # 3. full stream: image AUROC at each quarter, cross-class mean
     S.append("[3] FULL STREAM — image AUROC at each point of the stream (cross-class mean ± std)")
     S.append("    25/50/75/100% = bank at end of that quarter, scored on THAT phase's test set;")
-    S.append("    'forget@100%' = final bank scored on the stage-0 test set.")
+    S.append("    s0@X = bank at X% of the stream scored on the STAGE-0 test set "
+             "(s0@100% = forgetting; s0@50/75% need STAGE0_EVERY=1 runs).")
     g = defaultdict(lambda: defaultdict(list))
     for x in per_seed:
-        col = "forget@100%" if x["stage"] == FORGET else f"{int(round(100 * x['stream_frac_evaluated_at']))}%"
+        pct = f"{int(round(100 * x['stream_frac_evaluated_at']))}%"
+        col = ("s0@100%" if x["stage"] == FORGET else
+               f"s0@{pct}" if x["stage"].startswith("stage0_at_") else
+               "s0@25%" if x["stage"] == "0" else pct)
+        if x["stage"] == "0":
+            g[(x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"])]["25%"].append(x["image_auroc"])
         g[(x["dataset"], x["backbone"], x["budget"], x["variant"], x["policy"])][col].append(x["image_auroc"])
-    cols = ["25%", "50%", "75%", "100%", "forget@100%"]
+    cols = ["25%", "50%", "75%", "100%", "s0@25%", "s0@50%", "s0@75%", "s0@100%"]
     S.append(box("", ["dataset", "backbone", "budget", "variant", "policy"] + cols,
                  [[*k, *(pm(*mean_std(v[c])[:2]) for c in cols)]
                   for k, v in sorted(g.items(), key=lambda kv: (kv[0][0], kv[0][1], _budget_key(kv[0][2]), kv[0][3], kv[0][4]))]))

@@ -545,3 +545,23 @@ def test_fit_stage0_only_traces_ok_with_stage0_weight():
                              stage0_weight=1.0)
     assert _targets_of(res, traces) == pytest.approx([0.90, 0.70])
     assert not res["traces_without_stage0"]
+
+
+# ---- reviewer protocol: calibration split + pre-shift episodes -----------
+def test_calibration_split_disjoint_stratified_and_preshift_stops_at_stage1():
+    from patchcore.streaming.cache import calibration_split, stage0_end
+
+    labels = np.array([0] * 30 + [1] * 70)
+    calib, eval_ = calibration_split(labels, 0.3, seed=0)
+    assert not set(calib) & set(eval_)                    # disjoint
+    assert len(calib) + len(eval_) == len(labels)         # covers every image
+    assert (labels[calib] == 0).sum() == 9 and (labels[calib] == 1).sum() == 21
+
+    cfg = SyntheticConfig(images_per_stage=20, patches_per_image=64)
+    stream = make_synthetic_stream(cfg)
+    stop = stage0_end(stream)
+    assert stop > 10 and stream.stage_of(stop) == 1 and stream.stage_of(stop - 1) == 0
+    env = MemoryMaintenanceEnv(stream, capacity=128, warmup_images=10, episode_stop=stop)
+    summ = P.run_policy(env, P.FIFOPolicy(k=8))
+    assert len(summ["infos"]) == stop - 10                # ends at the first stage-1 image
+    assert all(i["stage"] == 0 for i in summ["infos"])

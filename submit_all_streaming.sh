@@ -30,6 +30,10 @@
 #       nvidia/mit-b3 in the HF cache (./download_hf_backbones.sh, login node).
 #       New backbone = new cache tag: step 1 re-caches all 15 classes first.
 #
+#   MEM=48G ONLY=kvasir ./submit_all_streaming.sh
+#       host RAM for the endoscopy jobs (default 12G); OFFLINE=1's whole-stream
+#       coreset pool is ~8-11 GB on Kvasir/HyperKvasir, so raise it there.
+#
 # CLASSNAMES is passed via the environment (--export=ALL): sbatch's
 # --export=NAME=VALUE parsing splits on commas and would mangle a list value.
 
@@ -57,7 +61,7 @@ if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "hyperkvasir" ]; then
         --output="../logs/streaming_output_%j.log" \
         --error="../logs/streaming_error_%j.log" \
         --gres="${GRES}" "${DEP_ARG[@]}" \
-        --export=ALL --mem=12G run_streaming.sh)"
+        --export=ALL --mem="${MEM:-12G}" run_streaming.sh)"
 fi
 
 if [ "${ONLY}" = "kvasir" ]; then
@@ -73,7 +77,7 @@ if [ "${ONLY}" = "kvasir" ]; then
         --output="../logs/streaming_output_%j.log" \
         --error="../logs/streaming_error_%j.log" \
         --gres="${GRES}" "${DEP_ARG[@]}" \
-        --export=ALL --mem=12G run_streaming.sh)"
+        --export=ALL --mem="${MEM:-12G}" run_streaming.sh)"
 fi
 
 if [ "${ONLY}" = "all" ] || [ "${ONLY}" = "mvtec" ]; then

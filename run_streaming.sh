@@ -240,6 +240,28 @@ STAGE0_ONLY=${STAGE0_ONLY:-0}
 STAGE0_ONLY_ARG=""
 [ "${STAGE0_ONLY}" = "1" ] && STAGE0_ONLY_ARG="--stage0_only"
 
+# Reviewer-protocol knobs (all opt-in; unset = historical behaviour):
+#   CALIB_SPLIT=0.3  fit the reward on a stratified 30% CALIBRATION subset of
+#                    the labeled test set and report on the disjoint 70%
+#   PRESHIFT=1       reward fit + PPO training (incl. obs-norm prefit) see the
+#                    pre-shift stream only; benchmark still runs the full stream
+#   STAGE0_EVERY=1   also score the stage-0 test set at 50%/75% of the stream
+#   OFFLINE=1        step 6: offline greedy coreset at exactly M (stage-0 pool
+#                    and whole-stream pool), appended to results.csv
+#   DEPLOY=1         step 7: latency + peak GPU memory -> deployment.csv
+CALIB_SPLIT=${CALIB_SPLIT:-0}
+PRESHIFT=${PRESHIFT:-0}
+STAGE0_EVERY=${STAGE0_EVERY:-0}
+OFFLINE=${OFFLINE:-0}
+OFFLINE_MAX_PATCHES=${OFFLINE_MAX_PATCHES:-0}
+DEPLOY=${DEPLOY:-0}
+CALIB_ARG=""
+[ "${CALIB_SPLIT}" != "0" ] && CALIB_ARG="--calib_split ${CALIB_SPLIT}"
+PRESHIFT_ARG=""
+[ "${PRESHIFT}" = "1" ] && PRESHIFT_ARG="--preshift"
+STAGE0_EVERY_ARG=""
+[ "${STAGE0_EVERY}" = "1" ] && STAGE0_EVERY_ARG="--stage0_every_boundary"
+
 # Reward-fit ranking target:
 #   DRIFTED_WEIGHT*mean(stage>=1 AUROC) + FORGET_WEIGHT*forgetting
 #   + STAGE0_WEIGHT*stage-0 AUROC
@@ -250,7 +272,7 @@ STAGE0_ONLY_ARG=""
 # drifted-stage entries (fit_reward_weights raises if FORGET_WEIGHT/
 # DRIFTED_WEIGHT are non-zero against them), so the defaults flip to a
 # pure stage-0 target unless the caller explicitly overrides them.
-if [ "${STAGE0_ONLY}" = "1" ]; then
+if [ "${STAGE0_ONLY}" = "1" ] || [ "${PRESHIFT}" = "1" ]; then
     FORGET_WEIGHT=${FORGET_WEIGHT:-0.0}
     DRIFTED_WEIGHT=${DRIFTED_WEIGHT:-0.0}
     STAGE0_WEIGHT=${STAGE0_WEIGHT:-1.0}
@@ -398,8 +420,13 @@ PYEOF
     # stage0_only (stage0_only traces carry no forget_auroc/drifted-stage
     # entries), so only reuse them when those still match (sidecar check).
     local TRACES_ARG=""
+    # historical key unchanged when the reviewer knobs are off, so old traces
+    # stay reusable; any split/preshift change re-records
+    local TRACES_KEY="${WARMUP}:${CAPACITY}:${STAGE0_ONLY}"
+    [ "${CALIB_SPLIT}" != "0" ] || [ "${PRESHIFT}" = "1" ] \
+        && TRACES_KEY="${TRACES_KEY}:${CALIB_SPLIT}:${PRESHIFT}"
     if [ -f "${RESULT_DIR}/reward_traces.pkl" ] \
-        && [ "$(cat "${RESULT_DIR}/reward_traces.cfg" 2>/dev/null)" = "${WARMUP}:${CAPACITY}:${STAGE0_ONLY}" ]; then
+        && [ "$(cat "${RESULT_DIR}/reward_traces.cfg" 2>/dev/null)" = "${TRACES_KEY}" ]; then
         TRACES_ARG="--traces_in ${RESULT_DIR}/reward_traces.pkl"
     fi
     # ITERATE=1: iterated reward refit — replay the previously trained PPO
@@ -415,8 +442,8 @@ PYEOF
         echo "[${CLASSNAME}] ITERATE=1 but no checkpoint at ${PPO_OUT} — plain fit"
     fi
     echo -e "\n[${CLASSNAME} 3.5/5] Fitting proxy-reward weights (target: ${DRIFTED_WEIGHT}*drifted + ${FORGET_WEIGHT}*forgetting + ${STAGE0_WEIGHT}*stage0) ..."
-    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --drifted_weight "${DRIFTED_WEIGHT}" --stage0_weight "${STAGE0_WEIGHT}" --min_rho "${MIN_RHO}" --permute "${PERMUTE}" ${TRACES_ARG} ${PPO_ITER_ARG} ${STAGE0_ONLY_ARG} --out "${RESULT_DIR}/reward_weights.json"
-    echo "${WARMUP}:${CAPACITY}:${STAGE0_ONLY}" > "${RESULT_DIR}/reward_traces.cfg"
+    python -u bin/fit_reward_weights.py --cache_dir "${CACHE_DIR}" --capacity "${CAPACITY}" --warmup "${WARMUP}" --n_nn "${N_NN}" --forget_weight "${FORGET_WEIGHT}" --drifted_weight "${DRIFTED_WEIGHT}" --stage0_weight "${STAGE0_WEIGHT}" --min_rho "${MIN_RHO}" --permute "${PERMUTE}" ${TRACES_ARG} ${PPO_ITER_ARG} ${STAGE0_ONLY_ARG} ${CALIB_ARG} ${PRESHIFT_ARG} --out "${RESULT_DIR}/reward_weights.json"
+    echo "${TRACES_KEY}" > "${RESULT_DIR}/reward_traces.cfg"
    
 
     # Without the fitted weights train/benchmark fall back to the DEFAULT
@@ -440,6 +467,7 @@ PYEOF
         --lr_end           "${PPO_LR_END}" \
         --reward_form      "${REWARD_FORM}" \
         ${REWARD_JSON_ARG} \
+        ${PRESHIFT_ARG} \
         --eval_baselines || { echo "[${CLASSNAME}] PPO training failed"; return 1; }
 
     # STEP 5: benchmark all policies
@@ -454,7 +482,45 @@ PYEOF
         --seeds      "${EVAL_SEEDS}" \
         ${REWARD_JSON_ARG} \
         ${STAGE0_ONLY_ARG} \
+        ${CALIB_ARG} \
+        ${STAGE0_EVERY_ARG} \
         --out        "${RESULT_DIR}" || { echo "[${CLASSNAME}] benchmark failed"; return 1; }
+
+    # STEP 6: offline PatchCore at exactly M (stage-0 pool = frozen on phase 1;
+    # whole-stream pool = rebuilt on everything), appended to results.csv
+    if [ "${OFFLINE}" = "1" ]; then
+        echo -e "\n[${CLASSNAME} 6/7] Offline greedy coreset at M=${CAPACITY} ..."
+        python -u bin/run_offline_coreset.py \
+            --cache_dir   "${CACHE_DIR}" \
+            --capacity    "${CAPACITY}" \
+            --n_nn        "${N_NN}" \
+            --seeds       "${EVAL_SEEDS}" \
+            --max_patches "${OFFLINE_MAX_PATCHES}" \
+            ${CALIB_ARG} \
+            --out         "${RESULT_DIR}" || { echo "[${CLASSNAME}] offline coreset failed"; return 1; }
+    fi
+
+    # STEP 7: deployment cost (latency per image + peak GPU memory)
+    if [ "${DEPLOY}" = "1" ]; then
+        echo -e "\n[${CLASSNAME} 7/7] Measuring deployment latency / memory ..."
+        python -u bin/measure_deployment.py \
+            --backbone_name             "${BACKBONE}" \
+            "${LAYERS[@]}" \
+            --data_path                 "${DATA_PATH}" \
+            --classname                 "${CLASSNAME}" \
+            --resize                    "${RESIZE}" \
+            --imagesize                 "${IMAGESIZE}" \
+            --pretrain_embed_dimension  "${PRE_DIM}" \
+            --target_embed_dimension    "${TGT_DIM}" \
+            --patchsize                 "${PATCHSIZE}" \
+            --cache_dir                 "${CACHE_DIR}" \
+            --capacity                  "${CAPACITY}" \
+            --warmup                    "${WARMUP}" \
+            --n_nn                      "${N_NN}" \
+            --ppo_path                  "${PPO_OUT}" \
+            ${REWARD_JSON_ARG} \
+            --out                       "${RESULT_DIR}" || { echo "[${CLASSNAME}] deployment measurement failed"; return 1; }
+    fi
 
     echo "[${CLASSNAME}] DONE -> ${RESULT_DIR}/results.csv"
 }
@@ -512,7 +578,8 @@ policies = list(dict.fromkeys(r["policy"] for r in rows))
 # bank) — keep it out of the stage columns and the stage mean, mirroring
 # run_streaming_baseline's own summary.
 FORGET = "final_forgetting"
-stages = sorted({r["stage"] for r in rows if r["stage"] != FORGET})
+stages = sorted({r["stage"] for r in rows if r["stage"].isdigit()}, key=int)
+extra = sorted({r["stage"] for r in rows if r["stage"] not in stages and r["stage"] != FORGET})
 sums = defaultdict(float)
 counts = defaultdict(int)
 for r in rows:
@@ -523,7 +590,9 @@ for r in rows:
             continue
         if v != v:  # NaN (e.g. pixel/pro can be absent for forgetting rows)
             continue
-        keys = (FORGET,) if r["stage"] == FORGET else (r["stage"], "mean")
+        # only true per-stage rows enter the stage mean; final_forgetting and
+        # stage0_at_<s> (stage-0 test re-scored mid-stream) are extra columns
+        keys = (r["stage"], "mean") if r["stage"].isdigit() else (r["stage"],)
         for s in keys:
             sums[(r["policy"], s, m)] += v
             counts[(r["policy"], s, m)] += 1
@@ -533,7 +602,7 @@ with open(mean_csv, "w", newline="") as f:
     w = csv.writer(f)
     w.writerow(["policy", "stage"] + metrics)
     for p in policies:
-        for s in stages + [FORGET, "mean"]:
+        for s in stages + extra + [FORGET, "mean"]:
             w.writerow([p, "forget" if s == FORGET else s] + [
                 round(sums[(p, s, m)] / counts[(p, s, m)], 4) if counts[(p, s, m)] else ""
                 for m in metrics
@@ -542,8 +611,8 @@ with open(mean_csv, "w", newline="") as f:
 titles = {"image_auroc": "image AUROC", "pixel_auroc": "pixel AUROC", "pro": "PRO"}
 n_classes = len({r["class"] for r in rows})
 n_seeds = len({r["seed"] for r in rows})
-col_keys = stages + [FORGET, "mean"]
-cols = [f"stage{s}" for s in stages] + ["forget", "mean"]
+col_keys = stages + extra + [FORGET, "mean"]
+cols = [f"stage{s}" for s in stages] + [s.replace("stage0_at_", "s0@") for s in extra] + ["forget", "mean"]
 name_w = max(len(p) for p in policies + ["policy"]) + 2
 col_w = max(8, max(len(c) for c in cols) + 2)
 inner = name_w + col_w * len(cols)

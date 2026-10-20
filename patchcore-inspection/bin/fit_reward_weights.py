@@ -95,10 +95,19 @@ def _load_readers(cache_dir, synthetic):
          "--forget_weight 0 --drifted_weight 0 (typically --stage0_weight 1) "
          "or fit_reward_weights raises.",
 )
+@click.option("--calib_split", type=float, default=0.0,
+              help="Fit on a stratified CALIBRATION subset of the labeled test "
+                   "set (this fraction); run_streaming_baseline.py --calib_split "
+                   "with the same value reports on the disjoint rest. 0 = legacy "
+                   "(fit and report on the same test images).")
+@click.option("--preshift", is_flag=True, default=False,
+              help="Record traces over the pre-shift stream only (episodes end "
+                   "at the first stage-1 image) — the policy's reward must not "
+                   "be fitted on post-shift data. Requires a stage-0-only target.")
 @click.option("--out", default="reward_weights.json")
 def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
          forget_weight, drifted_weight, stage0_weight, min_rho, permute, max_p,
-         traces_out, traces_in, ppo_pt, stage0_only, out):
+         traces_out, traces_in, ppo_pt, stage0_only, calib_split, preshift, out):
     import pickle
 
     from patchcore.streaming.bank import device_banner
@@ -113,6 +122,23 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
                 "pass --cache_dir or --synthetic (needed to record traces)")
         print(device_banner())
         stream, tests, patch_shape, imagesize = _load_readers(cache_dir, synthetic)
+        if calib_split:
+            from patchcore.streaming.cache import split_test_readers
+
+            tests = split_test_readers(tests, calib_split, "calib")
+            print(f"[calib] fitting on {tests[0].n_images} calibration test images "
+                  f"({calib_split:.0%}, stratified); the rest is reserved for reporting")
+
+    episode_stop = None
+    if preshift:
+        if forget_weight or drifted_weight:
+            raise click.UsageError("--preshift traces carry no post-shift labels: "
+                                   "use --forget_weight 0 --drifted_weight 0")
+        if stream is not None:
+            from patchcore.streaming.cache import stage0_end
+
+            episode_stop = stage0_end(stream)
+            print(f"[preshift] traces end at image {episode_stop} (first stage-1 image)")
 
     if traces_in:
         with open(traces_in, "rb") as f:
@@ -123,7 +149,7 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
             stream, tests, capacity, warmup=warmup, n_nearest_neighbours=n_nn,
             patch_shape=patch_shape, imagesize=imagesize,
             policy_names=[n for n in policy_names.split(",") if n],
-            seeds=seed_list, stage0_only=stage0_only,
+            seeds=seed_list, stage0_only=stage0_only, episode_stop=episode_stop,
         )
 
     if ppo_pt:
@@ -136,7 +162,7 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, seeds,
             stream, tests, capacity, ppo_pt, warmup=warmup,
             n_nearest_neighbours=n_nn, patch_shape=patch_shape,
             imagesize=imagesize, seeds=seed_list, name=name,
-            stage0_only=stage0_only,
+            stage0_only=stage0_only, episode_stop=episode_stop,
         )
 
     if not traces_in or ppo_pt:

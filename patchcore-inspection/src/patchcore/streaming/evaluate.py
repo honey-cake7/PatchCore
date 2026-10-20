@@ -58,8 +58,9 @@ def _image_and_pixel_scores(
     to stock PatchCore) or ``torch`` (same scores up to float noise, chunked on
     the k-NN device — much faster at large bank capacities).
     """
-    n, p, d = reader.embeddings.shape
-    flat = np.ascontiguousarray(reader.embeddings.reshape(n * p, d), dtype=np.float32)
+    emb = reader.embeddings  # read once: subset readers materialize on access
+    n, p, d = emb.shape
+    flat = np.ascontiguousarray(emb.reshape(n * p, d), dtype=np.float32)
     if os.environ.get("STREAMING_EVAL_BACKEND", "faiss") == "torch":
         patch_scores = _torch_patch_scores(
             bank, flat, min(n_nearest_neighbours, max(len(bank), 1))

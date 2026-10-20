@@ -179,3 +179,67 @@ class EmbeddingCacheReader:
         return np.concatenate(
             [self.image_patches(i) for i in image_ids], axis=0
         ).astype(np.float32)
+
+
+class SubsetReader:
+    """A fixed subset of a labeled test reader's images (same interface).
+
+    ``embeddings`` materializes the subset on every access (fancy indexing
+    copies), so callers should read it once per evaluation — holding all four
+    stage subsets in RAM would cost ~4x a test set.
+    """
+
+    def __init__(self, base, idx) -> None:
+        self.base = base
+        self.idx = np.asarray(sorted(idx), dtype=np.int64)
+        self.labels = None if base.labels is None else np.asarray(base.labels)[self.idx]
+        self.masks = None if base.masks is None else np.asarray(base.masks[self.idx])
+        self.manifest = base.manifest
+
+    @property
+    def embeddings(self) -> np.ndarray:
+        return self.base.embeddings[self.idx]
+
+    @property
+    def n_images(self) -> int:
+        return len(self.idx)
+
+    def __len__(self) -> int:
+        return len(self.idx)
+
+
+def calibration_split(labels, frac: float, seed: int = 0):
+    """Stratified (calib_idx, eval_idx) split of one labeled test set.
+
+    Every stage's test cache holds the same images in the same order (one
+    drifted copy per stage), so one split applied to all stages keeps the
+    calibration and evaluation images disjoint at every stage.
+    """
+    labels = np.asarray(labels)
+    rng = np.random.default_rng(seed)
+    calib = []
+    for lab in np.unique(labels):
+        ids = rng.permutation(np.flatnonzero(labels == lab))
+        calib.extend(ids[: max(1, int(round(frac * len(ids))))].tolist())
+    calib = np.asarray(sorted(calib), dtype=np.int64)
+    eval_ = np.setdiff1d(np.arange(len(labels)), calib)
+    return calib, eval_
+
+
+def split_test_readers(readers, frac: float, part: str, seed: int = 0):
+    """Return the ``part`` ("calib" | "eval") subset of every stage's reader;
+    ``frac`` <= 0 returns the readers unchanged (legacy: calibrate on test)."""
+    if not frac or frac <= 0:
+        return readers
+    calib, eval_ = calibration_split(readers[0].labels, frac, seed)
+    idx = calib if part == "calib" else eval_
+    for r in readers[1:]:
+        if len(r.labels) != len(readers[0].labels) or (r.labels != readers[0].labels).any():
+            raise ValueError("stage test sets differ — cannot share one split")
+    return [SubsetReader(r, idx) for r in readers]
+
+
+def stage0_end(reader) -> int:
+    """Exclusive index of the first post-shift image in a stream cache."""
+    later = np.flatnonzero(reader._stage_of > 0)
+    return int(later[0]) if len(later) else reader.n_images
