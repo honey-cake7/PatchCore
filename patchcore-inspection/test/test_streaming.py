@@ -924,3 +924,106 @@ def test_band6_admits_typical_or_novel_window_nearest_centre_first():
     mid, _ = env.decode_action(np.array([0., 50, 0, 0, 0, 0]))
     r = np.searchsorted(np.sort(nn), nn[mid])
     assert abs(np.median(r) - (len(nn) - 1) / 2) <= cap      # window sits mid-ranking
+
+
+# ---- Tier-1 policy fixes: no-op, Beta policy, delta ι, KL brake, eval select --
+def _tier1_stream():
+    return make_synthetic_stream(SyntheticConfig(images_per_stage=12, patches_per_image=64))
+
+
+def test_admit_floor_zero_allows_exact_noop_for_both_modes():
+    from patchcore.streaming.env import ActionConfig
+
+    for mode in ("continuous6", "band6"):
+        noop = np.array([0.0, -50, 0, 0, 0, 0])            # a1 -> minimum count
+        for floor, expect in ((1, 1), (0, 0)):
+            env = MemoryMaintenanceEnv(_tier1_stream(), capacity=256, warmup_images=8,
+                                       action_cfg=ActionConfig(mode=mode, admit_floor=floor))
+            env.reset()
+            admit, evict = env.decode_action(noop)
+            assert len(admit) == expect, (mode, floor)
+            if floor == 0:
+                assert len(evict) == 0
+
+
+def test_beta_policy_is_bounded_and_round_trips(tmp_path):
+    import torch
+
+    from patchcore.streaming.env import ActionConfig
+    from patchcore.streaming.ppo import (
+        ActorCritic, PPOConfig, PPOTrainer, action_cfg_from_meta, load_checkpoint,
+    )
+
+    ac = ActorCritic(hidden=16, dist="beta")
+    with torch.no_grad():                                    # push logits to extremes
+        ac.conc_head.bias[:6] = 1e4
+        ac.conc_head.bias[6:] = -1e4
+    with torch.no_grad():
+        dist, _ = ac(torch.zeros(4, OBS_DIM))
+        a = np.tanh(ac.to_env(ac.mean_action(dist)).numpy())
+    assert np.all(np.abs(a) < 1.0) and np.all(np.isfinite(a))   # cannot run off to ±inf
+    x = ac.sample(dist)
+    assert torch.isfinite(dist.log_prob(x)).all()
+
+    stream = _tier1_stream()
+    fn = lambda: MemoryMaintenanceEnv(stream, capacity=128, warmup_images=8,  # noqa: E731
+                                      action_cfg=ActionConfig(mode="band6", admit_floor=0))
+    tr = PPOTrainer([fn], PPOConfig(rollout_steps=8, total_env_steps=8, hidden=16,
+                                    policy_dist="beta"))
+    path = tmp_path / "p.pt"
+    tr.save(str(path))
+    ac2, _, meta = load_checkpoint(str(path))
+    assert ac2.dist_kind == "beta" and meta["policy_dist"] == "beta"
+    cfg = action_cfg_from_meta(meta)
+    assert cfg.mode == "band6" and cfg.admit_floor == 0
+    for p1, p2 in zip(tr.ac.state_dict().values(), ac2.state_dict().values()):
+        assert torch.equal(p1, p2)
+
+
+def test_delta_iota_reward_telescopes_to_final_iota():
+    from patchcore.streaming.reward import RewardConfig
+    from patchcore.streaming.teacher import build_teacher
+
+    stream = _tier1_stream()
+    teacher = build_teacher(stream, 5, verbose=False)
+    rets = {}
+    for form in ("level", "delta"):
+        env = MemoryMaintenanceEnv(stream, capacity=128, warmup_images=8, seed=0,
+                                   reward_cfg=RewardConfig(reward_form=form),
+                                   reward_mode="iota", teacher=teacher,
+                                   heldout_frac=0.2, heldout_seed=3)
+        summ = P.run_policy(env, P.FIFOPolicy(k=4))
+        rets[form] = (summ["rewards"], [i["iota"] for i in summ["infos"]])
+    level_r, iotas = rets["level"]
+    delta_r, _ = rets["delta"]
+    final = [v for v in iotas if np.isfinite(v)][-1]
+    assert np.isclose(np.sum(delta_r), -final, atol=1e-5)    # Σ -(ι_t - ι_{t-1}) = -ι_T
+    assert np.allclose(level_r, [-(v if np.isfinite(v) else 0.0) for v in iotas])
+
+
+def test_target_kl_stops_update_early_and_eval_select_keeps_best():
+    import torch
+
+    from patchcore.streaming.ppo import PPOConfig, PPOTrainer
+
+    stream = _tier1_stream()
+    fns = [lambda s=i: MemoryMaintenanceEnv(stream, capacity=128, warmup_images=8, seed=s)
+           for i in range(2)]
+    torch.manual_seed(0)
+    tr = PPOTrainer(fns, PPOConfig(rollout_steps=16, total_env_steps=32, lr=0.5,
+                                   target_kl=1e-6, epochs=4, minibatches=4))
+    steps, stopped = tr.update(tr.collect())
+    assert stopped and steps < 4 * 4                         # brake fired before the end
+
+    scores = iter([1.0, 5.0, 2.0])
+    snaps = []
+
+    def eval_fn(ac, norm):
+        snaps.append({k: v.clone() for k, v in ac.state_dict().items()})
+        return next(scores)
+
+    tr = PPOTrainer(fns, PPOConfig(rollout_steps=8, total_env_steps=8 * 2 * 3,
+                                   select="eval", eval_every=1), eval_fn=eval_fn)
+    tr.train(log_every=10)
+    for k, v in tr.ac.state_dict().items():                  # restored = the 5.0 snapshot
+        assert torch.equal(v, snaps[1][k])

@@ -42,10 +42,10 @@ def run(env, ac, sample, rng):
         obs = torch.as_tensor(env.last_obs, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             dist, _ = ac(obs)
-        # raw (pre-tanh) env action: the Gaussian mean itself, or atanh(2x-1)
-        # of the Beta mean — comparable across policy types
-        mu = ac.to_env(ac.mean_action(dist)).squeeze(0).numpy()
-        a = ac.to_env(ac.sample(dist)).squeeze(0).numpy() if sample else mu
+            # raw (pre-tanh) env action: the Gaussian mean itself, or
+            # atanh(2x-1) of the Beta mean — comparable across policy types
+            mu = ac.to_env(ac.mean_action(dist)).squeeze(0).numpy()
+            a = ac.to_env(ac.sample(dist)).squeeze(0).numpy() if sample else mu
         mus.append(mu)
         admit, evict = env.decode_action(a)
         if len(evict):

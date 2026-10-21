@@ -227,7 +227,10 @@ PPO_STEPS=${PPO_STEPS:-100000}
 PPO_LR=${PPO_LR:-1e-3}                         # starting learning rate
 PPO_LR_END=${PPO_LR_END:-1e-5}                 # linear anneal target
 ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, critic-free)
-CLIP_MODE=${CLIP_MODE:-gppo}                   # clip | gppo (gradient-preserving)
+# clip | gppo (gradient-preserving). ι runs default to standard clip: with
+# gppo + lr 1e-3 the policy means ran to |mu| ~ 20-220 and every action
+# saturated (bin/diagnose_ppo_policy.py on the Kvasir checkpoints).
+CLIP_MODE=${CLIP_MODE:-$([ "${REWARD_MODE:-proxy}" = "iota" ] && echo clip || echo gppo)}
 CLIP_HIGH=${CLIP_HIGH:-}                       # optional decoupled upper epsilon
 REWARD_FORM=${REWARD_FORM:-level}              # level | delta (potential-based shaping)
 # STAGE0_ONLY=1: the paper reports ONLY stage-0 image/pixel AUROC. Skips all
@@ -265,6 +268,17 @@ EPOCHS=${EPOCHS:-4}
 MINIBATCHES=${MINIBATCHES:-64}
 ADV_BASELINE=${ADV_BASELINE:-loo}
 ACTION_MODE=${ACTION_MODE:-continuous6}       # band6: admit from a novelty window (ι arm)
+# Policy-class fixes for the ι arm (each fixes an observed failure; see ppo.py):
+#   POLICY_DIST=beta  bounded actions — the Gaussian mean saturated tanh
+#   ADMIT_FLOOR=0     exact no-op (static) becomes reachable
+#   TARGET_KL=0.02    per-minibatch KL brake on every update
+#   SELECT=eval       keep the best policy by deterministic eval on an unseen
+#                     held-out set, not by the noisy training reward
+POLICY_DIST=${POLICY_DIST:-beta}
+ADMIT_FLOOR=${ADMIT_FLOOR:-0}
+TARGET_KL=${TARGET_KL:-0.02}
+SELECT=${SELECT:-eval}
+EVAL_EVERY=${EVAL_EVERY:-0}                   # 0 = one stream pass
 FULL_MEMORY=${FULL_MEMORY:-0}
 KAPPA_ARG=""
 [ -n "${KAPPA}" ] && KAPPA_ARG="--admit_cap_abs ${KAPPA}"
@@ -479,6 +493,12 @@ PYEOF
                 --epochs           "${EPOCHS}" \
                 --minibatches      "${MINIBATCHES}" \
                 --action_mode      "${ACTION_MODE}" \
+                --reward_form      "${REWARD_FORM}" \
+                --policy_dist      "${POLICY_DIST}" \
+                --admit_floor      "${ADMIT_FLOOR}" \
+                --target_kl        "${TARGET_KL}" \
+                --select           "${SELECT}" \
+                --eval_every       "${EVAL_EVERY}" \
                 ${IOTA_ARGS} \
                 ${PRESHIFT_ARG} \
                 --eval_baselines || { echo "[${CLASSNAME}] PPO training (seed ${ts}) failed"; return 1; }
