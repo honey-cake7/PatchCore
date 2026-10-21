@@ -27,12 +27,37 @@ import torch  # noqa: F401 — load before faiss (macOS libomp)
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
+import time
+
+import patchcore.metrics
 from patchcore.streaming import policies as P
+from patchcore.streaming.bank import device_banner, knn_device
 from patchcore.streaming.cache import EmbeddingCacheReader
 from patchcore.streaming.env import MemoryMaintenanceEnv
-from patchcore.streaming.evaluate import evaluate_bank_on_stage
 from patchcore.streaming.reward import RewardConfig
 from patchcore.streaming.teacher import load_teacher
+
+
+def image_auroc(bank, reader, k, chunk_images=64):
+    """Image AUROC only — the same scores as evaluate_bank_on_stage (mean of
+    the k smallest squared L2 distances per patch, max over patches) without
+    the pixel maps / pixel AUROC / PRO it also computes. Streams the test
+    cache in image chunks so nothing large is held in memory."""
+    import torch
+
+    dev = knn_device()
+    base = torch.from_numpy(bank.vectors()).to(dev)
+    kk = min(k, len(base))
+    emb = reader.embeddings
+    n, p, d = emb.shape
+    scores = np.empty(n, dtype=np.float64)
+    for s in range(0, n, chunk_images):
+        q = torch.from_numpy(np.ascontiguousarray(emb[s:s + chunk_images], dtype=np.float32))
+        q = q.to(dev).reshape(-1, d)
+        pd = (torch.cdist(q, base) ** 2).topk(kk, dim=1, largest=False).values.mean(1)
+        scores[s:s + chunk_images] = pd.reshape(-1, p).max(1).values.double().cpu().numpy()
+    return float(patchcore.metrics.compute_imagewise_retrieval_metrics(
+        scores, np.asarray(reader.labels, dtype=int))["auroc"])
 
 RULES = {
     "random": lambda k, seed: P.RandomPolicy(k=k, seed=seed),
@@ -59,8 +84,10 @@ def main(cache_dir, capacity, warmup, n_nn, teacher, heldout_frac, rates, rules,
     test_dir = os.path.join(cache_dir, "test")
     tests = [EmbeddingCacheReader(os.path.join(test_dir, s))
              for s in sorted(d for d in os.listdir(test_dir) if d.startswith("stage_"))]
-    patch_shape = tuple(stream.manifest.get("patch_shape", (0, 0))) or None
-    imagesize = stream.manifest.get("imagesize")
+    print(device_banner())
+    if knn_device().type == "cpu":
+        print("WARNING: no GPU — every k-NN runs on CPU and the sweep will be very slow. "
+              "Run it inside the patchcore conda env on a GPU node (sbatch).")
     rates = [int(r) for r in rates.split(",")]
     seeds = [int(s) for s in seeds.split(",")]
 
@@ -74,15 +101,14 @@ def main(cache_dir, capacity, warmup, n_nn, teacher, heldout_frac, rates, rules,
                     stream, capacity=capacity, warmup_images=warmup, seed=seed,
                     n_nearest_neighbours=n_nn, reward_cfg=dataclasses.replace(RewardConfig()),
                     reward_mode="iota", teacher=teach, heldout_frac=heldout_frac,
-                    heldout_seed=seed)
+                    heldout_seed=seed, compute_obs=False)
                 pol = P.StaticPolicy() if k == 0 else RULES[rule](k, seed)
                 stage_auc = {}
+                t_start = time.perf_counter()
 
                 def eval_fn(env, stage):
                     if auroc:
-                        stage_auc[stage] = evaluate_bank_on_stage(
-                            env.bank, tests[stage], n_nn, patch_shape, imagesize
-                        )["image_auroc"]
+                        stage_auc[stage] = image_auroc(env.bank, tests[stage], n_nn)
                     return {}
 
                 summ = P.run_policy(env, pol, per_stage_eval=eval_fn)
@@ -93,14 +119,14 @@ def main(cache_dir, capacity, warmup, n_nn, teacher, heldout_frac, rates, rules,
                        "writes": summ["total_admit"]}
                 if auroc:
                     row.update({f"auroc_s{s}": v for s, v in stage_auc.items()})
-                    row["forget"] = evaluate_bank_on_stage(
-                        env.bank, tests[0], n_nn, patch_shape, imagesize)["image_auroc"]
+                    row["forget"] = image_auroc(env.bank, tests[0], n_nn)
                 rows.append(row)
                 print(f"{row['rule']:7s} k={k:3d} seed={seed} ι return {row['iota_return']:+.4f} "
                       f"writes {row['writes']:7d}"
                       + ("  AUROC " + " ".join(f"{row.get(f'auroc_s{s}', float('nan')):.3f}"
                                                for s in range(len(tests)))
-                         + f"  forget {row['forget']:.3f}" if auroc else ""), flush=True)
+                         + f"  forget {row['forget']:.3f}" if auroc else "")
+                      + f"  [{time.perf_counter() - t_start:.0f}s]", flush=True)
 
     out = out or os.path.join(cache_dir, "write_rate_sweep.csv")
     fields = list(dict.fromkeys(k for r in rows for k in r))

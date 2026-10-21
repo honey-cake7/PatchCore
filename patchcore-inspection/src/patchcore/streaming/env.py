@@ -185,6 +185,7 @@ class MemoryMaintenanceEnv:
         n_nearest_neighbours: int = 1,
         obs_norm: Optional["RunningNorm"] = None,
         episode_stop: Optional[int] = None,
+        compute_obs: bool = True,
         reward_mode: str = "proxy",
         teacher: Optional[dict] = None,
         heldout_frac: float = 0.0,
@@ -205,6 +206,10 @@ class MemoryMaintenanceEnv:
         # slice; None = the whole stream. Pre-shift-only training sets it to
         # the end of stage 0 so the policy never sees post-shift images.
         self.episode_stop = episode_stop
+        # False: skip the 53-dim policy observation (and the window coverage
+        # k-NN that only feeds it) — fixed-rule policies never read it, and it
+        # is a large share of a non-PPO step. reset()/step return obs=None.
+        self.compute_obs = compute_obs
         if reward_mode not in ("proxy", "iota"):
             raise ValueError(f"unknown reward_mode {reward_mode!r}")
         if reward_mode == "iota":
@@ -384,7 +389,7 @@ class MemoryMaintenanceEnv:
         self._t = self._start
         self._reset_heldout()
         self._load_current()
-        return self._observe()
+        return self._observe() if self.compute_obs else None
 
     # ---- whole-image held-out set (ι reward) -----------------------------
     def _reset_heldout(self) -> None:
@@ -788,11 +793,11 @@ class MemoryMaintenanceEnv:
         holdout, tot_admit, tot_evict = self._apply_decision(admit_idx, evict_slots)
         reward, info, done = self._reward_step(holdout, tot_admit, tot_evict)
         if done:
-            return self._observe_terminal(), reward, True, info
+            return (self._observe_terminal() if self.compute_obs else None), reward, True, info
         t0 = time.perf_counter()
         self._load_current()
         t1 = time.perf_counter()
-        obs = self._observe()
+        obs = self._observe() if self.compute_obs else None
         self.perf["load"] += t1 - t0
         self.perf["obs"] += time.perf_counter() - t1
         return obs, reward, False, info
@@ -851,8 +856,10 @@ class MemoryMaintenanceEnv:
         """Reward + step bookkeeping; optional injected batched distances."""
         t0 = time.perf_counter()
         if self.reward_mode == "iota":
-            reward, comps = self._window_comps(holdout, tot_admit, tot_evict,
-                                               holdout_dists)
+            # without an observation the window coverage has no consumer
+            reward, comps = self._window_comps(
+                holdout if self.compute_obs else holdout[:0], tot_admit, tot_evict,
+                holdout_dists)
         else:
             reward, comps = self._proxy.compute(
                 self.bank, holdout, tot_admit, tot_evict,
