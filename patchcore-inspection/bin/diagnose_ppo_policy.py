@@ -7,9 +7,12 @@ of steps with |mu| > 3 (tanh within 0.5% of ±1: every sample decodes the same),
 log_std, admits/evicts per step, and which bank entries get evicted — the
 newest (static + one churning slot) or the oldest.
 
-    python bin/diagnose_ppo_policy.py --cache_dir cache/kvasir_polyppvt_staged_abrupt_4 \
+    python3 bin/diagnose_ppo_policy.py --cache_dir cache/kvasir_polyppvt_staged_abrupt_4 \
         --capacity 2000 --warmup 100 \
         --ppo results/streaming/kvasir_polyppvt_staged_abrupt_4_M2000_iota/ppo_*_s*.pt
+
+The glob may be quoted (expanded here) or left to the shell (extra paths are
+taken as further checkpoints).
 """
 import glob
 import os
@@ -58,13 +61,19 @@ def run(env, ac, sample, rng):
 @click.option("--capacity", type=int, required=True)
 @click.option("--warmup", type=int, default=100)
 @click.option("--ppo", "ppo_glob", required=True, help="checkpoint path or glob")
+@click.argument("more_ppo", nargs=-1)
 @click.option("--teacher", default=None, help="default: <cache_dir>/teacher_k5.npz")
 @click.option("--heldout_seed", type=int, default=12345,
               help="distinct from every training/eval seed so H is out-of-sample")
-def main(cache_dir, capacity, warmup, ppo_glob, teacher, heldout_seed):
+def main(cache_dir, capacity, warmup, ppo_glob, more_ppo, teacher, heldout_seed):
     stream = EmbeddingCacheReader(os.path.join(cache_dir, "stream"))
     teach = load_teacher(teacher or os.path.join(cache_dir, "teacher_k5.npz"))
-    for path in sorted(glob.glob(ppo_glob)):
+    # an unquoted glob arrives shell-expanded: first match in --ppo, the rest
+    # as positional args
+    paths = sorted({p for pat in (ppo_glob, *more_ppo) for p in glob.glob(pat)})
+    if not paths:
+        raise click.UsageError(f"no checkpoint matches {ppo_glob!r}")
+    for path in paths:
         ac, norm, meta = load_checkpoint(path, device="cpu")
         meta = meta or {}
         print(f"\n=== {path}")
