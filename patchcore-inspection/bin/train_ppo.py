@@ -302,13 +302,24 @@ def _compare_to_baselines(trainer, env_fn):
           f"held-out set no training episode used) ===")
     ppo_env = _fresh_heldout(env_fn(), trainer.envs[0].heldout_seed)
     ppo_env._norm = trainer.obs_norm  # eval under the training normalization
-    ppo_ret = np.mean(run_policy(ppo_env, PPOPolicy(trainer.ac))["rewards"])
+    ppo_ret = _level_return(run_policy(ppo_env, PPOPolicy(trainer.ac)))
     print(f"{'ppo':26s} {ppo_ret:.4f}")
     for name, cls in P.BASELINES.items():
         pol = cls(k=8) if name in ("fifo", "random") else cls()
         env = _fresh_heldout(env_fn(), trainer.envs[0].heldout_seed)
-        ret = np.mean(run_policy(env, pol)["rewards"])
+        ret = _level_return(run_policy(env, pol))
         print(f"{name:26s} {ret:.4f}")
+
+
+def _level_return(summ):
+    """Mean per-step -ι (the anytime objective every report uses), whatever
+    reward form trained the policy: under the delta (telescoping) form the
+    rewards sum to -ι at the LAST step only, so averaging rewards would
+    silently score a different objective. Proxy runs: mean reward."""
+    iotas = [i.get("iota", float("nan")) for i in summ["infos"]]
+    if not any(np.isfinite(v) for v in iotas):
+        return float(np.mean(summ["rewards"]))
+    return float(np.mean([-(v if np.isfinite(v) else 0.0) for v in iotas]))
 
 
 # Offset for evaluation held-out sets: a fresh env samples H from
@@ -325,13 +336,13 @@ def _fresh_heldout(env, train_heldout_seed):
 def _make_eval_fn(env_fn, train_heldout_seed):
     """eval_fn for PPOTrainer(select="eval"): one deterministic episode on a
     held-out set no training episode uses (same stream / episode stop / κ as
-    training). Returns the mean reward."""
+    training). Returns the level ι return (see _level_return)."""
     from patchcore.streaming.policies import PPOPolicy, run_policy
 
     def eval_fn(ac, obs_norm):
         env = _fresh_heldout(env_fn(), train_heldout_seed)
         env._norm = obs_norm
-        return float(np.mean(run_policy(env, PPOPolicy(ac))["rewards"]))
+        return _level_return(run_policy(env, PPOPolicy(ac)))
 
     return eval_fn
 
