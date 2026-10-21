@@ -232,7 +232,8 @@ ADV_MODE=${ADV_MODE:-grpo}                     # gae | grpo (group-relative, cri
 # saturated (bin/diagnose_ppo_policy.py on the Kvasir checkpoints).
 CLIP_MODE=${CLIP_MODE:-$([ "${REWARD_MODE:-proxy}" = "iota" ] && echo clip || echo gppo)}
 CLIP_HIGH=${CLIP_HIGH:-}                       # optional decoupled upper epsilon
-REWARD_FORM=${REWARD_FORM:-level}              # level | delta (potential-based shaping)
+# level | delta (potential-based shaping; for ι: the telescoping Δι)
+REWARD_FORM=${REWARD_FORM:-$([ "${REWARD_MODE:-proxy}" = "iota" ] && echo delta || echo level)}
 # STAGE0_ONLY=1: the paper reports ONLY stage-0 image/pixel AUROC. Skips all
 # work serving drifted stages 1-3 and the forgetting metric — caching (step
 # 1: 1 test-set embed instead of 4), per-stage evaluation (steps 3.5/4/5: 1
@@ -267,7 +268,12 @@ HIDDEN=${HIDDEN:-128}
 EPOCHS=${EPOCHS:-4}
 MINIBATCHES=${MINIBATCHES:-64}
 ADV_BASELINE=${ADV_BASELINE:-loo}
-ACTION_MODE=${ACTION_MODE:-continuous6}       # band6: admit from a novelty window (ι arm)
+# ι arm defaults, chosen on the synthetic fixture with the policy fixes below
+# (2 train seeds x 4 unseen held-out sets): band6 + delta was the best and the
+# most stable of {continuous6, band6} x {level, delta} (-0.559 vs -0.583 for
+# continuous6+level; static -0.695, reservoir -0.351). Weak but consistent
+# evidence — override with ACTION_MODE / REWARD_FORM.
+ACTION_MODE=${ACTION_MODE:-band6}             # band6: admit from a novelty window
 # Policy-class fixes for the ι arm (each fixes an observed failure; see ppo.py):
 #   POLICY_DIST=beta  bounded actions — the Gaussian mean saturated tanh
 #   ADMIT_FLOOR=0     exact no-op (static) becomes reachable
