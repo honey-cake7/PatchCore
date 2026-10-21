@@ -204,7 +204,9 @@ class PPOPolicy(BasePolicy):
         with torch.no_grad():
             t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             dist, _ = self.ac(t)
-            action = dist.mean.squeeze(0).cpu().numpy()
+            # deterministic action, mapped to the env's raw action space
+            # (identity for the Gaussian policy, atanh(2x-1) for Beta)
+            action = self.ac.to_env(self.ac.mean_action(dist)).squeeze(0).cpu().numpy()
         return env.decode_action(action)
 
 

@@ -130,6 +130,9 @@ def main(backbone_name, layers_to_extract_from, data_path, classname, resize,
 
             ac, norm, meta = load_checkpoint(ppo_path, device="cpu")
             pol, mode = P.PPOPolicy(ac), (meta or {}).get("action_mode")
+            from patchcore.streaming.ppo import action_cfg_from_meta
+
+            ppo_action_cfg = action_cfg_from_meta(meta)
         else:
             if name == "myopic_iota" and not heldout_frac:
                 print("[skip] myopic_iota needs --heldout_frac > 0")
@@ -138,7 +141,8 @@ def main(backbone_name, layers_to_extract_from, data_path, classname, resize,
             pol = cls(k=8) if name in ("fifo", "random") else cls()
         env = MemoryMaintenanceEnv(stream, capacity=capacity, warmup_images=warmup,
                                    n_nearest_neighbours=n_nn, obs_norm=norm,
-                                   action_cfg=ActionConfig(mode=mode or "continuous6"),
+                                   action_cfg=(ppo_action_cfg if name == "ppo"
+                                               else ActionConfig(mode=mode or "continuous6")),
                                    reward_cfg=dataclasses.replace(reward_cfg), **extra)
         env.import_init_state(env0.export_init_state())
         env.reset()

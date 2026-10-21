@@ -18,6 +18,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from patchcore.streaming import policies as P
 from patchcore.streaming.env import ActionConfig, MemoryMaintenanceEnv
+from patchcore.streaming.ppo import action_cfg_from_meta
 from patchcore.streaming.evaluate import evaluate_bank_on_stage
 
 
@@ -195,7 +196,10 @@ def main(cache_dir, synthetic, capacity, warmup, n_nn, policy_names, ppo_path,
             extra["admit_cap_abs"] = cap
         return MemoryMaintenanceEnv(
             stream, capacity=capacity, warmup_images=warmup, seed=seed,
-            action_cfg=ActionConfig(mode=mode or action_mode),
+            # a checkpoint's full action config (mode, admit floor) when it has
+            # one; otherwise the CLI/legacy mode
+            action_cfg=(action_cfg_from_meta(meta, mode or action_mode) if meta
+                        else ActionConfig(mode=mode or action_mode)),
             n_nearest_neighbours=n_nn, obs_norm=obs_norm,
             # fresh copy per env: reset() writes warmup scales into the config
             reward_cfg=dataclasses.replace(reward_cfg),

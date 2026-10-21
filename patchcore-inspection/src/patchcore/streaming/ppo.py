@@ -26,14 +26,44 @@ CHECKPOINT_FORMAT_VERSION = 2
 
 
 class ActorCritic(nn.Module):
-    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACTION_DIM, hidden: int = 128):
+    """Policy + value net.
+
+    ``dist="gaussian"`` (historical): diagonal Gaussian over the RAW action,
+    which the env squashes with tanh. Nothing bounds the mean, and on the real
+    runs it drifted to |mu| ~ 20-220: every sample then decodes to the same
+    corner of the action space and exploration is dead (bin/diagnose_ppo_policy).
+    ``log_std_min`` floors the std; the trainer's ``mu_l2`` penalises |mu|.
+
+    ``dist="beta"``: Beta(alpha, beta) per dim on (0, 1), mapped to the env's
+    raw action by atanh(2x - 1) so the env's tanh recovers 2x - 1 in (-1, 1).
+    Bounded by construction (the mean cannot run away) and its entropy lives
+    in action space. alpha, beta = 1 + softplus(.) (unimodal), capped at
+    ``conc_max`` — the cap is the std floor. Initialised at alpha = beta = 5
+    (std ~0.15 on (0,1)): a moderate start rather than uniform-random
+    eviction weights, which produced catastrophic episodes on the fixture.
+    """
+
+    def __init__(self, obs_dim: int = OBS_DIM, act_dim: int = ACTION_DIM, hidden: int = 128,
+                 dist: str = "gaussian", log_std_min: Optional[float] = None,
+                 conc_max: float = 50.0):
         super().__init__()
+        self.dist_kind = dist
+        self.log_std_min = log_std_min
+        self.conc_max = conc_max
         self.actor = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
         )
-        self.mean_head = nn.Linear(hidden, act_dim)
-        self.log_std = nn.Parameter(torch.full((act_dim,), -0.5))
+        if dist == "beta":
+            self.conc_head = nn.Linear(hidden, 2 * act_dim)
+            with torch.no_grad():
+                self.conc_head.weight.mul_(0.01)
+                self.conc_head.bias.fill_(float(np.log(np.expm1(4.0))))  # 1+softplus = 5
+        elif dist == "gaussian":
+            self.mean_head = nn.Linear(hidden, act_dim)
+            self.log_std = nn.Parameter(torch.full((act_dim,), -0.5))
+        else:
+            raise ValueError(f"unknown policy dist {dist!r}")
         self.critic = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
@@ -42,11 +72,37 @@ class ActorCritic(nn.Module):
 
     def forward(self, obs):
         h = self.actor(obs)
-        mean = self.mean_head(h)
-        std = torch.exp(self.log_std).clamp(1e-3, 5.0)
-        dist = torch.distributions.Normal(mean, std)
+        if self.dist_kind == "beta":
+            conc = (1.0 + nn.functional.softplus(self.conc_head(h))).clamp(max=self.conc_max)
+            a, b = conc.chunk(2, dim=-1)
+            dist = torch.distributions.Beta(a, b)
+        else:
+            mean = self.mean_head(h)
+            log_std = self.log_std
+            if self.log_std_min is not None:
+                log_std = log_std.clamp(min=self.log_std_min)
+            std = torch.exp(log_std).clamp(1e-3, 5.0)
+            dist = torch.distributions.Normal(mean, std)
         value = self.critic(obs).squeeze(-1)
         return dist, value
+
+    # Beta samples live on (0, 1); keep them off the boundary where log_prob
+    # and atanh are infinite.
+    _EPS = 1e-6
+
+    def sample(self, dist):
+        x = dist.sample()
+        return x.clamp(self._EPS, 1 - self._EPS) if self.dist_kind == "beta" else x
+
+    def mean_action(self, dist):
+        """Deterministic (evaluation) action, in the policy's own space."""
+        return dist.mean
+
+    def to_env(self, x):
+        """Policy-space action -> the raw action the env tanh-squashes."""
+        if self.dist_kind == "beta":
+            return torch.atanh((2 * x - 1).clamp(-1 + 2 * self._EPS, 1 - 2 * self._EPS))
+        return x
 
 
 @dataclass
@@ -97,12 +153,32 @@ class PPOConfig:
     # per-iter reward. Runs shorter than best_window keep the final policy.
     save_best: bool = True
     best_window: int = 9
+    # Which policy to keep. "rolling": best rolling mean of the TRAINING
+    # reward (sampled actions; noisy, and on the real runs it chose between
+    # saturated corners by chance). "eval": every eval_every iters run the
+    # trainer's eval_fn — a deterministic episode on a held-out set no
+    # training episode uses — and keep the best of those.
+    select: str = "rolling"
+    eval_every: int = 0                  # 0 -> best_window
+    # Policy class (see ActorCritic): "gaussian" (historical) | "beta".
+    policy_dist: str = "gaussian"
+    log_std_min: Optional[float] = None  # gaussian std floor (None = 1e-3 only)
+    conc_max: float = 50.0               # beta concentration cap (= std floor)
+    mu_l2: float = 0.0                   # gaussian: L2 penalty on the raw mean
+    # Stop the update once approx-KL(old || new) on a minibatch exceeds
+    # 1.5 x target_kl. Checked per minibatch: with 64 minibatches an epoch is
+    # already 64 Adam steps, so a per-epoch check fires far too late.
+    target_kl: Optional[float] = None
 
 
 class PPOTrainer:
     def __init__(self, env_fns: List[Callable], cfg: PPOConfig = None,
-                 obs_norm: Optional[RunningNorm] = None, lockstep: bool = False):
+                 obs_norm: Optional[RunningNorm] = None, lockstep: bool = False,
+                 eval_fn: Optional[Callable] = None):
         self.cfg = cfg or PPOConfig()
+        # eval_fn(actor_critic, obs_norm) -> score (higher better); required
+        # for cfg.select == "eval"
+        self.eval_fn = eval_fn
         self.envs = [fn() for fn in env_fns]
         self.n_env = len(self.envs)
         # lockstep=True: all envs replay the SAME stream (cache path), so
@@ -119,19 +195,25 @@ class PPOTrainer:
         for env in self.envs:
             env._norm = self.obs_norm
         self.device = torch.device(self.cfg.device)
-        self.ac = ActorCritic(hidden=self.cfg.hidden).to(self.device)
+        self.ac = ActorCritic(hidden=self.cfg.hidden, dist=self.cfg.policy_dist,
+                              log_std_min=self.cfg.log_std_min,
+                              conc_max=self.cfg.conc_max).to(self.device)
         self.opt = torch.optim.Adam(self.ac.parameters(), lr=self.cfg.lr)
         self._obs = np.stack([e.reset() for e in self.envs])
         self._ret_rms_std = 1.0  # running return std for reward scaling
         self._fixed_scale_set = False
 
     def _act(self, obs_np):
+        """Returns (policy-space action [buffered for log-probs], env action,
+        log-prob, value)."""
         obs = torch.as_tensor(obs_np, dtype=torch.float32, device=self.device)
         with torch.no_grad():
             dist, value = self.ac(obs)
-            action = dist.sample()
+            action = self.ac.sample(dist)
             logp = dist.log_prob(action).sum(-1)
-        return action.cpu().numpy(), logp.cpu().numpy(), value.cpu().numpy()
+            env_action = self.ac.to_env(action)
+        return (action.cpu().numpy(), env_action.cpu().numpy(),
+                logp.cpu().numpy(), value.cpu().numpy())
 
     def _lockstep_step(self, action, next_obs):
         """One synchronized step of all envs with fused cross-env k-NNs.
@@ -237,17 +319,21 @@ class PPOTrainer:
 
         act_s = reset_s = bknn_s = 0.0
         n_resets = 0
+        sat_steps = 0.0      # fraction of action dims with |tanh(a)| > 0.995
+        admits = 0.0
         for t in range(T):
             t0 = time.perf_counter()
-            action, logp, value = self._act(self._obs)
+            action, env_action, logp, value = self._act(self._obs)
             act_s += time.perf_counter() - t0
             obs_buf[t], act_buf[t], logp_buf[t], val_buf[t] = (
                 self._obs, action, logp, value
             )
+            sat_steps += float(np.mean(np.abs(np.tanh(env_action)) > 0.995))
             next_obs = np.zeros_like(self._obs)
             if self.lockstep:
-                rews, dones, step_bknn = self._lockstep_step(action, next_obs)
+                rews, dones, step_bknn = self._lockstep_step(env_action, next_obs)
                 bknn_s += step_bknn
+                admits += sum(env._pend_result[1]["n_admit"] for env in self.envs)
                 rew_buf[t] = rews
                 done_buf[t] = float(dones)
                 if dones:
@@ -258,7 +344,8 @@ class PPOTrainer:
                         n_resets += 1
             else:
                 for i, env in enumerate(self.envs):
-                    o, r, d, _ = env.step(action[i])
+                    o, r, d, info = env.step(env_action[i])
+                    admits += info["n_admit"]
                     rew_buf[t, i], done_buf[t, i] = r, float(d)
                     if d:
                         t0 = time.perf_counter()
@@ -329,6 +416,8 @@ class PPOTrainer:
             "ret": ret.reshape(-1),
             "mean_reward": float(flat_r.mean()),
             "perf": perf,
+            "sat_frac": sat_steps / T,
+            "admits_per_step": admits / (T * N),
         }
 
     def update(self, batch, ent_coef: Optional[float] = None):
@@ -345,12 +434,20 @@ class PPOTrainer:
         n = len(obs)
         idx = np.arange(n)
         mb = max(1, n // cfg.minibatches)
+        steps, stopped = 0, False
         for _ in range(cfg.epochs):
             np.random.shuffle(idx)
             for start in range(0, n, mb):
                 b = idx[start:start + mb]
                 dist, value = self.ac(obs[b])
                 logp = dist.log_prob(act[b]).sum(-1)
+                if cfg.target_kl is not None:
+                    with torch.no_grad():
+                        log_ratio = logp - old_logp[b]
+                        approx_kl = ((torch.exp(log_ratio) - 1) - log_ratio).mean().item()
+                    if approx_kl > 1.5 * cfg.target_kl:
+                        stopped = True
+                        break
                 ratio = torch.exp(logp - old_logp[b])
                 lo = 1.0 - cfg.clip
                 hi = 1.0 + (cfg.clip_high if cfg.clip_high is not None else cfg.clip)
@@ -368,6 +465,8 @@ class PPOTrainer:
                 pg_loss = -torch.min(surr1, surr2).mean()
                 ent = dist.entropy().sum(-1).mean()
                 loss = pg_loss - ent_coef * ent
+                if cfg.mu_l2 and self.ac.dist_kind == "gaussian":
+                    loss = loss + cfg.mu_l2 * (dist.mean ** 2).mean()
                 if cfg.adv_mode != "grpo":  # grpo has no value target
                     v_loss = ((value - ret[b]) ** 2).mean()
                     loss = loss + cfg.vf_coef * v_loss
@@ -375,6 +474,10 @@ class PPOTrainer:
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.ac.parameters(), cfg.max_grad_norm)
                 self.opt.step()
+                steps += 1
+            if stopped:
+                break
+        return steps, stopped
 
     def train(self, log_every: int = 1):
         cfg = self.cfg
@@ -382,6 +485,11 @@ class PPOTrainer:
         n_iters = max(1, cfg.total_env_steps // steps_per_iter)
         history = []
         best_score, best_iter, best_state = -float("inf"), -1, None
+        use_eval = cfg.save_best and cfg.select == "eval"
+        if use_eval and self.eval_fn is None:
+            raise ValueError("PPOConfig.select='eval' needs PPOTrainer(eval_fn=...)")
+        eval_every = cfg.eval_every or cfg.best_window
+        last_sat = 0.0
         for it in range(n_iters):
             frac = it / max(n_iters - 1, 1)
             if cfg.lr_end is not None:
@@ -397,25 +505,42 @@ class PPOTrainer:
             history.append(batch["mean_reward"])
             # mean_reward measures the pre-update policy, so snapshot before
             # update() — the weights that produced the score, not their successor.
-            if cfg.save_best and len(history) >= cfg.best_window:
+            last_sat = batch["sat_frac"]
+            if cfg.save_best and not use_eval and len(history) >= cfg.best_window:
                 score = sum(history[-cfg.best_window:]) / cfg.best_window
                 if score > best_score:
                     best_score, best_iter = score, it + 1
                     best_state = copy.deepcopy(self.ac.state_dict())
             t0 = time.time()
-            self.update(batch, ent_coef=ent_coef)
+            n_steps, kl_stop = self.update(batch, ent_coef=ent_coef)
             update_s = time.time() - t0
+            eval_str = ""
+            if use_eval and ((it + 1) % eval_every == 0 or it + 1 == n_iters):
+                # scores the POST-update policy, so snapshot after update()
+                score = float(self.eval_fn(self.ac, self.obs_norm))
+                eval_str = f" eval={score:.4f}"
+                if score > best_score:
+                    best_score, best_iter = score, it + 1
+                    best_state = copy.deepcopy(self.ac.state_dict())
             if (it + 1) % log_every == 0:
                 perf = batch.get("perf", {})
                 other = collect_s - sum(perf.values())
                 detail = " ".join(f"{k}={v:.1f}" for k, v in perf.items())
                 print(f"[ppo] iter {it+1}/{n_iters} mean_reward={batch['mean_reward']:.4f} "
+                      f"sat={batch['sat_frac']:.0%} admits/step={batch['admits_per_step']:.2f} "
+                      f"grad_steps={n_steps}{' (KL stop)' if kl_stop else ''}{eval_str} "
                       f"collect={collect_s:.1f}s ({detail} other={other:.1f}) "
                       f"update={update_s:.1f}s")
         if best_state is not None:
             self.ac.load_state_dict(best_state)
-            print(f"[ppo] restored best policy from iter {best_iter} "
-                  f"(rolling[{cfg.best_window}] mean_reward={best_score:.4f})")
+            how = (f"deterministic eval={best_score:.4f}" if use_eval else
+                   f"rolling[{cfg.best_window}] mean_reward={best_score:.4f}")
+            print(f"[ppo] restored best policy from iter {best_iter} ({how})")
+        if last_sat > 0.5:
+            print(f"[ppo] WARNING: {last_sat:.0%} of action dims are saturated "
+                  "(|tanh(a)| > 0.995) in the last rollout — every sample decodes "
+                  "to the same decision and exploration is dead. Use "
+                  "policy_dist='beta' (or log_std_min + mu_l2) and target_kl.")
         return history
 
     def save(self, path: str):
@@ -433,6 +558,10 @@ class PPOTrainer:
                 "heldout_frac": env0.heldout_frac,
                 "admit_cap_abs": env0.admit_cap_abs,
                 "hidden": self.cfg.hidden,
+                "policy_dist": self.cfg.policy_dist,
+                "log_std_min": self.cfg.log_std_min,
+                "conc_max": self.cfg.conc_max,
+                "action_cfg": dataclasses.asdict(env0.action_cfg),
             },
             path,
         )
@@ -459,14 +588,18 @@ def load_checkpoint(path: str, device: str = "cpu") -> Tuple[ActorCritic, Option
     obj = torch.load(path, map_location=device, weights_only=False)
     if isinstance(obj, dict) and obj.get("format_version", 0) >= 2:
         ac = ActorCritic(obj.get("obs_dim", OBS_DIM), obj.get("act_dim", ACTION_DIM),
-                         hidden=obj.get("hidden", 128))
+                         hidden=obj.get("hidden", 128),
+                         dist=obj.get("policy_dist", "gaussian"),
+                         log_std_min=obj.get("log_std_min"),
+                         conc_max=obj.get("conc_max", 50.0))
         ac.load_state_dict(obj["ac"])
         ac.to(torch.device(device))
         norm = RunningNorm.from_state_dict(obj["obs_norm"]) if obj.get("obs_norm") else None
         # reward_mode / heldout_frac / admit_cap_abs / hidden only exist in
         # checkpoints written after the ι rebuild; absent keys = legacy proxy.
         meta = {k: obj[k] for k in ("action_mode", "reward_cfg", "reward_mode",
-                                    "heldout_frac", "admit_cap_abs", "hidden")
+                                    "heldout_frac", "admit_cap_abs", "hidden",
+                                    "policy_dist", "action_cfg")
                 if k in obj}
         return ac, norm, meta
     print("[ppo] WARNING: legacy checkpoint (no obs normalizer saved) — "
@@ -475,3 +608,14 @@ def load_checkpoint(path: str, device: str = "cpu") -> Tuple[ActorCritic, Option
     ac.load_state_dict(obj)
     ac.to(torch.device(device))
     return ac, None, {}
+
+
+def action_cfg_from_meta(meta: Optional[dict], default_mode: str = "continuous6"):
+    """The ActionConfig a checkpoint trained under (mode, admit floor, caps);
+    older checkpoints stored only the mode, which implies the old defaults."""
+    from patchcore.streaming.env import ActionConfig
+
+    meta = meta or {}
+    if meta.get("action_cfg"):
+        return ActionConfig(**meta["action_cfg"])
+    return ActionConfig(mode=meta.get("action_mode") or default_mode)

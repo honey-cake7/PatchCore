@@ -27,7 +27,7 @@ import numpy as np
 
 from patchcore.streaming.cache import EmbeddingCacheReader
 from patchcore.streaming.env import ActionConfig, MemoryMaintenanceEnv
-from patchcore.streaming.ppo import load_checkpoint
+from patchcore.streaming.ppo import action_cfg_from_meta, load_checkpoint
 from patchcore.streaming.teacher import load_teacher
 
 DIMS = ["a0 admit bar/centre", "a1 admit count", "a2 w_age", "a3 w_-hit",
@@ -42,8 +42,10 @@ def run(env, ac, sample, rng):
         obs = torch.as_tensor(env.last_obs, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             dist, _ = ac(obs)
-        mu = dist.mean.squeeze(0).numpy()
-        a = dist.sample().squeeze(0).numpy() if sample else mu
+        # raw (pre-tanh) env action: the Gaussian mean itself, or atanh(2x-1)
+        # of the Beta mean — comparable across policy types
+        mu = ac.to_env(ac.mean_action(dist)).squeeze(0).numpy()
+        a = ac.to_env(ac.sample(dist)).squeeze(0).numpy() if sample else mu
         mus.append(mu)
         admit, evict = env.decode_action(a)
         if len(evict):
@@ -77,13 +79,16 @@ def main(cache_dir, capacity, warmup, ppo_glob, more_ppo, teacher, heldout_seed)
         ac, norm, meta = load_checkpoint(path, device="cpu")
         meta = meta or {}
         print(f"\n=== {path}")
+        spread = (f"log_std={np.round(ac.log_std.detach().numpy(), 3).tolist()}"
+                  if ac.dist_kind == "gaussian" else f"beta conc_max={ac.conc_max}")
         print(f"action_mode={meta.get('action_mode')} reward_mode={meta.get('reward_mode')} "
               f"kappa={meta.get('admit_cap_abs')} hidden={meta.get('hidden')} "
-              f"log_std={np.round(ac.log_std.detach().numpy(), 3).tolist()}")
+              f"policy={ac.dist_kind} admit_floor={action_cfg_from_meta(meta).admit_floor} "
+              f"{spread}")
         for sample in (False, True):
             env = MemoryMaintenanceEnv(
                 stream, capacity=capacity, warmup_images=warmup, obs_norm=norm,
-                action_cfg=ActionConfig(mode=meta.get("action_mode", "continuous6")),
+                action_cfg=action_cfg_from_meta(meta),
                 reward_mode="iota", teacher=teach,
                 heldout_frac=meta.get("heldout_frac") or 0.05, heldout_seed=heldout_seed,
                 admit_cap_abs=meta.get("admit_cap_abs"))

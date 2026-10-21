@@ -26,7 +26,7 @@ from patchcore.streaming.reward import RewardConfig, load_reward_weights
 _SYNTH_TEACHER_K = 5
 
 
-def _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, base_seed, reward_cfg,
+def _make_synthetic_env_fns(n_env, capacity, warmup, action_cfg, base_seed, reward_cfg,
                             env_kw):
     from patchcore.streaming.synthetic import SyntheticConfig, make_synthetic_stream
     from patchcore.streaming.teacher import build_teacher
@@ -44,7 +44,7 @@ def _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, base_seed, rew
         def fn(stream=stream, seed=seed, kw=kw):
             return MemoryMaintenanceEnv(
                 stream, capacity=capacity, warmup_images=warmup, seed=seed,
-                action_cfg=ActionConfig(mode=action_mode),
+                action_cfg=dataclasses.replace(action_cfg),
                 # each env gets its own copy: reset() writes warmup scales into it
                 reward_cfg=dataclasses.replace(reward_cfg), **kw,
             )
@@ -53,7 +53,7 @@ def _make_synthetic_env_fns(n_env, capacity, warmup, action_mode, base_seed, rew
     return fns
 
 
-def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_seed, reward_cfg,
+def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_cfg, base_seed, reward_cfg,
                         env_kw, preshift=False):
     from patchcore.streaming.cache import EmbeddingCacheReader, stage0_end
 
@@ -70,7 +70,7 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
     print("[env] computing warmup coreset once (shared across envs) ...")
     proto = MemoryMaintenanceEnv(
         reader, capacity=capacity, warmup_images=warmup, seed=base_seed,
-        action_cfg=ActionConfig(mode=action_mode),
+        action_cfg=dataclasses.replace(action_cfg),
         reward_cfg=dataclasses.replace(reward_cfg), episode_stop=stop, **env_kw,
     )
     proto.reset()
@@ -81,7 +81,7 @@ def _make_cache_env_fns(n_env, cache_dir, capacity, warmup, action_mode, base_se
         def fn(seed=base_seed + i):
             env = MemoryMaintenanceEnv(
                 reader, capacity=capacity, warmup_images=warmup, seed=seed,
-                action_cfg=ActionConfig(mode=action_mode),
+                action_cfg=dataclasses.replace(action_cfg),
                 reward_cfg=dataclasses.replace(reward_cfg), episode_stop=stop,
                 **env_kw,
             )
@@ -181,12 +181,26 @@ def _fit_obs_norm(env_fn, seed=0):
 @click.option("--hidden", type=int, default=128, help="Actor/critic MLP width")
 @click.option("--epochs", type=int, default=4, help="PPO epochs per iteration")
 @click.option("--minibatches", type=int, default=64, help="PPO minibatches per epoch")
+@click.option("--policy_dist", default="gaussian", type=click.Choice(["gaussian", "beta"]),
+              help="beta = bounded policy (cannot saturate the action squash)")
+@click.option("--log_std_min", type=float, default=None, help="gaussian std floor (log)")
+@click.option("--mu_l2", type=float, default=0.0, help="gaussian: L2 penalty on the raw mean")
+@click.option("--conc_max", type=float, default=50.0, help="beta concentration cap")
+@click.option("--target_kl", type=float, default=None,
+              help="stop the update when per-minibatch approx-KL > 1.5x this")
+@click.option("--admit_floor", type=int, default=1,
+              help="minimum admits per step; 0 allows an exact no-op")
+@click.option("--select", "select_mode", default="rolling", type=click.Choice(["rolling", "eval"]),
+              help="keep the best policy by rolling training reward, or by "
+                   "deterministic eval on a held-out set no training episode uses")
+@click.option("--eval_every", type=int, default=0, help="iters between evals (0 = best_window)")
 def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
          total_env_steps, seed, out, device, eval_baselines, reward_json,
          beta, gamma, churn_coef, churn_budget, reward_form, norm_mode,
          reward_scale, adv_mode, clip_mode, clip_high, ent_coef, ent_coef_end,
          lr, lr_end, preshift, reward_mode, teacher_path, heldout_frac,
-         admit_cap_abs, adv_baseline, hidden, epochs, minibatches):
+         admit_cap_abs, adv_baseline, hidden, epochs, minibatches, policy_dist,
+         log_std_min, mu_l2, conc_max, target_kl, admit_floor, select_mode, eval_every):
     import torch
 
     from patchcore.streaming.bank import device_banner
@@ -224,12 +238,13 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
               f"eps={env_kw['teacher']['eps']:.4g})")
     print(f"[env] reward_mode={reward_mode} heldout_frac={heldout_frac} "
           f"admit_cap_abs={admit_cap_abs}")
+    action_cfg = ActionConfig(mode=action_mode, admit_floor=admit_floor)
     if synthetic:
         env_fns = _make_synthetic_env_fns(
-            n_env, capacity, warmup, action_mode, seed, reward_cfg, env_kw)
+            n_env, capacity, warmup, action_cfg, seed, reward_cfg, env_kw)
     elif cache_dir:
         env_fns = _make_cache_env_fns(
-            n_env, cache_dir, capacity, warmup, action_mode, seed, reward_cfg,
+            n_env, cache_dir, capacity, warmup, action_cfg, seed, reward_cfg,
             env_kw, preshift=preshift)
     else:
         raise click.UsageError("pass --cache_dir or --synthetic")
@@ -242,7 +257,9 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
         clip_mode=clip_mode, clip_high=clip_high,
         ent_coef=ent_coef, ent_coef_end=ent_coef_end, lr=lr, lr_end=lr_end,
         adv_baseline=adv_baseline, hidden=hidden, epochs=epochs,
-        minibatches=minibatches,
+        minibatches=minibatches, policy_dist=policy_dist, log_std_min=log_std_min,
+        mu_l2=mu_l2, conc_max=conc_max, target_kl=target_kl,
+        select=select_mode, eval_every=eval_every,
     )
     if cache_dir:
         # The best-checkpoint score is a rolling mean over one full stream
@@ -261,10 +278,12 @@ def main(cache_dir, synthetic, n_env, capacity, warmup, action_mode,
         cfg.best_window = max(3, round(episode_steps / cfg.rollout_steps))
     print(f"[ppo] adv_mode={adv_mode} adv_baseline={adv_baseline} clip_mode={clip_mode} "
           f"clip_high={clip_high} best_window={cfg.best_window} hidden={hidden} "
-          f"epochs={epochs} minibatches={minibatches}")
+          f"epochs={epochs} minibatches={minibatches} policy={policy_dist} "
+          f"target_kl={target_kl} admit_floor={admit_floor} select={select_mode}")
     # Cache-path envs replay the same stream in lockstep -> fused cross-env
     # k-NN batching in collect(); synthetic envs have per-seed streams.
-    trainer = PPOTrainer(env_fns, cfg, obs_norm=obs_norm, lockstep=bool(cache_dir))
+    trainer = PPOTrainer(env_fns, cfg, obs_norm=obs_norm, lockstep=bool(cache_dir),
+                         eval_fn=_make_eval_fn(env_fns[0], seed))
     history = trainer.train()
     trainer.save(out)
     print(f"saved policy -> {out}")
@@ -279,15 +298,42 @@ def _compare_to_baselines(trainer, env_fn):
     from patchcore.streaming import policies as P
     from patchcore.streaming.policies import PPOPolicy, run_policy
 
-    print(f"\n=== {trainer.envs[0].reward_mode} return (higher is better) ===")
-    ppo_env = env_fn()
+    print(f"\n=== {trainer.envs[0].reward_mode} return (higher is better; "
+          f"held-out set no training episode used) ===")
+    ppo_env = _fresh_heldout(env_fn(), trainer.envs[0].heldout_seed)
     ppo_env._norm = trainer.obs_norm  # eval under the training normalization
     ppo_ret = np.mean(run_policy(ppo_env, PPOPolicy(trainer.ac))["rewards"])
     print(f"{'ppo':26s} {ppo_ret:.4f}")
     for name, cls in P.BASELINES.items():
         pol = cls(k=8) if name in ("fifo", "random") else cls()
-        ret = np.mean(run_policy(env_fn(), pol)["rewards"])
+        env = _fresh_heldout(env_fn(), trainer.envs[0].heldout_seed)
+        ret = np.mean(run_policy(env, pol)["rewards"])
         print(f"{name:26s} {ret:.4f}")
+
+
+# Offset for evaluation held-out sets: a fresh env samples H from
+# (heldout_seed, episode 0) — exactly the first TRAINING episode's H — so any
+# score computed on it is in-sample. Shift the seed to get an unseen H.
+_EVAL_HELDOUT_OFFSET = 10_007
+
+
+def _fresh_heldout(env, train_heldout_seed):
+    env.heldout_seed = train_heldout_seed + _EVAL_HELDOUT_OFFSET
+    return env
+
+
+def _make_eval_fn(env_fn, train_heldout_seed):
+    """eval_fn for PPOTrainer(select="eval"): one deterministic episode on a
+    held-out set no training episode uses (same stream / episode stop / κ as
+    training). Returns the mean reward."""
+    from patchcore.streaming.policies import PPOPolicy, run_policy
+
+    def eval_fn(ac, obs_norm):
+        env = _fresh_heldout(env_fn(), train_heldout_seed)
+        env._norm = obs_norm
+        return float(np.mean(run_policy(env, PPOPolicy(ac))["rewards"]))
+
+    return eval_fn
 
 
 if __name__ == "__main__":

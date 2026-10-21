@@ -281,8 +281,10 @@ def record_ppo_traces(
     from patchcore.streaming.ppo import load_checkpoint
 
     seeds = seeds if seeds is not None else [0]
+    from patchcore.streaming.ppo import action_cfg_from_meta
+
     ac, norm, meta = load_checkpoint(ppo_path, device="cpu")
-    action_mode = (meta or {}).get("action_mode", "continuous6")
+    action_cfg = action_cfg_from_meta(meta)
 
     def eval_fn(env, stage):
         if stage0_only and stage != 0:
@@ -299,7 +301,7 @@ def record_ppo_traces(
         env = MemoryMaintenanceEnv(
             stream_reader, capacity=capacity, warmup_images=warmup,
             seed=seed, n_nearest_neighbours=n_nearest_neighbours,
-            obs_norm=norm, action_cfg=ActionConfig(mode=action_mode),
+            obs_norm=norm, action_cfg=action_cfg,
             episode_stop=episode_stop,
         )
         summ = P.run_policy(env, P.PPOPolicy(ac), per_stage_eval=eval_fn)

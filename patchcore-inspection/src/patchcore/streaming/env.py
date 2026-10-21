@@ -60,6 +60,12 @@ class ActionConfig:
     # with a novelty WINDOW instead of a novelty floor (see decode_action).
     mode: str = "continuous6"
     admit_cap_frac: float = 0.05   # max admissions per step, as a fraction of M
+    # Minimum admissions per (continuous6/band6) step. The historical floor of
+    # 1 makes an exact no-op — i.e. static, the strongest simple policy on
+    # endoscopy — unreachable: the nearest action is "admit 1, evict the
+    # newest", which is exactly where saturated PPO policies ended up.
+    # 0 = the policy can choose to admit nothing.
+    admit_floor: int = 1
     discrete_k: int = 8            # patches added/evicted per discrete action
 
 
@@ -222,6 +228,7 @@ class MemoryMaintenanceEnv:
         # without a teacher (myopic baseline) the env's own n_nn.
         self._iota_k = int(teacher["k"]) if teacher is not None else int(self.n_nn)
         self._episode_idx = -1
+        self._iota_prev = 0.0             # previous step's ι (delta reward form)
         self._ho_ids = np.empty(0, dtype=np.int64)
         self._ho_mask: Optional[np.ndarray] = None
         self._ho_pool: Optional[torch.Tensor] = None
@@ -388,6 +395,7 @@ class MemoryMaintenanceEnv:
         """
         self._episode_idx += 1
         self._ho_nimg = 0
+        self._iota_prev = 0.0
         self._ho_full = False
         self._ho_bank_step = self.bank.step
         if self.heldout_frac <= 0:
@@ -696,7 +704,7 @@ class MemoryMaintenanceEnv:
 
         if mode == "continuous6":
             cap_frac = (a[1] + 1.0) / 2.0 * self.action_cfg.admit_cap_frac
-            cap = max(1, int(cap_frac * self.capacity))
+            cap = max(self.action_cfg.admit_floor, int(cap_frac * self.capacity))
         # keep the most novel up to the cap
         if len(admit_idx) > cap:
             order = np.argsort(-nn[admit_idx])
@@ -721,9 +729,10 @@ class MemoryMaintenanceEnv:
         a[2:6] = the same eviction-utility weights.
         """
         nn = self._batch_nn
-        cap = max(1, int((a[1] + 1.0) / 2.0 * self.action_cfg.admit_cap_frac
-                         * self.capacity))
-        if len(nn):
+        cap = max(self.action_cfg.admit_floor,
+                  int((a[1] + 1.0) / 2.0 * self.action_cfg.admit_cap_frac
+                      * self.capacity))
+        if len(nn) and cap > 0:
             ranked = np.argsort(nn, kind="stable")        # typical -> novel
             c = (a[0] + 1.0) / 2.0 * (len(nn) - 1)
             take = min(cap, len(nn))
@@ -853,7 +862,15 @@ class MemoryMaintenanceEnv:
         iota_t = float("nan")
         if self.reward_mode == "iota":
             iota_t = self._iota_now()
-            reward = 0.0 if not np.isfinite(iota_t) else -iota_t
+            cur = iota_t if np.isfinite(iota_t) else 0.0
+            if self.reward_cfg.reward_form == "delta":
+                # telescoping: the episode return is -ι at the last step (the
+                # final bank against every held-out image), each step credited
+                # with its own change in ι rather than the level
+                reward = -(cur - self._iota_prev)
+            else:
+                reward = -cur
+            self._iota_prev = cur
             comps["reward"] = reward
         scale = self.reward_cfg.coverage_scale
         self._win_cov_cache = (comps["C"] * scale, comps["C90"] * scale)
