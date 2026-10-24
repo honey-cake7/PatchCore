@@ -2,6 +2,116 @@
  REVIEWER CHECKLIST — HARVESTED FROM EXISTING RUNS
 ==============================================================================
 
+------------------------------------------------------------------------------
+ FINDINGS (read first) — analysis of the tables below
+------------------------------------------------------------------------------
+
+DATA VALIDITY — fix before quoting anything
+  * MVTec M=2000 and HyperKvasir M=2000 hold the ITERATE=1 regression run,
+    not the kept no-iterate run. Evidence: their fits use J=14 traces
+    (12 baselines + 2 ppo_r1), HyperKvasir PPO writes = 318,201 (kept run:
+    3,282), MVTec PPO stage-0 .944 / HyperKvasir .902 (kept run: .955 / .905).
+    The kept run's files were overwritten (same result dirs). These two rows
+    cannot go in the paper as-is -> rerun clean, fresh RESULT_TAG, ITERATE=0.
+  * MVTec M=2000 also mixes reward targets: leather and toothbrush were fitted
+    on drifted+forget, the other 13 classes on stage-0.
+  * Toothbrush has 0 policy steps before the stage-0 eval (warmup 15 = all of
+    stage 0), so every method = the warmup bank. Already excluded (n=42 =
+    14 classes x 3 seeds).
+  * Kvasir warmup not recorded (run predates the sidecar);
+    run_streaming_polyp_pvt.sh default is 100.
+
+[1] MEMORY SWEEP
+  * Budgets with all 6 methods + writes: MVTec M=2000, 2.5%, 10%;
+    Kvasir M=2000; HyperKvasir M=2000. Short: 2 MVTec budgets, 4 per
+    endoscopy dataset. Kvasir DOES have every streaming baseline (Table 5).
+  * Kvasir: PPO ties the best methods at a fraction of the writes —
+    ppo .936 (2,400 writes) vs periodic .940 (92,000) vs static .935 (0).
+  * MVTec: PPO trails fifo/periodic at every budget
+    (M=2000 .944 vs .969; 2.5% .949 vs .972; 10% .967 vs .972).
+  * MVTec 10% is saturated: bottle/leather/hazelnut = 1.000 for every method.
+    Above ~2.5% only screw, grid, capsule, pill separate the methods.
+  * Closest thing to "offline at M=2000": stock PatchCore-1% on MVTec = .993
+    (best streaming at M=2000 = periodic .969). Not matched: stock uses the
+    full train set, not stage-0 data. Offline coreset at exact M = NEW RUN.
+
+[2] SEED VARIANCE (3 seeds everywhere)
+  * PPO is by far the least seed-stable method on MVTec: screw 2.5%
+    .672/.429/.865 (±.22), screw 10% .948/.854/.605 (±.18), grid M=2000
+    .961/.855/.853, capsule M=2000 .934/.903/.783. Baselines ~±.005.
+  * Eval seed changes env randomness only (probe set Z, warmup coreset start,
+    holdout split, window subsample, obs projection). Stream order fixed by
+    cache SEED=0; reservoir/periodic/random use hard-coded seed 0; one PPO
+    policy per class (TRAIN_SEEDS=0). PPO std = eval noise, not training
+    variance.
+
+[3] FULL STREAM
+  * Covered at 25/50/75/100% (each on that phase's drifted test set) + stage-0
+    re-scored at 100% (forget). Missing: stage-0 test at 50% and 75%.
+  * Kvasir: PPO best at 100% (.891 vs <=.877) and least forgetting (.923).
+  * HyperKvasir: PPO forget .902 ~ static .904; fifo/periodic forget ~.85.
+  * MVTec: PPO behind fifo/periodic at every point of the stream.
+
+[4] DRIFT
+  * Phases documented; one drifted copy of the test split per phase.
+  * Pre-shift-only check FAILS for all 47 runs: PPO trains on the full stream,
+    obs normaliser fitted on a full episode, 33/47 fits use post-shift labels.
+    Needs a code change (train on phase 0 only), not just a rerun.
+
+[5] CALIBRATION (45/47 fits now have a permutation null, B=200)
+  * 15/45 fits are indistinguishable from noise (p > .05):
+      M=2000 stage-0 target   9/13 MVTec pass (+ HyperKvasir);
+                              fail bottle .56, carpet .98, tile .11, zipper .27
+      2.5% drifted+forget    12/15 pass; fail tile .43, wood .38,
+                              transistor .08 (bottle exactly .05)
+      10%  drifted+forget     7/15 pass; fail carpet .11, grid .19,
+                              hazelnut .53, leather .22, screw .10, tile .17,
+                              wood .26, zipper .40
+      Kvasir M=2000           pass (rho* .951, p .000)
+  * Tile and wood fail at all three budgets; carpet and zipper at two —
+    mostly classes where every method ties.
+  * Null p95 is .73-.88 everywhere: MIN_RHO=0.7 sits below the noise ceiling.
+    Report the permutation test as the pass criterion, not rho >= 0.7.
+  * No p-value for leather and toothbrush at M=2000 (the two drifted+forget
+    fits inside the stage-0 set): backfill could not reproduce the stored
+    rho*, so it was skipped rather than reported wrong.
+  * A failing fit does not always mean a failing policy: grid 10% p=.19 but
+    PPO .966; screw 10% p=.10 and PPO swings .948/.854/.605.
+  * Labels came from the TEST split -> calibrate on a disjoint split = NEW RUN.
+  * Eq. 11: code has 7 weighted terms + 1 threshold (churn_budget) = 8 numbers.
+
+[6] OVERLAP / BACKBONE
+  * Kvasir and HyperKvasir anomaly test sets are the SAME 1,000 images
+    (md5-identical) — not two independent evaluations.
+  * Normals: no exact duplicates; 337/2,400 Kvasir-train vs HyperKvasir-train
+    near-duplicate candidates (dHash). Normal-vs-polyp pairs (impossible as
+    true duplicates) hit ~2%, so 14% is likely real re-encoded overlap —
+    eyeball overlap_kvasir_hyperkvasir_pairs.csv.
+  * Polyp-PVT train overlap still NOT computed (needs
+    --polyp_pvt_train_dir). Both anomaly sets are Kvasir-SEG, and Polyp-PVT
+    trains on 900 of its 1,000 images -> expect ~90%.
+  * No ImageNet-only backbone runs on endoscopy = NEW RUN.
+
+[7] DEPLOYMENT
+  * ~113 MiB total at M=2000, mostly backbone (95 MiB); bank 7.8 MiB at
+    M=2000, up to 120 MiB (hazelnut 10%); policy 0.09 MiB; window 9-10 MiB;
+    probe Z 1 MiB. Measured peak GPU memory + latency = NEW RUN.
+
+[8] PROTOCOL
+  * Counts complete in the [8] table. MVTec stage 0 = only 37-82 policy
+    steps; periodic re-coresets every 50 steps, so on 9 classes it never
+    fires before the stage-0 eval -> identical periodic/static rows
+    (bottle, cable, capsule, leather, metal_nut, tile, transistor, wood,
+    zipper). Period should scale with stream length.
+  * Learning rate is not logged or checkpointed — confirm from submit command.
+
+STILL NEEDS NEW RUNS
+  offline coreset at exact M | +2 MVTec / +4 endoscopy budgets | 5 seeds |
+  stage-0 test at 50/75% | clean MVTec + HyperKvasir M=2000 (no ITERATE) |
+  pre-shift-only training | disjoint calibration split | ImageNet backbone
+  (pvtv2_b2) | latency + peak memory | Polyp-PVT overlap (flag only)
+------------------------------------------------------------------------------
+
 [1] MEMORY SWEEP — stage-0, mean ± std over (class, seed)
 
 ┌─────────────┬──────────────┬────────────┬────────────┬──────────────────────────┬─────────────┬─────────────┬─────────────┬──────────┬────┐
@@ -353,9 +463,6 @@ Offline stock PatchCore (full train set, all classes in file)
 │ mvtec       │ M=2000     │ (untagged) │ zipper      │ 2000  │ streaming_greedy_coreset │ 0.978 0.981 0.980 │ 0.980±0.001 │ 0.986 0.986 0.986 │ 0.986±0.000 │
 └─────────────┴────────────┴────────────┴─────────────┴───────┴──────────────────────────┴───────────────────┴─────────────┴───────────────────┴─────────────┘
 
-
-
-
 [3] FULL STREAM — image AUROC at each point of the stream (cross-class mean ± std)
     25/50/75/100% = bank at end of that quarter, scored on THAT phase's test set;
     'forget@100%' = final bank scored on the stage-0 test set.
@@ -395,6 +502,7 @@ Offline stock PatchCore (full train set, all classes in file)
 │ mvtec       │ wideresnet50 │ M=2000     │ (untagged) │ streaming_greedy_coreset │ 0.935±0.091 │ 0.941±0.085 │ 0.809±0.159 │ 0.678±0.141 │ 0.920±0.115 │
 └─────────────┴──────────────┴────────────┴────────────┴──────────────────────────┴─────────────┴─────────────┴─────────────┴─────────────┴─────────────┘
 
+
 [4] DRIFT — phase definitions (staged_abrupt_4) and pre-shift audit
 
 ┌───────┬─────────────────────────────┬───────────────────┬──────┬───────┬────────┬──────────┬──────────┬────────┐
@@ -409,57 +517,58 @@ Offline stock PatchCore (full train set, all classes in file)
     Pre-shift-only: 47/47 runs FAIL (PPO trains on all phases; obs-norm fitted on a full episode).
     Runs whose reward-fit target uses post-shift labels: 33/47
 
+[5] CALIBRATION — reward fit per run (labels from the TEST split)
 
 ┌──────────────────────────────────────────────┬───────────────────────────────────┬────┬────────┬───────┬─────┬──────────┬───────┬──────────────────────────────────────┐
 │ run                                          │ target                            │ J  │ ρ*     │ p     │ B   │ null p95 │ p≤.05 │ w* (α β γ churn budget c90 probe q)  │
 ├──────────────────────────────────────────────┼───────────────────────────────────┼────┼────────┼───────┼─────┼──────────┼───────┼──────────────────────────────────────┤
 │ bottle_wideresnet50_staged_abrupt_4          │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.4472 │ 0.56  │ 200 │ 0.4477   │ False │ 0.0 0.0 0.0 0.0 0.0 0.0 0.0 1.0      │
-│ bottle_wideresnet50_staged_abrupt_4_m10      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.972  │ –     │     │          │       │ 0.25 0.15 0.0 4.0 0.01 0.25 0.25 1.0 │
-│ bottle_wideresnet50_staged_abrupt_4_m2.5     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.7972 │ –     │     │          │       │ 0.0 0.15 0.0 1.0 0.0 2.0 0.0 2.0     │
+│ bottle_wideresnet50_staged_abrupt_4_m10      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.972  │ 0.0   │ 200 │ 0.8112   │ True  │ 0.25 0.15 0.0 4.0 0.01 0.25 0.25 1.0 │
+│ bottle_wideresnet50_staged_abrupt_4_m2.5     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.7972 │ 0.05  │ 200 │ 0.7923   │ True  │ 0.0 0.15 0.0 1.0 0.0 2.0 0.0 2.0     │
 │ cable_wideresnet50_staged_abrupt_4           │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.8965 │ 0.005 │ 200 │ 0.7823   │ True  │ 0.0 0.3 0.1 4.0 0.01 1.0 0.0 1.0     │
-│ cable_wideresnet50_staged_abrupt_4_m10       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.958  │ –     │     │          │       │ 0.25 1.0 0.0 2.0 0.0 0.0 0.0 1.0     │
-│ cable_wideresnet50_staged_abrupt_4_m2.5      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9021 │ –     │     │          │       │ 0.0 1.0 0.0 0.5 0.0 2.0 0.25 4.0     │
+│ cable_wideresnet50_staged_abrupt_4_m10       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.958  │ 0.0   │ 200 │ 0.8329   │ True  │ 0.25 1.0 0.0 2.0 0.0 0.0 0.0 1.0     │
+│ cable_wideresnet50_staged_abrupt_4_m2.5      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9021 │ 0.005 │ 200 │ 0.8531   │ True  │ 0.0 1.0 0.0 0.5 0.0 2.0 0.25 4.0     │
 │ capsule_wideresnet50_staged_abrupt_4         │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.9405 │ 0.0   │ 200 │ 0.7669   │ True  │ 0.0 0.0 0.0 2.0 0.0 0.0 0.0 1.0      │
-│ capsule_wideresnet50_staged_abrupt_4_m10     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9441 │ –     │     │          │       │ 0.25 0.15 0.0 2.0 0.0 0.0 0.0 1.0    │
-│ capsule_wideresnet50_staged_abrupt_4_m2.5    │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.965  │ –     │     │          │       │ 0.25 0.0 0.0 2.0 0.005 0.25 0.25 1.0 │
+│ capsule_wideresnet50_staged_abrupt_4_m10     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9441 │ 0.0   │ 200 │ 0.8392   │ True  │ 0.25 0.15 0.0 2.0 0.0 0.0 0.0 1.0    │
+│ capsule_wideresnet50_staged_abrupt_4_m2.5    │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.965  │ 0.0   │ 200 │ 0.8252   │ True  │ 0.25 0.0 0.0 2.0 0.005 0.25 0.25 1.0 │
 │ carpet_wideresnet50_staged_abrupt_4          │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.1957 │ 0.98  │ 200 │ 0.7996   │ False │ 0.0 0.0 0.0 0.25 0.005 0.0 0.0 0.0   │
-│ carpet_wideresnet50_staged_abrupt_4_m10      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.7552 │ –     │     │          │       │ 0.0 1.0 0.0 0.25 0.0 0.0 0.0 0.0     │
-│ carpet_wideresnet50_staged_abrupt_4_m2.5     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8671 │ –     │     │          │       │ 0.0 1.0 0.0 0.5 0.0 0.25 0.0 1.0     │
+│ carpet_wideresnet50_staged_abrupt_4_m10      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.7552 │ 0.11  │ 200 │ 0.8115   │ False │ 0.0 1.0 0.0 0.25 0.0 0.0 0.0 0.0     │
+│ carpet_wideresnet50_staged_abrupt_4_m2.5     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8671 │ 0.03  │ 200 │ 0.8122   │ True  │ 0.0 1.0 0.0 0.5 0.0 0.25 0.0 1.0     │
 │ grid_wideresnet50_staged_abrupt_4            │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.8769 │ 0.0   │ 200 │ 0.7321   │ True  │ 0.0 0.15 0.0 0.5 0.0 0.25 0.0 1.0    │
-│ grid_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.6713 │ –     │     │          │       │ 0.0 0.15 0.0 0.0 0.0 0.0 0.0 0.0     │
-│ grid_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9091 │ –     │     │          │       │ 0.25 0.0 0.0 0.0 0.0 1.0 0.0 8.0     │
+│ grid_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.6713 │ 0.19  │ 200 │ 0.7699   │ False │ 0.0 0.15 0.0 0.0 0.0 0.0 0.0 0.0     │
+│ grid_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9091 │ 0.0   │ 200 │ 0.8042   │ True  │ 0.25 0.0 0.0 0.0 0.0 1.0 0.0 8.0     │
 │ hazelnut_wideresnet50_staged_abrupt_4        │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.8427 │ 0.03  │ 200 │ 0.8276   │ True  │ 0.25 1.0 0.0 0.5 0.02 0.0 0.25 1.0   │
-│ hazelnut_wideresnet50_staged_abrupt_4_m10    │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5315 │ –     │     │          │       │ 0.0 0.15 0.0 0.25 0.0 0.0 0.0 0.0    │
-│ hazelnut_wideresnet50_staged_abrupt_4_m2.5   │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8811 │ –     │     │          │       │ 0.0 0.0 0.0 0.5 0.0 2.0 0.25 8.0     │
+│ hazelnut_wideresnet50_staged_abrupt_4_m10    │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5315 │ 0.53  │ 200 │ 0.8115   │ False │ 0.0 0.15 0.0 0.25 0.0 0.0 0.0 0.0    │
+│ hazelnut_wideresnet50_staged_abrupt_4_m2.5   │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8811 │ 0.01  │ 200 │ 0.8252   │ True  │ 0.0 0.0 0.0 0.5 0.0 2.0 0.25 8.0     │
 │ hyperkvasir_polyppvt_staged_abrupt_4         │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.9473 │ 0.0   │ 200 │ 0.7978   │ True  │ 0.0 0.15 0.0 0.5 0.0 2.0 0.0 2.0     │
-│ kvasir_polyppvt_staged_abrupt_4              │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.951  │ –     │     │          │       │ 0.0 0.15 0.0 0.0 0.0 0.0 2.0 8.0     │
+│ kvasir_polyppvt_staged_abrupt_4              │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.951  │ 0.0   │ 200 │ 0.8252   │ True  │ 0.0 0.15 0.0 0.0 0.0 0.0 2.0 8.0     │
 │ leather_wideresnet50_staged_abrupt_4         │ 1.0*drifted+0.5*forget+0.0*stage0 │ 14 │ 0.8945 │ –     │     │          │       │ 1.0 1.0 0.0 1.0 0.0 0.25 0.5 4.0     │
-│ leather_wideresnet50_staged_abrupt_4_m10     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.655  │ –     │     │          │       │ 0.25 0.0 0.0 1.0 0.0 1.0 0.0 4.0     │
-│ leather_wideresnet50_staged_abrupt_4_m2.5    │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8741 │ –     │     │          │       │ 0.25 1.0 0.0 0.25 0.0 0.0 0.0 1.0    │
+│ leather_wideresnet50_staged_abrupt_4_m10     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.655  │ 0.22  │ 200 │ 0.7921   │ False │ 0.25 0.0 0.0 1.0 0.0 1.0 0.0 4.0     │
+│ leather_wideresnet50_staged_abrupt_4_m2.5    │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8741 │ 0.01  │ 200 │ 0.8182   │ True  │ 0.25 1.0 0.0 0.25 0.0 0.0 0.0 1.0    │
 │ metal_nut_wideresnet50_staged_abrupt_4       │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.8745 │ 0.01  │ 200 │ 0.7865   │ True  │ 0.0 0.6 0.0 2.0 0.0 0.0 0.25 2.0     │
-│ metal_nut_wideresnet50_staged_abrupt_4_m10   │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9441 │ –     │     │          │       │ 0.0 1.0 0.0 4.0 0.0 0.25 0.0 1.0     │
-│ metal_nut_wideresnet50_staged_abrupt_4_m2.5  │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.951  │ –     │     │          │       │ 0.0 0.0 0.0 0.0 0.0 1.0 0.25 1.0     │
+│ metal_nut_wideresnet50_staged_abrupt_4_m10   │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9441 │ 0.0   │ 200 │ 0.8605   │ True  │ 0.0 1.0 0.0 4.0 0.0 0.25 0.0 1.0     │
+│ metal_nut_wideresnet50_staged_abrupt_4_m2.5  │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.951  │ 0.0   │ 200 │ 0.8395   │ True  │ 0.0 0.0 0.0 0.0 0.0 1.0 0.25 1.0     │
 │ pill_wideresnet50_staged_abrupt_4            │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.8945 │ 0.005 │ 200 │ 0.8112   │ True  │ 1.0 0.3 0.0 2.0 0.0 1.0 1.0 4.0      │
-│ pill_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8811 │ –     │     │          │       │ 0.0 0.3 0.3 0.5 0.01 0.0 0.0 0.0     │
-│ pill_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.958  │ –     │     │          │       │ 0.25 0.15 0.0 1.0 0.01 1.0 0.5 1.0   │
+│ pill_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8811 │ 0.01  │ 200 │ 0.8182   │ True  │ 0.0 0.3 0.3 0.5 0.01 0.0 0.0 0.0     │
+│ pill_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.958  │ 0.0   │ 200 │ 0.8815   │ True  │ 0.25 0.15 0.0 1.0 0.01 1.0 0.5 1.0   │
 │ screw_wideresnet50_staged_abrupt_4           │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.9209 │ 0.0   │ 200 │ 0.7936   │ True  │ 1.0 0.6 0.0 0.0 0.0 0.5 0.0 4.0      │
-│ screw_wideresnet50_staged_abrupt_4_m10       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.7762 │ –     │     │          │       │ 0.0 0.15 0.1 0.25 0.0 0.0 0.0 0.0    │
-│ screw_wideresnet50_staged_abrupt_4_m2.5      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.965  │ –     │     │          │       │ 0.0 0.15 0.3 0.0 0.0 0.0 0.0 0.0     │
+│ screw_wideresnet50_staged_abrupt_4_m10       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.7762 │ 0.1   │ 200 │ 0.8045   │ False │ 0.0 0.15 0.1 0.25 0.0 0.0 0.0 0.0    │
+│ screw_wideresnet50_staged_abrupt_4_m2.5      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.965  │ 0.0   │ 200 │ 0.8182   │ True  │ 0.0 0.15 0.3 0.0 0.0 0.0 0.0 0.0     │
 │ tile_wideresnet50_staged_abrupt_4            │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.7677 │ 0.11  │ 200 │ 0.8519   │ False │ 0.0 0.6 0.0 0.25 0.01 0.0 0.0 1.0    │
-│ tile_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.6923 │ –     │     │          │       │ 0.0 1.0 0.0 0.25 0.01 0.0 0.0 0.0    │
-│ tile_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5594 │ –     │     │          │       │ 0.25 1.0 0.0 0.0 0.0 0.0 0.0 2.0     │
+│ tile_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.6923 │ 0.165 │ 200 │ 0.7902   │ False │ 0.0 1.0 0.0 0.25 0.01 0.0 0.0 0.0    │
+│ tile_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5594 │ 0.43  │ 200 │ 0.778    │ False │ 0.25 1.0 0.0 0.0 0.0 0.0 0.0 2.0     │
 │ toothbrush_wideresnet50_staged_abrupt_4      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 14 │ 0.9117 │ –     │     │          │       │ 1.0 1.0 0.3 0.25 0.0 0.0 0.0 1.0     │
-│ toothbrush_wideresnet50_staged_abrupt_4_m10  │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9859 │ –     │     │          │       │ 0.0 1.0 0.0 0.25 0.0 0.5 0.25 0.0    │
-│ toothbrush_wideresnet50_staged_abrupt_4_m2.5 │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8592 │ –     │     │          │       │ 0.0 0.15 0.0 1.0 0.0 2.0 0.25 0.0    │
+│ toothbrush_wideresnet50_staged_abrupt_4_m10  │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.9859 │ 0.0   │ 200 │ 0.8135   │ True  │ 0.0 1.0 0.0 0.25 0.0 0.5 0.25 0.0    │
+│ toothbrush_wideresnet50_staged_abrupt_4_m2.5 │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8592 │ 0.015 │ 200 │ 0.8012   │ True  │ 0.0 0.15 0.0 1.0 0.0 2.0 0.25 0.0    │
 │ transistor_wideresnet50_staged_abrupt_4      │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.8707 │ 0.005 │ 200 │ 0.787    │ True  │ 0.0 1.0 0.0 2.0 0.0 0.25 0.25 2.0    │
-│ transistor_wideresnet50_staged_abrupt_4_m10  │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.986  │ –     │     │          │       │ 0.0 0.0 0.0 2.0 0.01 0.25 0.0 1.0    │
-│ transistor_wideresnet50_staged_abrupt_4_m2.5 │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8392 │ –     │     │          │       │ 1.0 0.6 0.0 2.0 0.005 1.0 0.5 2.0    │
+│ transistor_wideresnet50_staged_abrupt_4_m10  │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.986  │ 0.0   │ 200 │ 0.8605   │ True  │ 0.0 0.0 0.0 2.0 0.01 0.25 0.0 1.0    │
+│ transistor_wideresnet50_staged_abrupt_4_m2.5 │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8392 │ 0.08  │ 200 │ 0.8605   │ False │ 1.0 0.6 0.0 2.0 0.005 1.0 0.5 2.0    │
 │ wood_wideresnet50_staged_abrupt_4            │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.865  │ 0.01  │ 200 │ 0.7648   │ True  │ 0.0 0.0 0.0 0.5 0.0 0.0 0.0 1.0      │
-│ wood_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.6456 │ –     │     │          │       │ 0.0 1.0 0.0 0.25 0.0 0.0 0.0 0.0     │
-│ wood_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5524 │ –     │     │          │       │ 0.25 0.6 0.0 4.0 0.01 2.0 0.0 8.0    │
+│ wood_wideresnet50_staged_abrupt_4_m10        │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.6456 │ 0.255 │ 200 │ 0.8002   │ False │ 0.0 1.0 0.0 0.25 0.0 0.0 0.0 0.0     │
+│ wood_wideresnet50_staged_abrupt_4_m2.5       │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5524 │ 0.38  │ 200 │ 0.7979   │ False │ 0.25 0.6 0.0 4.0 0.01 2.0 0.0 8.0    │
 │ zipper_wideresnet50_staged_abrupt_4          │ 0.0*drifted+0.0*forget+1.0*stage0 │ 14 │ 0.6351 │ 0.265 │ 200 │ 0.7852   │ False │ 0.0 0.0 0.3 0.0 0.0 0.5 0.25 1.0     │
-│ zipper_wideresnet50_staged_abrupt_4_m10      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5734 │ –     │     │          │       │ 0.0 1.0 0.0 0.25 0.01 0.0 0.0 0.0    │
-│ zipper_wideresnet50_staged_abrupt_4_m2.5     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8741 │ –     │     │          │       │ 1.0 0.0 0.0 4.0 0.02 0.25 0.0 8.0    │
+│ zipper_wideresnet50_staged_abrupt_4_m10      │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.5734 │ 0.4   │ 200 │ 0.8066   │ False │ 0.0 1.0 0.0 0.25 0.01 0.0 0.0 0.0    │
+│ zipper_wideresnet50_staged_abrupt_4_m2.5     │ 1.0*drifted+0.5*forget+0.0*stage0 │ 12 │ 0.8741 │ 0.015 │ 200 │ 0.7976   │ True  │ 1.0 0.0 0.0 4.0 0.02 0.25 0.0 8.0    │
 └──────────────────────────────────────────────┴───────────────────────────────────┴────┴────────┴───────┴─────┴──────────┴───────┴──────────────────────────────────────┘
 
     J, reference trajectories and w* per run: calibration.csv / report.txt.
@@ -630,75 +739,7 @@ Scanned 47 result dirs and 62 SLURM logs. COVERED = harvested into the CSVs here
 
 ## 5. Calibration
 
-- COVERED: 47 fits in calibration.csv (14 with a permutation null).
-- Before/after retargeting: compare rows of one class with different `target` values.
-- Eq. 11: the code has 7 weighted terms + 1 threshold (churn_budget) = 8 numbers; reconcile the paper's 'six terms' against hyperparams.json.
-- **Labels came from the TEST split** (traces score the cached test/stage_* sets, the same images reported). NEW RUN: calibrate on a disjoint split, then refit, retrain and re-benchmark everything downstream.
-
-## 6. Backbone check
-
-- Polyp-PVT train overlap NOT computed: pass --polyp_pvt_train_dir. Expect it to be high: Kvasir's anomalies are Kvasir-SEG (prepare_dataset.py) and Polyp-PVT trains on 900 of the 1000 Kvasir-SEG images.
-- ImageNet-only backbone runs on endoscopy: NONE -> NEW RUN (BACKBONE=pvtv2_b2)
-
-## 7. Deployment cost
-
-- COVERED (analytic): bank / mirror / policy / window / probe-set sizes and backbone params in deployment_memory.csv.
-- NEW RUN: measured peak GPU memory and per-image latency split into feature extraction / NN search / maintenance step (logs only hold training-time cost).
-
-## 8. Protocol
-
-- COVERED: counts, anomaly types, warmup and eval point in protocol.csv; method details in hyperparams.json; Kvasir/HyperKvasir overlap in overlap_kvasir_hyperkvasir*.csv.
-- Mask origin (from prep scripts): Kvasir = Kvasir-SEG masks; HyperKvasir = segmented-images/masks. Normals: Kvasir-v2 normal-{cecum,pylorus,z-line}; HyperKvasir anatomical landmarks (6 classes).
-- Learning rate is not logged anywhere — confirm from the submit command.
-user
-
-
-
-
-
-
-# Reviewer checklist — what existing runs cover
-
-Scanned 47 result dirs and 62 SLURM logs. COVERED = harvested into the CSVs here; NEW RUN = no existing artifact has it.
-
-## 1. Memory sweep
-
-- **hyperkvasir**: 1 budget(s) with stage-0 results
-  - M=2000 (untagged) (1 classes): all 6 methods
-  - NEW RUN: needs >=5 budgets, has 1
-- **kvasir**: 1 budget(s) with stage-0 results
-  - M=2000 (untagged) (1 classes): all 6 methods
-  - NEW RUN: needs >=5 budgets, has 1
-- **mvtec**: 3 budget(s) with stage-0 results
-  - 2.5% match (untagged) (14 classes): all 6 methods
-  - 10% match (untagged) (14 classes): all 6 methods
-  - M=2000 (untagged) (14 classes): all 6 methods
-  - NEW RUN: needs >=5 budgets, has 3
-- Writes: 4176/4176 per-seed rows have admit counts from logs
-- Offline PatchCore: stock results found for ['IM224_Ensemble_L2-3_P001_D1024-384_PS-3_AN-1', 'IM224_GastroNet_L5-11_HyperKvasir', 'IM224_GastroNet_L5-11_P01_10', 'IM224_GastroNet_L5-11_P01_11', 'IM224_GastroNet_L5-11_P01_2', 'IM224_GastroNet_L5-11_P01_3', 'IM224_GastroNet_L5-11_P01_4', 'IM224_GastroNet_L5-11_P01_5', 'IM224_GastroNet_L5-11_P01_6', 'IM224_GastroNet_L5-11_P01_7', 'IM224_GastroNet_L5-11_P01_8', 'IM224_GastroNet_L5-11_P01_9', 'IM224_GastroNet_MVTec_L5-11_P01', 'IM224_MambaVisionT_MVTec_S12_P01', 'IM224_MambaVisionT_s12_HyperKvasir', 'IM224_MambaVisionT_s12_P01_1', 'IM224_PolypPVT_MVTec_norm23_P01', 'IM224_PolypPVT_MVTec_norm23_P01_1', 'IM224_PolypPVT_norm23_HyperKvasir', 'IM224_PolypPVT_norm23_HyperKvasir_1', 'IM224_PolypPVT_norm23_P01', 'IM224_PolypPVT_norm23_P01_1', 'IM224_SegFormerB3_MVTec_S12_P01', 'IM224_SegFormerB3_s12_HyperKvasir', 'IM224_SegFormerB3_s12_P01_1', 'IM224_VimBase_s01_P01_5', 'IM224_WR50_L2-3_P01', 'IM224_WR50_L2-3_P01_D1024-1024_PS-3_AN-1', 'IM224_WR50_L2-3_P01_Eval_TTT4AS', 'IM320_Ensemble_L2-3_P001_D1024-384_PS-3_AN-1', 'IM320_Ensemble_L2-3_P001_D1024-384_PS-5_AN-5', 'IM320_WR50_L2-3_P001_D1024-1024_PS-3_AN-1', 'IM320_WR50_L2-3_P001_D1024-1024_PS-5_AN-3', 'Kvasir_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0', 'Kvasir_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0_0', 'Kvasir_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0_1'] (full train set, NOT stage-0 data, NOT matched M).
-- NEW RUN: offline greedy coreset at every exact M (incl. M=2000) — never run.
-
-## 2. Seed variance
-
-- COVERED: per-class per-seed rows in seed_variance.csv; eval seeds per run: [3].
-- NEW RUN: 5 seeds (EVAL_SEEDS=0,1,2,3,4) — only step 5 needs rerunning.
-- What the eval seed controls (from code): env rng only — probe-set Z draw, warmup coreset random start, per-step holdout split, window subsample, obs projection. It does NOT change stream order (fixed by the cache SEED=0), baseline policy sampling (reservoir/periodic/random use a hard-coded seed=0), or PPO weights (one policy trained with TRAIN_SEEDS=0, deterministic mean action). So ppo std = eval-env noise only, not training variance.
-
-## 3. Full-stream behaviour
-
-- COVERED for 47 runs: AUROC at 25/50/75/100% — but each on THAT phase's drifted test set, plus stage-0 test re-scored at 100% (forgetting). See fullstream.csv.
-- NEW RUN: stage-0 test at 50% and 75% (never evaluated), and every STAGE0_ONLY run (only the 25% point exists).
-
-## 4. Drift
-
-- COVERED: phase definitions (drift_protocol.csv), images per phase and per-phase labelled test sets (protocol.csv; one drifted copy of the same test split per phase).
-- 'Offline frozen on phase 1' ~ the `static` policy, but its bank is a coreset of the first WARMUP images only, not all of phase 1.
-- NEW RUN: offline frozen on ALL phase-1 data; offline rebuilt on the whole stream.
-- **Pre-shift check FAILS** (preshift_audit.csv): PPO trains on the full stream incl. post-shift phases, the obs normaliser is fitted on a full episode, and reward fits with drifted/forget weights use post-shift labels. Needs training restricted to phase 0 — a code change, not a rerun.
-
-## 5. Calibration
-
-- COVERED: 47 fits in calibration.csv (14 with a permutation null).
+- COVERED: 47 fits in calibration.csv (45 with a permutation null).
 - Before/after retargeting: compare rows of one class with different `target` values.
 - Eq. 11: the code has 7 weighted terms + 1 threshold (churn_budget) = 8 numbers; reconcile the paper's 'six terms' against hyperparams.json.
 - **Labels came from the TEST split** (traces score the cached test/stage_* sets, the same images reported). NEW RUN: calibrate on a disjoint split, then refit, retrain and re-benchmark everything downstream.
